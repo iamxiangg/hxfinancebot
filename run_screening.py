@@ -19,130 +19,111 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SMA_PERIOD = 60
-VWAP_STD_MULT = 1.0
-VOLUME_SURGE_MULT = 1.5
-SCORE_GREEN_THRESHOLD = 15
+SCORE_GREEN_THRESHOLD = 10 # Lowered to ensure AI triggers on best available
 
 # ── Universe Setup ─────────────────────────────────────────────────────────
 def get_universe():
-    """Fetches S&P 500 and NASDAQ 100 tickers via Finviz library."""
+    """Fetches ALL S&P 500 and NASDAQ 100 tickers via Finviz."""
     try:
-        logger.info("Connecting to Finviz...")
+        logger.info("Fetching full market universe from Finviz...")
         foverview = Overview()
         
-        # Pull S&P 500
+        # limit=-1 fetches all pages automatically
         foverview.set_filter(filters_dict={'Index': 'S&P 500'})
-        sp500_df = foverview.screener_view()
-        sp500 = sp500_df['Ticker'].tolist() if not sp500_df.empty else []
+        sp500 = foverview.screener_view(limit=-1, verbose=0)['Ticker'].tolist()
         
-        # Pull Nasdaq 100
         foverview.set_filter(filters_dict={'Index': 'NASDAQ 100'})
-        nasdaq_df = foverview.screener_view()
-        nasdaq100 = nasdaq_df['Ticker'].tolist() if not nasdaq_df.empty else []
+        nas100 = foverview.screener_view(limit=-1, verbose=0)['Ticker'].tolist()
         
-        full_list = list(set(sp500 + nasdaq100))
-        if not full_list:
-            raise ValueError("Finviz returned empty list.")
-            
+        full_list = list(set(sp500 + nas100))
         logger.info(f"Universe size: {len(full_list)} tickers.")
         return [t.replace('.', '-') for t in full_list]
     except Exception as e:
         logger.warning(f"Finviz failed, using core backup: {e}")
-        return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "AMD", "META", "AVGO", "NFLX"]
+        return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "AMD", "META"]
 
 # ── Analysis Helpers ───────────────────────────────────────────────────────
 
-def get_safe_data(ticker):
-    """Downloads yfinance data and flattens to prevent Series errors."""
-    try:
-        df = yf.download(ticker, period="4mo", interval="1d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 65: return None
-        
-        # Flatten columns to 1D numpy arrays to avoid 'Series' errors
-        data = {
-            'Close': df['Close'].values.flatten(),
-            'Volume': df['Volume'].values.flatten()
-        }
-        # Filter out NaNs
-        mask = ~np.isnan(data['Close'])
-        return {k: v[mask] for k, v in data.items()}
-    except Exception as e:
-        logger.warning(f"YFinance error for {ticker}: {e}")
-        return None
-
-def compute_score(ticker):
-    data = get_safe_data(ticker)
-    if not data: return None
-    close, vol = data['Close'], data['Volume']
-
-    # 1. SMA60 (Trend)
-    sma60 = pd.Series(close).rolling(window=SMA_PERIOD).mean().values
-    latest_sma = sma60[-1]
-    if np.isnan(latest_sma): return None
-    sma_score = min(10, max(0, ((close[-1] / latest_sma) - 1) * 200))
-
-    # 2. VWAP (Value)
-    vwap = np.cumsum(close * vol) / np.cumsum(vol)
-    latest_vwap, std_diff = vwap[-1], np.std(close - vwap)
-    thresh = latest_vwap - (VWAP_STD_MULT * std_diff)
-    vwap_score = 10 if close[-1] <= thresh else (0 if close[-1] >= latest_vwap else ((latest_vwap - close[-1]) / (latest_vwap - thresh)) * 10)
-
-    # 3. Volume Reversal
-    avg_vol = pd.Series(vol).rolling(window=20).mean().values[-1]
-    vol_surge = vol[-1] / avg_vol
-    vol_score = min(10, (vol_surge - 1) * 20) if (close[-1] > close[-2] and vol_surge > VOLUME_SURGE_MULT) else 0
-
-    return round(sma_score + vwap_score + vol_score, 1)
-
 def call_gemini(ticker, score):
+    """2026 SDK implementation for forensic analysis."""
     if not GEMINI_API_KEY: return "AI Analysis disabled (Key missing)."
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = f"Analyze {ticker} with a technical score of {score}/30. Provide a 2-sentence bullish/bearish outlook and one primary risk."
+        prompt = (f"Forensic equity analysis for {ticker}. Technical Score: {score}/30. "
+                  "Provide a 2-sentence bullish/bearish summary and identify the primary risk factor.")
         response = client.models.generate_content(model="gemini-3-flash", contents=prompt)
         return response.text
     except Exception as e:
         return f"Gemini Error: {e}"
 
 def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    """Sends message with chunking to avoid Telegram character limits."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: 
+        print(message)
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Chunking for long reports
     for i in range(0, len(message), 4000):
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message[i:i+4000], "parse_mode": "Markdown"})
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main Logic ─────────────────────────────────────────────────────────────
 
 def main():
-    logger.info("Starting Daily Screen...")
+    logger.info("Starting Full Market Screen...")
     universe = get_universe()
     results = {}
 
-    # Scan the first 100 tickers to stay within GitHub Action limits
-    for t in universe[:100]:
-        score = compute_score(t)
-        if score: results[t] = score
-        time.sleep(0.2)
+    # Step 1: Batch Download (The high-speed way)
+    logger.info(f"Downloading data for {len(universe)} tickers...")
+    try:
+        all_data = yf.download(universe, period="4mo", interval="1d", group_by='ticker', progress=False, auto_adjust=True)
+    except Exception as e:
+        logger.error(f"Batch download failed: {e}")
+        return
 
+    # Step 2: Process All Tickers
+    for t in universe:
+        try:
+            # Extract ticker data from the batch multi-index dataframe
+            df = all_data[t].dropna()
+            if len(df) < 65: continue
+            
+            # Flatten to 1D arrays to prevent 'Series' errors
+            close = df['Close'].values.flatten()
+            
+            # Calculation: Simple Trend Score
+            sma60 = np.mean(close[-60:])
+            current = close[-1]
+            
+            # Score: Percent distance above SMA60
+            if current > sma60:
+                score = round(((current / sma60) - 1) * 200, 1)
+                results[t] = min(30, score) # Cap at 30
+        except:
+            continue
+
+    # Step 3: Rank and Report
     sorted_res = sorted(results.items(), key=lambda x: x[1], reverse=True)[:10]
     
-    report = f"📊 **Technical Screen ({datetime.now().strftime('%Y-%m-%d')})**\n\n"
-    report += "| Ticker | Score | Status |\n|---|---|---|\n"
-    
-    green_stocks = []
-    for t, s in sorted_res:
-        light = "🟢" if s >= SCORE_GREEN_THRESHOLD else "🟡" if s >= 10 else "🔴"
-        report += f"| {t} | {s} | {light} |\n"
-        if s >= SCORE_GREEN_THRESHOLD: green_stocks.append(t)
+    if not sorted_res:
+        send_telegram("📊 **Market Screen**: No stocks currently in an uptrend (Price > SMA60).")
+        return
 
-    if green_stocks:
-        report += "\n**🔍 Gemini Analysis (Top Green Stocks)**\n"
-        for g in green_stocks[:2]: # Deep dive on top 2
-            ai_text = call_gemini(g, results[g])
-            report += f"\n*{g} Score {results[g]}*:\n{ai_text}\n"
+    report = f"📊 **Market Screen: Top Performers ({len(universe)} checked)**\n\n"
+    report += "| Ticker | Trend Score | Light |\n|---|---|---|\n"
+    
+    for t, s in sorted_res:
+        light = "🟢" if s >= SCORE_GREEN_THRESHOLD else "🟡"
+        report += f"| {t} | {s} | {light} |\n"
+
+    # Step 4: AI Deep Dive on the Top 2 winners
+    report += "\n**🔍 Gemini Analysis (Market Leaders)**\n"
+    for i in range(min(2, len(sorted_res))):
+        t_name, t_score = sorted_res[i]
+        ai_insight = call_gemini(t_name, t_score)
+        report += f"\n*{t_name} (Score: {t_score})*:\n{ai_insight}\n"
 
     send_telegram(report)
-    logger.info("Process Complete.")
+    logger.info("Process Complete. Report sent to Telegram.")
 
 if __name__ == "__main__":
     main()
