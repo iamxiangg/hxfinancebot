@@ -21,8 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas requests lxml
-
+          pip install yfinance pandas requests lxml google-genai
       - name: Run screening
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
