@@ -1,71 +1,51 @@
-#!/usr/bin/env python3
 import os
 import time
 import requests
-import pandas as pd
 import yfinance as yf
 from datetime import datetime
 
-# --- Secrets from GitHub ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# Get Secrets
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-def send_telegram(message):
-    """Sends a plain text message to Telegram."""
-    print(f"Final Report:\n{message}", flush=True)
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Telegram secrets missing!")
+def send_telegram(msg):
+    if not TOKEN or not CHAT_ID:
+        print("❌ Error: Missing Telegram Secrets")
         return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": message, 
-        "parse_mode": "Markdown"
-    }
-    
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"❌ Telegram Error: {r.text}")
-    except Exception as e:
-        print(f"❌ Connection error: {e}")
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    r = requests.post(url, json=payload)
+    print(f"Telegram Response: {r.status_code}")
 
 def main():
-    print(f"--- STARTING NO-AI SCAN: {datetime.now()} ---", flush=True)
-
-    # Core high-volume universe
-    tickers = ["AAPL", "NVDA", "TSLA", "MSFT", "AMD", "GOOGL", "AMZN", "META", "AVGO", "NFLX"]
-    candidates = []
+    print(f"--- Scan Started: {datetime.now()} ---")
+    
+    # Simple list for testing
+    tickers = ["AAPL", "NVDA", "TSLA", "MSFT", "AMD", "GOOGL"]
+    hits = []
 
     for t in tickers:
         try:
-            print(f"Scanning: {t}...", flush=True)
-            # Fetch 4 months of data for a 60-day SMA
-            df = yf.download(t, period="4mo", interval="1d", progress=False)
-            
-            if not df.empty and len(df) >= 60:
-                current_price = float(df['Close'].iloc[-1])
-                sma60 = float(df['Close'].rolling(window=60).mean().iloc[-1])
-                
-                # The "Green" Condition
-                if current_price > sma60:
-                    candidates.append(t)
-            time.sleep(0.5) 
+            print(f"Checking {t}...")
+            df = yf.download(t, period="3mo", interval="1d", progress=False)
+            if not df.empty:
+                current = float(df['Close'].iloc[-1])
+                sma50 = float(df['Close'].rolling(window=50).mean().iloc[-1])
+                # If price is above average, it's a 'Hit'
+                if current > sma50:
+                    hits.append(t)
+            time.sleep(0.5)
         except Exception as e:
-            print(f"Error scanning {t}: {e}")
+            print(f"Error on {t}: {e}")
 
-    # Build and send report
-    if not candidates:
-        msg = "📊 **Daily Screen Complete**\nNo stocks currently meet the uptrend criteria (Price > SMA60)."
+    # Build the message
+    if hits:
+        message = "🚀 **Daily Screen Results**\n\nStocks in uptrend:\n" + "\n".join([f"• `{h}`" for h in hits])
     else:
-        msg = f"🚀 **Stock Signals ({datetime.now().strftime('%Y-%m-%d')})**\n\n"
-        msg += "The following stocks are in a technical uptrend (Above SMA60):\n"
-        for c in candidates:
-            msg += f"• `{c}`\n"
-    
-    send_telegram(msg)
-    print("--- SCAN COMPLETE ---", flush=True)
+        message = "📊 **Daily Screen**\nNo stocks found in uptrend today."
+
+    send_telegram(message)
+    print("--- Scan Finished ---")
 
 if __name__ == "__main__":
     main()
