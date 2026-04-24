@@ -2,26 +2,34 @@ name: Daily Stock Screen
 
 on:
   schedule:
-    - cron: "30 13 * * 1-5"
-  workflow_dispatch:
+    - cron: "30 13 * * 1-5" # Runs at 8:30 AM EST (13:30 UTC) Monday-Friday
+  workflow_dispatch: # Allows you to run it manually with a button click
 
 jobs:
   screen:
     runs-on: ubuntu-latest
+    
+    # Ensures the runner uses the modern environment
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip' # Speeds up future runs
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install yfinance pandas requests lxml
 
-      - name: Run screening
+      - name: Run screening script
+        # These are the only two secrets needed for the No-AI version
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
