@@ -6,8 +6,9 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import google.genai as genai  # Updated for 2026
+import google.genai as genai
 from datetime import datetime
+from finvizfinance.screener.overview import Overview
 
 # ── Configuration ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,141 +25,124 @@ SCORE_GREEN_THRESHOLD = 15
 
 # ── Universe Setup ─────────────────────────────────────────────────────────
 def get_universe():
+    """Fetches S&P 500 and NASDAQ 100 tickers via Finviz library."""
     try:
-        # Simplified robust universe fetch
-        sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]["Symbol"].tolist()
-        nasdaq100 = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")[4]["Ticker"].tolist()
-        # For testing/speed, we'll merge and take a manageable sample or full list
-        return list(set(sp500 + nasdaq100))
-    except Exception as e:
-        logger.error(f"Universe fetch failed: {e}")
-        return ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "AMD", "META"]
-
-UNIVERSE = get_universe()
-
-# ── Helper Functions ───────────────────────────────────────────────────────
-
-def get_safe_data(ticker, period="4mo"):
-    """Downloads data and flattens it to avoid 'Series' errors."""
-    try:
-        df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 65:
-            return None
+        logger.info("Connecting to Finviz...")
+        foverview = Overview()
         
-        # Flatten all relevant columns to 1D arrays immediately
+        # Pull S&P 500
+        foverview.set_filter(filters_dict={'Index': 'S&P 500'})
+        sp500_df = foverview.screener_view()
+        sp500 = sp500_df['Ticker'].tolist() if not sp500_df.empty else []
+        
+        # Pull Nasdaq 100
+        foverview.set_filter(filters_dict={'Index': 'NASDAQ 100'})
+        nasdaq_df = foverview.screener_view()
+        nasdaq100 = nasdaq_df['Ticker'].tolist() if not nasdaq_df.empty else []
+        
+        full_list = list(set(sp500 + nasdaq100))
+        if not full_list:
+            raise ValueError("Finviz returned empty list.")
+            
+        logger.info(f"Universe size: {len(full_list)} tickers.")
+        return [t.replace('.', '-') for t in full_list]
+    except Exception as e:
+        logger.warning(f"Finviz failed, using core backup: {e}")
+        return ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "AMD", "META", "AVGO", "NFLX"]
+
+# ── Analysis Helpers ───────────────────────────────────────────────────────
+
+def get_safe_data(ticker):
+    """Downloads yfinance data and flattens to prevent Series errors."""
+    try:
+        df = yf.download(ticker, period="4mo", interval="1d", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 65: return None
+        
+        # Flatten columns to 1D numpy arrays to avoid 'Series' errors
         data = {
             'Close': df['Close'].values.flatten(),
-            'Volume': df['Volume'].values.flatten(),
-            'High': df['High'].values.flatten(),
-            'Low': df['Low'].values.flatten()
+            'Volume': df['Volume'].values.flatten()
         }
-        # Filter NaNs
+        # Filter out NaNs
         mask = ~np.isnan(data['Close'])
-        for k in data:
-            data[k] = data[k][mask]
-            
-        return data
+        return {k: v[mask] for k, v in data.items()}
     except Exception as e:
-        logger.warning(f"Fetch failed for {ticker}: {e}")
+        logger.warning(f"YFinance error for {ticker}: {e}")
         return None
 
-def compute_technical_score(ticker):
+def compute_score(ticker):
     data = get_safe_data(ticker)
     if not data: return None
+    close, vol = data['Close'], data['Volume']
 
-    close = data['Close']
-    vol = data['Volume']
-    
-    # 1. SMA60 Score
+    # 1. SMA60 (Trend)
     sma60 = pd.Series(close).rolling(window=SMA_PERIOD).mean().values
     latest_sma = sma60[-1]
     if np.isnan(latest_sma): return None
-    
-    sma_ratio = (close[-1] / latest_sma) - 1
-    sma_score = min(10, max(0, sma_ratio * 200))
+    sma_score = min(10, max(0, ((close[-1] / latest_sma) - 1) * 200))
 
-    # 2. VWAP Score (Approximate)
+    # 2. VWAP (Value)
     vwap = np.cumsum(close * vol) / np.cumsum(vol)
-    latest_vwap = vwap[-1]
-    std_diff = np.std(close - vwap)
-    threshold = latest_vwap - (VWAP_STD_MULT * std_diff)
-    
-    if close[-1] >= latest_vwap: vwap_score = 0
-    elif close[-1] <= threshold: vwap_score = 10
-    else:
-        vwap_score = ((latest_vwap - close[-1]) / (latest_vwap - threshold)) * 10
+    latest_vwap, std_diff = vwap[-1], np.std(close - vwap)
+    thresh = latest_vwap - (VWAP_STD_MULT * std_diff)
+    vwap_score = 10 if close[-1] <= thresh else (0 if close[-1] >= latest_vwap else ((latest_vwap - close[-1]) / (latest_vwap - thresh)) * 10)
 
-    # 3. Volume Surge
+    # 3. Volume Reversal
     avg_vol = pd.Series(vol).rolling(window=20).mean().values[-1]
     vol_surge = vol[-1] / avg_vol
     vol_score = min(10, (vol_surge - 1) * 20) if (close[-1] > close[-2] and vol_surge > VOLUME_SURGE_MULT) else 0
 
     return round(sma_score + vwap_score + vol_score, 1)
 
-def fetch_fundamentals(ticker):
-    try:
-        info = yf.Ticker(ticker).info
-        return {
-            "rev_growth": f"{info.get('revenueGrowth', 0)*100:.1f}%",
-            "de": round(info.get("debtToEquity", 0) / 100, 2), # yfinance returns D/E as whole number often
-            "fcf": f"{info.get('freeCashflow', 0)/1e6:.1f}M"
-        }
-    except:
-        return {"rev_growth": "N/A", "de": "N/A", "fcf": "N/A"}
-
-def call_gemini(ticker, fund, score):
-    if not GEMINI_API_KEY: return "AI Key Missing."
+def call_gemini(ticker, score):
+    if not GEMINI_API_KEY: return "AI Analysis disabled (Key missing)."
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = f"Forensic analysis for {ticker}. Score: {score}. Fundamentals: Growth {fund['rev_growth']}, D/E {fund['de']}, FCF {fund['fcf']}. Provide Summary, Catalysts, and Risk in 4 bullet points total."
+        prompt = f"Analyze {ticker} with a technical score of {score}/30. Provide a 2-sentence bullish/bearish outlook and one primary risk."
         response = client.models.generate_content(model="gemini-3-flash", contents=prompt)
         return response.text
     except Exception as e:
         return f"Gemini Error: {e}"
 
 def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN: return
-    # Telegram has a 4096 character limit
-    if len(message) > 4000: message = message[:4000] + "..."
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    # Chunking for long reports
+    for i in range(0, len(message), 4000):
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message[i:i+4000], "parse_mode": "Markdown"})
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    logger.info("Starting analysis...")
+    logger.info("Starting Daily Screen...")
+    universe = get_universe()
     results = {}
-    
-    # Process a subset to avoid GitHub Action timeouts (Top 50 tickers)
-    test_universe = UNIVERSE[:50] 
-    
-    for t in test_universe:
-        score = compute_technical_score(t)
-        if score:
-            results[t] = score
+
+    # Scan the first 100 tickers to stay within GitHub Action limits
+    for t in universe[:100]:
+        score = compute_score(t)
+        if score: results[t] = score
         time.sleep(0.2)
 
     sorted_res = sorted(results.items(), key=lambda x: x[1], reverse=True)[:10]
     
-    report = "📊 **Daily Technical Screen**\n\n"
+    report = f"📊 **Technical Screen ({datetime.now().strftime('%Y-%m-%d')})**\n\n"
     report += "| Ticker | Score | Status |\n|---|---|---|\n"
     
     green_stocks = []
     for t, s in sorted_res:
         light = "🟢" if s >= SCORE_GREEN_THRESHOLD else "🟡" if s >= 10 else "🔴"
         report += f"| {t} | {s} | {light} |\n"
-        if s >= SCORE_GREEN_THRESHOLD:
-            green_stocks.append(t)
+        if s >= SCORE_GREEN_THRESHOLD: green_stocks.append(t)
 
     if green_stocks:
-        report += "\n**🔍 Deep Dive**\n"
-        for g in green_stocks[:2]: # Deep dive on top 2 green stocks to save time
-            f = fetch_fundamentals(g)
-            ai = call_gemini(g, f, results[g])
-            report += f"\n*{g}*:\n{ai}\n"
+        report += "\n**🔍 Gemini Analysis (Top Green Stocks)**\n"
+        for g in green_stocks[:2]: # Deep dive on top 2
+            ai_text = call_gemini(g, results[g])
+            report += f"\n*{g} Score {results[g]}*:\n{ai_text}\n"
 
     send_telegram(report)
-    logger.info("Report sent!")
+    logger.info("Process Complete.")
 
 if __name__ == "__main__":
     main()
