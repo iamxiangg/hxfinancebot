@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas numpy google-generativeai requests lxml
+          pip install yfinance pandas numpy google-genai requests lxml
 
       - name: Run screening
         env:
