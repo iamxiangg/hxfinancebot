@@ -17,7 +17,7 @@ def send_telegram(msg):
 
 def main():
     # Using the verified S&P 500 list from the repository
-    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
+    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/all.csv"
     
     try:
         tickers = pd.read_csv(url)['symbol'].tolist()
