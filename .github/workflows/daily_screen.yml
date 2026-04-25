@@ -1,29 +1,29 @@
-name: Daily Stock Screen
+name: Daily Signal Sheet
 
 on:
   schedule:
-    - cron: "30 13 * * 1-5"
+    # 00:00 UTC = 08:00 SGT, Monday to Friday
+    - cron: "0 0 * * 1-5"
   workflow_dispatch:
 
 jobs:
-  screen:
+  signal:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install yfinance pandas requests lxml google-genai finvizfinance
-      - name: Run screening
+        run: pip install yfinance pandas requests
+
+      - name: Run daily signal
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python run_screening.py
+        
