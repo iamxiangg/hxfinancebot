@@ -80,7 +80,7 @@ def compute_rsi(close_series, period=14):
 # ─────────────────────────────────────────────
 def main():
     # S&P 500 tickers from verified repo
-    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
+    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/all.csv"
     try:
         tickers = pd.read_csv(url)['symbol'].tolist()
     except Exception as e:
