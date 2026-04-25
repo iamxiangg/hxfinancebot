@@ -12,7 +12,7 @@ def send_telegram(msg):
 
 def main():
     # Pre-screened list (High volatility / Mid-Cap stocks are best for squeezes)
-    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/top_500.csv"
+    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
     tickers = pd.read_csv(url)['symbol'].tolist()
     
     candidates = []
