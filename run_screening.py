@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Daily Allocation Signal Sheet – scalar-safe version
+Daily Allocation Signal Sheet – new template
+Runs every weekday at 0800 SG time. Reports current recommended instruments.
 """
 
 import os
@@ -16,14 +17,13 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# ── Data helpers (robust to DataFrame vs Series) ───────────────────────────
+# ── Data helpers (scalar-safe) ─────────────────────────────────────────────
 
 def fetch_close(ticker: str) -> float:
     try:
         hist = yf.download(ticker, period="2d", progress=False, auto_adjust=True)
         if hist.empty:
             return None
-        # Squeeze to get a Series, then last value
         close_series = hist['Close'].squeeze()
         return float(close_series.iloc[-1])
     except Exception as e:
@@ -42,7 +42,7 @@ def compute_sma200(ticker: str) -> float:
         logger.warning(f"Failed to compute SMA200 for {ticker}: {e}")
         return None
 
-# ── Logic ──────────────────────────────────────────────────────────────────
+# ── Report builder ─────────────────────────────────────────────────────────
 
 def build_report() -> str:
     today = date.today()
@@ -58,32 +58,53 @@ def build_report() -> str:
         logger.error("Missing market data")
         return "⚠️ **Daily signal unavailable** – missing market data."
 
-    # Now all values are guaranteed floats
     vix_high = vix_close > 30
     qqq_above_sma = qqq_close > qqq_sma200
+    gld_above_sma = gld_close > gld_sma200
 
-    # Nasdaq instrument
+    # Nasdaq instrument & reasons
     if qqq_above_sma and not vix_high:
         nasdaq_instrument = "TQQQ (3×)"
-        nasdaq_reason = f"QQQ (${qqq_close:.2f}) > SMA200 (${qqq_sma200:.2f}) and VIX ({vix_close:.2f}) ≤ 30 → use TQQQ for 3× leverage."
+        nasdaq_reasons = [
+            f"VIX ≤ 30 ({vix_close:.2f}) – low volatility environment",
+            f"QQQ > SMA200 (${qqq_close:.2f} > ${qqq_sma200:.2f}) – uptrend confirmed",
+            "Use 3× leverage to maximise upside"
+        ]
     elif qqq_above_sma and vix_high:
         nasdaq_instrument = "QLD (2×)"
-        nasdaq_reason = f"QQQ > SMA200 but VIX > 30 → use QLD for reduced leverage."
+        nasdaq_reasons = [
+            f"VIX > 30 ({vix_close:.2f}) – elevated volatility",
+            f"QQQ > SMA200 (${qqq_close:.2f} > ${qqq_sma200:.2f}) – still in uptrend",
+            "Reduce leverage to 2× to manage risk"
+        ]
     elif not qqq_above_sma and vix_high:
         nasdaq_instrument = "Cash (SHY/T‑bills)"
-        nasdaq_reason = f"QQQ ≤ SMA200 and VIX > 30 → move Nasdaq portion to cash."
-    else:
+        nasdaq_reasons = [
+            f"VIX > 30 ({vix_close:.2f}) – high volatility",
+            f"QQQ ≤ SMA200 (${qqq_close:.2f} ≤ ${qqq_sma200:.2f}) – downtrend signal",
+            "Move Nasdaq portion to cash for capital preservation"
+        ]
+    else:  # not above sma and vix <= 30
         nasdaq_instrument = "QLD (2×)"
-        nasdaq_reason = f"QQQ ≤ SMA200 but VIX ≤ 30 → use QLD (2×) for moderate exposure."
+        nasdaq_reasons = [
+            f"VIX ≤ 30 ({vix_close:.2f}) – moderate volatility",
+            f"QQQ ≤ SMA200 (${qqq_close:.2f} ≤ ${qqq_sma200:.2f}) – below trend",
+            "Use 2× leverage for moderate exposure with safety"
+        ]
 
-    # Gold instrument
-    gld_above_sma = gld_close > gld_sma200
+    # Gold instrument & reasons
     if gld_above_sma:
         gold_instrument = "GLD"
-        gold_reason = f"GLD (${gld_close:.2f}) > SMA200 (${gld_sma200:.2f}) → buy/hold GLD."
+        gold_reasons = [
+            f"GLD > SMA200 (${gld_close:.2f} > ${gld_sma200:.2f}) – gold in uptrend",
+            "Hold as portfolio hedge"
+        ]
     else:
         gold_instrument = "Cash (SHY/T‑bills)"
-        gold_reason = f"GLD ≤ SMA200 → move gold portion to cash."
+        gold_reasons = [
+            f"GLD ≤ SMA200 (${gld_close:.2f} ≤ ${gld_sma200:.2f}) – gold in downtrend",
+            "Move gold portion to cash"
+        ]
 
     # Next trading day
     next_day = today + timedelta(days=1)
@@ -91,38 +112,31 @@ def build_report() -> str:
         next_day += timedelta(days=1)
     next_day_str = next_day.isoformat()
 
+    # Build report
     report = f"""📊 **Daily Allocation Signal Sheet**
-*{today} after market close*
+{today} after market close
 
 **Strategy Overview**
 • 85% Nasdaq‑100 (VIX+SMA200 matrix)
 • 15% Gold (GLD trend)
 • Execute next trading day at market open
 
-━━━━━━━━━━━━━━━━━━━━━━━
-**Nasdaq Allocation (85%)**
-| Indicator | Value |
-|-----------|-------|
-| QQQ Close | ${qqq_close:.2f} |
-| QQQ SMA200 | ${qqq_sma200:.2f} |
-| QQQ vs SMA | {"↑ Above" if qqq_above_sma else "↓ Below"} |
-| VIX Close | {vix_close:.2f} |
-| VIX Condition | {"≤ 30" if not vix_high else "> 30"} |
-| **Recommended** | **{nasdaq_instrument}** |
-
-**Why:** {nasdaq_reason}
+**Proposal:**
+- 85% **{nasdaq_instrument}**
+- 15% **{gold_instrument}**
 
 ━━━━━━━━━━━━━━━━━━━━━━━
-**Gold Allocation (15%)**
-| Indicator | Value |
-|-----------|-------|
-| GLD Close | ${gld_close:.2f} |
-| GLD SMA200 | ${gld_sma200:.2f} |
-| GLD vs SMA | {"↑ Above" if gld_above_sma else "↓ Below"} |
-| **Recommended** | **{gold_instrument}** |
 
-**Why:** {gold_reason}
+**Why {nasdaq_instrument}?**
+"""
+    for reason in nasdaq_reasons:
+        report += f"- {reason}\n"
 
+    report += f"\n**Why {gold_instrument}?**\n"
+    for reason in gold_reasons:
+        report += f"- {reason}\n"
+
+    report += f"""
 ━━━━━━━━━━━━━━━━━━━━━━━
 **Execution:** Buy these instruments at market open on {next_day_str} if not already held. Rebalance when signal changes.
 """
