@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily Allocation Signal Sheet (Nasdaq + Gold matrix)
-Runs every weekday at 0800 SG time. Reports current recommended instruments.
+Daily Allocation Signal Sheet – scalar-safe version
 """
 
 import os
@@ -17,14 +16,16 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# ── Data helpers ───────────────────────────────────────────────────────────
+# ── Data helpers (robust to DataFrame vs Series) ───────────────────────────
 
 def fetch_close(ticker: str) -> float:
     try:
         hist = yf.download(ticker, period="2d", progress=False, auto_adjust=True)
         if hist.empty:
             return None
-        return hist['Close'].iloc[-1]
+        # Squeeze to get a Series, then last value
+        close_series = hist['Close'].squeeze()
+        return float(close_series.iloc[-1])
     except Exception as e:
         logger.warning(f"Failed to fetch {ticker}: {e}")
         return None
@@ -34,7 +35,9 @@ def compute_sma200(ticker: str) -> float:
         hist = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
         if len(hist) < 200:
             return None
-        return hist['Close'].rolling(window=200).mean().iloc[-1]
+        close_series = hist['Close'].squeeze()
+        sma = close_series.rolling(window=200).mean().iloc[-1]
+        return float(sma)
     except Exception as e:
         logger.warning(f"Failed to compute SMA200 for {ticker}: {e}")
         return None
@@ -55,6 +58,7 @@ def build_report() -> str:
         logger.error("Missing market data")
         return "⚠️ **Daily signal unavailable** – missing market data."
 
+    # Now all values are guaranteed floats
     vix_high = vix_close > 30
     qqq_above_sma = qqq_close > qqq_sma200
 
