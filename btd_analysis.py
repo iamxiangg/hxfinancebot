@@ -63,7 +63,7 @@ def main():
     logger.info("Starting BTD Analysis")
 
     # ── Step 1: Authenticate to Google Sheets ──
-    creds_json = os.getenv('GCP_SERVICE_ACCOUNT')
+    creds_json = os.getenv('GCP_SERVICE_ACCOUNT_FILE')
     if not creds_json:
         logger.error("GCP_SERVICE_ACCOUNT not set")
         send_telegram("❌ BTD Analysis: GCP_SERVICE_ACCOUNT not set")
