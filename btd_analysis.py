@@ -3,7 +3,8 @@
 gh_btd.py — GitHub Actions BTD Analysis
 ========================================
 Fetches tickers from Google Sheets, runs BTD analysis,
-sends Telegram summary. No local files needed.
+sends Telegram summary. 
+Uses GitHub Secrets for GCP credentials.
 """
 
 import os
@@ -62,17 +63,19 @@ def get_sg_time() -> str:
 def main():
     logger.info("Starting BTD Analysis")
 
-    # ── Step 1: Authenticate to Google Sheets ──
+    # ── Step 1: Authenticate to Google Sheets using GitHub Secret ──
     creds_json = os.getenv('GCP_SERVICE_ACCOUNT_FILE')
     if not creds_json:
-        logger.error("GCP_SERVICE_ACCOUNT not set")
-        send_telegram("❌ BTD Analysis: GCP_SERVICE_ACCOUNT not set")
+        logger.error("Environment variable GCP_SERVICE_ACCOUNT_FILE is missing")
+        send_telegram("❌ BTD Analysis: Secret GCP_SERVICE_ACCOUNT_FILE not found")
         return
 
     try:
+        # Parse the JSON string from the secret directly into a dictionary
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
         client = gspread.authorize(creds)
+        
         workbook = client.open(SHEET_NAME)
         sheet = workbook.worksheet(WORKSHEET_NAME)
         hist_sheet = workbook.worksheet(HIST_WORKSHEET_NAME)
