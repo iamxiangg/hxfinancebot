@@ -23,7 +23,7 @@ jobs:
       - name: Run BTD Script
         env:
           # This creates the JSON file from your Secret on the fly
-          GCP_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python btd_analysis.py
