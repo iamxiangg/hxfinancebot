@@ -1,218 +1,198 @@
-#!/usr/bin/env python3
-"""
-Gamma Squeeze Breakout Scanner
-Uses Finviz -> yfinance -> Telegram notification
-"""
-
-import os
-import sys
-import time
 import logging
 import pandas as pd
-import yfinance as yf
+import numpy as np
 from finvizfinance.screener.overview import Overview
+from finvizfinance.screener.performance import Performance
+import yfinance as yf
+from datetime import datetime, timedelta
 
-# --- Configuration ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MAX_TICKERS_TO_ANALYSE = 50   # max after Finviz filter (avoid yfinance overload)
-TOP_RESULTS_TO_SEND = 5       # number of stocks in Telegram message
-YFINANCE_SLEEP = 0.3          # seconds between yfinance requests (rate limit)
-
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- Helper functions ----------
-
-def finviz_prefilter() -> list:
-    """Return list of tickers from Finviz with high short interest, volume, etc."""
-    filters = {
-        'Volume': 'Over 1M',
-        'Short Float': 'Over 20%',
-        'Price': 'Over $5',
-        'Float': 'Under 50M',
-        # optionally add: 'Borrow Rate' if available (FinvizElite)
-    }
-    screener = Overview()
-    try:
-        # Unpack dict as keyword arguments (fix for newer finvizfinance versions)
-        screener.set_filter(**filters)
-        df = screener.screener_view(columns=['Ticker', 'Volume', 'Short Float', 'Float'])
-        tickers = df['Ticker'].tolist()
-        logger.info(f"Finviz pre-filter returned {len(tickers)} tickers.")
-        return tickers[:MAX_TICKERS_TO_ANALYSE]  # limit further
-    except Exception as e:
-        logger.error(f"Finviz screening failed: {e}")
-        return []
-
-def get_otm_oi(ticker: yf.Ticker, price: float) -> float:
-    """Return total open interest of OTM calls (strike > price * 1.02) for nearest expiry."""
-    try:
-        expirations = ticker.options
-        if not expirations:
-            return 0
-        # Use the nearest expiration (first in list)
-        chain = ticker.option_chain(expirations[0]).calls
-        otm = chain[chain['strike'] > price * 1.02]
-        return otm['openInterest'].sum()
-    except Exception as e:
-        logger.debug(f"Error getting OI for {ticker.ticker}: {e}")
-        return 0
-
-def compute_composite_score(ticker_symbol: str) -> dict:
+# ──────────────────────────────────────────────
+# 1. GAMMA CALCULATION HELPER
+# ──────────────────────────────────────────────
+def get_gamma_exposure(ticker, expiration_range='week'):
     """
-    Compute composite score (0-100) for a single ticker.
-    Returns dict with ticker, composite, and sub‑scores for debugging.
+    Fetch option chain for the nearest expiry and compute gamma exposure.
+    Returns total gamma (sum of gamma * open_interest * 100) and max gamma strike.
     """
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
+        stock = yf.Ticker(ticker)
+        exps = stock.options
+        if not exps:
+            return 0, None, pd.DataFrame()
 
-        # --- Basic data ---
-        price = info.get('regularMarketPrice', 0)
-        if price <= 0:
-            return None
-
-        # --- Engine (50%) ---
-        # OI on OTM calls (nearest expiry)
-        oi_otm = get_otm_oi(ticker, price)
-        oi_score = min(100, oi_otm / 10_000 * 100) if oi_otm else 0
-
-        # Short interest % of float
-        si = info.get('shortPercentOfFloat', 0) or 0
-        si_score = min(100, si * 10)  # 10% SI -> 100, 50% -> 100 (capped)
-
-        # Float ratio (low is good)
-        float_shares = info.get('floatShares', 0)
-        outstanding = info.get('sharesOutstanding', 1)
-        float_ratio = float_shares / outstanding if float_shares else 1
-        float_score = max(0, 100 - (float_ratio * 330))  # 30% float -> 0
-
-        engine = 0.4 * oi_score + 0.3 * si_score + 0.3 * float_score
-
-        # --- Accelerator (30%) ---
-        # Days to cover
-        dtc = info.get('shortRatio', 0) or 0
-        dtc_score = min(100, dtc * 20)   # 5 days -> 100
-
-        # Borrow fee not directly available from yfinance; we skip (weight redistributed)
-        # Instead, we double weight on DTC and add a dummy (0) for borrow
-        # Gamma concentration: % of OI from top two strikes (simplified: use oi_score as proxy)
-        gamma_score = min(100, oi_otm / 5000 * 100)  # proxy
-
-        accelerator = 0.6 * dtc_score + 0.4 * gamma_score
-
-        # --- Trigger (20%) ---
-        # Historical data for SMA & volume
-        hist = ticker.history(period="2mo")
-        if hist.empty or len(hist) < 20:
-            return None
-
-        # SMA-20 breakout
-        sma20 = hist['Close'].rolling(20).mean().iloc[-1]
-        sma20_prev = hist['Close'].rolling(20).mean().iloc[-2]
-        breakout = hist['Close'].iloc[-1] > sma20 and hist['Close'].iloc[-2] <= sma20_prev
-        sma_score = 100 if breakout else 0
-
-        # Volume spike
-        avg_vol = hist['Volume'].rolling(20).mean().iloc[-1]
-        today_vol = hist['Volume'].iloc[-1]
-        vol_spike = (today_vol / avg_vol) - 1 if avg_vol > 0 else 0
-        vol_score = min(100, vol_spike * 100)  # 2x -> 100
-
-        # RSI (avoid overbought)
-        delta = hist['Close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.rolling(14).mean()
-        avg_loss = loss.rolling(14).mean()
-        rs = avg_gain / avg_loss.replace(0, 1e-10)
-        rsi = 100 - (100 / (1 + rs.iloc[-1]))
-        rsi_score = max(0, 100 - (rsi - 50))  # RSI=60->90, RSI=80->30
-
-        # Expiration proximity (days to nearest)
-        expirations = ticker.options
-        if expirations:
-            from datetime import datetime
-            nearest_exp = datetime.strptime(expirations[0], "%Y-%m-%d")
-            days_to_exp = (nearest_exp - datetime.now()).days
-            exp_score = 100 if days_to_exp <= 7 else (50 if days_to_exp <= 14 else 0)
+        # Choose nearest expiry
+        if expiration_range == 'week':
+            target_days = 7
+        elif expiration_range == 'month':
+            target_days = 30
         else:
-            exp_score = 0
+            target_days = 7
 
-        # News (catalyst proxy)
-        news_count = len(ticker.news) if ticker.news else 0
-        cat_score = 50 if news_count > 0 else 0
+        now = datetime.now()
+        best_exp = None
+        best_diff = 999
+        for e in exps:
+            exp_date = datetime.strptime(e, '%Y-%m-%d')
+            diff = (exp_date - now).days
+            if 0 <= diff <= target_days * 2 and abs(diff - target_days) < best_diff:
+                best_diff = abs(diff - target_days)
+                best_exp = e
 
-        trigger = (0.30 * sma_score + 0.25 * vol_score + 0.20 * exp_score +
-                   0.15 * rsi_score + 0.10 * cat_score)
+        if not best_exp:
+            return 0, None, pd.DataFrame()
 
-        # Composite
-        composite = 0.50 * engine + 0.30 * accelerator + 0.20 * trigger
+        opt = stock.option_chain(best_exp)
+        calls = opt.calls.copy()
+        puts = opt.puts.copy()
 
-        return {
-            'ticker': ticker_symbol,
-            'composite': round(composite, 1),
-            'price': price,
-            'short_float': si,
-            'days_to_cover': dtc,
-            'oi_otm': int(oi_otm),
-            'breakout': breakout,
-            'volume_spike': round(vol_spike, 2),
-            'rsi': round(rsi, 1)
-        }
+        # Calculate gamma exposure per strike: gamma * openInterest * 100
+        calls['GammaExposure'] = calls['gamma'] * calls['openInterest'] * 100
+        puts['GammaExposure'] = puts['gamma'] * puts['openInterest'] * 100
+        calls['Type'] = 'Call'
+        puts['Type'] = 'Put'
+
+        combined = pd.concat([calls[['strike', 'gamma', 'openInterest', 'GammaExposure', 'Type']],
+                              puts[['strike', 'gamma', 'openInterest', 'GammaExposure', 'Type']]])
+
+        total_gamma = combined['GammaExposure'].sum()
+        max_gamma_strike = combined.loc[combined['GammaExposure'].idxmax(), 'strike'] if not combined.empty else None
+
+        return total_gamma, max_gamma_strike, combined
 
     except Exception as e:
-        logger.warning(f"Failed to process {ticker_symbol}: {e}")
-        return None
+        logger.warning(f"Gamma calc failed for {ticker}: {e}")
+        return 0, None, pd.DataFrame()
 
-
-# ---------- Main ----------
-def main():
+# ──────────────────────────────────────────────
+# 2. FINVIZ SCREENING (fixed)
+# ──────────────────────────────────────────────
+def gamma_squeeze_screener():
     logger.info("Starting gamma squeeze scanner...")
 
-    # 1. Finviz pre-filter
-    tickers = finviz_prefilter()
-    if not tickers:
+    try:
+        f = Overview()
+        filters = {
+            'Volume': 'Over 2M',
+            'Market Cap.': 'Small',          # adjust as needed
+            'Relative Volume': 'Over 1.5',
+            'Short Float': 'Over 10%',
+            'Price': 'Over $5',
+            'Change': 'Over 5%'
+        }
+        f.set_filter(filters=filters)
+        candidates = f.screener_view()
+    except Exception as e:
+        logger.error(f"Finviz screening failed: {e}")
         logger.error("No tickers from Finviz. Exiting.")
+        return pd.DataFrame()
+
+    if candidates.empty:
+        logger.info("No tickers matched the filters.")
+        return pd.DataFrame()
+
+    logger.info(f"Found {len(candidates)} potential candidates: {candidates['Ticker'].tolist()}")
+    return candidates
+
+# ──────────────────────────────────────────────
+# 3. MAIN ANALYSIS
+# ──────────────────────────────────────────────
+def analyze_gamma_squeeze(candidates_df):
+    results = []
+
+    for idx, row in candidates_df.iterrows():
+        ticker = row['Ticker']
+        logger.info(f"Analyzing {ticker}...")
+
+        total_gamma, max_gamma_strike, chain = get_gamma_exposure(ticker)
+
+        # Fetch current price & short interest from Finviz data
+        price = row.get('Price', np.nan)
+        short_float_pct = row.get('Short Float', '0%')
+        volume = row.get('Volume', 0)
+
+        # Clean short float percentage
+        try:
+            short_float_val = float(short_float_pct.strip('%'))
+        except:
+            short_float_val = 0.0
+
+        # Relative volume indicator (crude: volume / avg volume)
+        rel_vol = row.get('Rel Volume', 1)
+
+        # Gamma squeeze score (heuristic)
+        gamma_score = 0
+        if total_gamma > 1e6:
+            gamma_score += 3
+        elif total_gamma > 5e5:
+            gamma_score += 2
+        elif total_gamma > 1e5:
+            gamma_score += 1
+
+        # Short interest score
+        short_score = 0
+        if short_float_val > 30:
+            short_score = 3
+        elif short_float_val > 20:
+            short_score = 2
+        elif short_float_val > 10:
+            short_score = 1
+
+        # Volume score
+        vol_score = 0
+        if volume > 10_000_000:
+            vol_score = 3
+        elif volume > 5_000_000:
+            vol_score = 2
+        elif volume > 2_000_000:
+            vol_score = 1
+
+        total_score = gamma_score + short_score + vol_score
+
+        results.append({
+            'Ticker': ticker,
+            'Price': price,
+            'Short Float %': short_float_val,
+            'Volume': volume,
+            'Gamma Exposure': round(total_gamma, 0),
+            'Max Gamma Strike': max_gamma_strike,
+            'Gamma Score': gamma_score,
+            'Short Score': short_score,
+            'Vol Score': vol_score,
+            'Total Squeeze Score': total_score
+        })
+
+        # Avoid hammering Yahoo Finance
+        pd.Timestamp('0.5s')
+
+    return pd.DataFrame(results)
+
+# ──────────────────────────────────────────────
+# 4. OUTPUT
+# ──────────────────────────────────────────────
+def main():
+    # Step 1: Screen Finviz
+    candidates_df = gamma_squeeze_screener()
+    if candidates_df.empty:
         return
 
-    # 2. Deep analysis with yfinance
-    results = []
-    for i, symbol in enumerate(tickers):
-        logger.info(f"Processing {i+1}/{len(tickers)}: {symbol}")
-        result = compute_composite_score(symbol)
-        if result:
-            results.append(result)
-        time.sleep(YFINANCE_SLEEP)
+    # Step 2: Analyze each candidate
+    logger.info("Analyzing options gamma for each candidate...")
+    results_df = analyze_gamma_squeeze(candidates_df)
 
-    # 3. Sort by composite score descending
-    results.sort(key=lambda x: x['composite'], reverse=True)
-    top = results[:TOP_RESULTS_TO_SEND]
+    # Step 3: Sort and display
+    results_df.sort_values('Total Squeeze Score', ascending=False, inplace=True)
 
-    # 4. Prepare Telegram message
-    msg_lines = ["🔥 **Gamma Squeeze Breakout Scan**", ""]
-    if top:
-        for r in top:
-            msg_lines.append(
-                f"• {r['ticker']} (Score: {r['composite']})\n"
-                f"  Price: ${r['price']:.2f} | SI: {r['short_float']:.1%} | DTC: {r['days_to_cover']:.1f}\n"
-                f"  OI OTM: {r['oi_otm']:,} | Breakout: {'✅' if r['breakout'] else '❌'}\n"
-                f"  Vol Spike: {r['volume_spike']*100:.0f}% | RSI: {r['rsi']}"
-            )
-    else:
-        msg_lines.append("No candidates found today.")
+    print("\n" + "="*80)
+    print("GAMMA SQUEEZE SCANNER RESULTS")
+    print("="*80)
+    print(results_df.to_string(index=False))
 
-    message = "\n\n".join(msg_lines)
-
-    # 5. Send Telegram notification (if token provided)
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        from telegram_notifier import send_telegram
-        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, message)
-    else:
-        logger.info("No Telegram credentials set – printing message:\n")
-        print(message)
+    # Optional: save to CSV
+    results_df.to_csv('gamma_squeeze_candidates.csv', index=False)
+    logger.info("Results saved to gamma_squeeze_candidates.csv")
 
 if __name__ == "__main__":
     main()
