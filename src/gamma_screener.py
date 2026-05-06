@@ -1,198 +1,174 @@
 import logging
 import pandas as pd
 import numpy as np
-from finvizfinance.screener.overview import Overview
-from finvizfinance.screener.performance import Performance
 import yfinance as yf
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
+from scipy.stats import norm
+from finvizfinance.screener.overview import Overview
+
+# Import your custom notifier
+from telegram_notifier import send_telegram
+
+# ──────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
-# 1. GAMMA CALCULATION HELPER
+# 1. GAMMA CALCULATION (Black-Scholes)
 # ──────────────────────────────────────────────
-def get_gamma_exposure(ticker, expiration_range='week'):
-    """
-    Fetch option chain for the nearest expiry and compute gamma exposure.
-    Returns total gamma (sum of gamma * open_interest * 100) and max gamma strike.
-    """
+def calculate_gamma(S, K, T, r, sigma):
+    """Calculates Option Gamma."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0
+    try:
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+        return gamma
+    except:
+        return 0
+
+def get_gamma_exposure(ticker):
+    """Fetches option chain and computes Net Gamma Exposure."""
     try:
         stock = yf.Ticker(ticker)
+        # Use fast_info for current price to save API time
+        current_price = stock.fast_info['lastPrice']
         exps = stock.options
         if not exps:
-            return 0, None, pd.DataFrame()
+            return 0, None
 
-        # Choose nearest expiry
-        if expiration_range == 'week':
-            target_days = 7
-        elif expiration_range == 'month':
-            target_days = 30
-        else:
-            target_days = 7
-
+        # Target the nearest monthly or weekly expiry (approx 7-10 days)
         now = datetime.now()
-        best_exp = None
-        best_diff = 999
-        for e in exps:
-            exp_date = datetime.strptime(e, '%Y-%m-%d')
-            diff = (exp_date - now).days
-            if 0 <= diff <= target_days * 2 and abs(diff - target_days) < best_diff:
-                best_diff = abs(diff - target_days)
-                best_exp = e
-
-        if not best_exp:
-            return 0, None, pd.DataFrame()
-
+        best_exp = min(exps, key=lambda x: abs((datetime.strptime(x, '%Y-%m-%d') - now).days - 7))
+        
         opt = stock.option_chain(best_exp)
-        calls = opt.calls.copy()
-        puts = opt.puts.copy()
+        t_days = (datetime.strptime(best_exp, '%Y-%m-%d') - now).days
+        T = max(t_days, 1) / 365.0 
+        r = 0.04  # Proxy 4% risk-free rate
 
-        # Calculate gamma exposure per strike: gamma * openInterest * 100
-        calls['GammaExposure'] = calls['gamma'] * calls['openInterest'] * 100
-        puts['GammaExposure'] = puts['gamma'] * puts['openInterest'] * 100
-        calls['Type'] = 'Call'
-        puts['Type'] = 'Put'
+        # Calculate Call Gamma
+        call_gex = 0
+        for _, row in opt.calls.iterrows():
+            if row['impliedVolatility'] > 0 and row['openInterest'] > 0:
+                g = calculate_gamma(current_price, row['strike'], T, r, row['impliedVolatility'])
+                call_gex += (g * row['openInterest'] * 100)
 
-        combined = pd.concat([calls[['strike', 'gamma', 'openInterest', 'GammaExposure', 'Type']],
-                              puts[['strike', 'gamma', 'openInterest', 'GammaExposure', 'Type']]])
+        # Calculate Put Gamma
+        put_gex = 0
+        for _, row in opt.puts.iterrows():
+            if row['impliedVolatility'] > 0 and row['openInterest'] > 0:
+                g = calculate_gamma(current_price, row['strike'], T, r, row['impliedVolatility'])
+                put_gex += (g * row['openInterest'] * 100)
 
-        total_gamma = combined['GammaExposure'].sum()
-        max_gamma_strike = combined.loc[combined['GammaExposure'].idxmax(), 'strike'] if not combined.empty else None
+        # Net Gamma (Call GEX - Put GEX)
+        # Positive values suggest dealers are long gamma and must buy as price rises
+        net_gex = call_gex - put_gex
+        
+        # Max Gamma Wall (Strike with highest total exposure)
+        combined = pd.concat([opt.calls, opt.puts])
+        # Simple heuristic for 'Wall' using Open Interest
+        max_strike = combined.loc[combined['openInterest'].idxmax(), 'strike']
 
-        return total_gamma, max_gamma_strike, combined
+        return net_gex, max_strike
 
     except Exception as e:
-        logger.warning(f"Gamma calc failed for {ticker}: {e}")
-        return 0, None, pd.DataFrame()
+        logger.warning(f"Could not process options for {ticker}: {e}")
+        return 0, None
 
 # ──────────────────────────────────────────────
-# 2. FINVIZ SCREENING (fixed)
+# 2. SCREENER & ANALYZER
 # ──────────────────────────────────────────────
-def gamma_squeeze_screener():
-    logger.info("Starting gamma squeeze scanner...")
-
+def run_scanner():
+    logger.info("Scanning Finviz for candidates...")
     try:
         f = Overview()
+        # Corrected filter logic for finvizfinance
         filters = {
-            'Volume': 'Over 2M',
-            'Market Cap.': 'Small',          # adjust as needed
-            'Relative Volume': 'Over 1.5',
-            'Short Float': 'Over 10%',
-            'Price': 'Over $5',
-            'Change': 'Over 5%'
+            'Average Volume': 'Over 1M',
+            'Market Cap.': 'Small ($300mln to $2bln)',
+            'Short Float': 'Over 15%',
+            'Relative Volume': 'Over 1.5'
         }
-        f.set_filter(filters=filters)
+        f.set_filter(**filters)
         candidates = f.screener_view()
     except Exception as e:
-        logger.error(f"Finviz screening failed: {e}")
-        logger.error("No tickers from Finviz. Exiting.")
+        logger.error(f"Finviz API error: {e}")
         return pd.DataFrame()
 
-    if candidates.empty:
-        logger.info("No tickers matched the filters.")
+    if candidates is None or candidates.empty:
+        logger.info("No candidates found.")
         return pd.DataFrame()
 
-    logger.info(f"Found {len(candidates)} potential candidates: {candidates['Ticker'].tolist()}")
-    return candidates
-
-# ──────────────────────────────────────────────
-# 3. MAIN ANALYSIS
-# ──────────────────────────────────────────────
-def analyze_gamma_squeeze(candidates_df):
     results = []
-
-    for idx, row in candidates_df.iterrows():
+    for _, row in candidates.iterrows():
         ticker = row['Ticker']
         logger.info(f"Analyzing {ticker}...")
-
-        total_gamma, max_gamma_strike, chain = get_gamma_exposure(ticker)
-
-        # Fetch current price & short interest from Finviz data
-        price = row.get('Price', np.nan)
-        short_float_pct = row.get('Short Float', '0%')
-        volume = row.get('Volume', 0)
-
-        # Clean short float percentage
+        
+        net_gex, wall = get_gamma_exposure(ticker)
+        
+        # Cleaning data
         try:
-            short_float_val = float(short_float_pct.strip('%'))
+            short_p = float(str(row['Short Float']).strip('%'))
+            rel_vol = float(row['Rel Volume'])
+            price = float(row['Price'])
         except:
-            short_float_val = 0.0
+            short_p, rel_vol, price = 0, 0, 0
 
-        # Relative volume indicator (crude: volume / avg volume)
-        rel_vol = row.get('Rel Volume', 1)
-
-        # Gamma squeeze score (heuristic)
-        gamma_score = 0
-        if total_gamma > 1e6:
-            gamma_score += 3
-        elif total_gamma > 5e5:
-            gamma_score += 2
-        elif total_gamma > 1e5:
-            gamma_score += 1
-
-        # Short interest score
-        short_score = 0
-        if short_float_val > 30:
-            short_score = 3
-        elif short_float_val > 20:
-            short_score = 2
-        elif short_float_val > 10:
-            short_score = 1
-
-        # Volume score
-        vol_score = 0
-        if volume > 10_000_000:
-            vol_score = 3
-        elif volume > 5_000_000:
-            vol_score = 2
-        elif volume > 2_000_000:
-            vol_score = 1
-
-        total_score = gamma_score + short_score + vol_score
+        # Scoring Logic
+        score = 0
+        if short_p > 25: score += 4
+        elif short_p > 15: score += 2
+        
+        if net_gex > 500_000: score += 3
+        if rel_vol > 2.0: score += 2
+        if price < 50: score += 1 # Cheaper stocks squeeze harder
 
         results.append({
             'Ticker': ticker,
             'Price': price,
-            'Short Float %': short_float_val,
-            'Volume': volume,
-            'Gamma Exposure': round(total_gamma, 0),
-            'Max Gamma Strike': max_gamma_strike,
-            'Gamma Score': gamma_score,
-            'Short Score': short_score,
-            'Vol Score': vol_score,
-            'Total Squeeze Score': total_score
+            'Short_Pct': short_p,
+            'Net_GEX': round(net_gex, 0),
+            'Wall': wall,
+            'Score': score
         })
+        time.sleep(0.5) # Avoid Yahoo Finance rate limits
 
-        # Avoid hammering Yahoo Finance
-        pd.Timestamp('0.5s')
-
-    return pd.DataFrame(results)
+    return pd.DataFrame(results).sort_values(by='Score', ascending=False)
 
 # ──────────────────────────────────────────────
-# 4. OUTPUT
+# 3. MAIN EXECUTION
 # ──────────────────────────────────────────────
-def main():
-    # Step 1: Screen Finviz
-    candidates_df = gamma_squeeze_screener()
-    if candidates_df.empty:
-        return
-
-    # Step 2: Analyze each candidate
-    logger.info("Analyzing options gamma for each candidate...")
-    results_df = analyze_gamma_squeeze(candidates_df)
-
-    # Step 3: Sort and display
-    results_df.sort_values('Total Squeeze Score', ascending=False, inplace=True)
-
-    print("\n" + "="*80)
-    print("GAMMA SQUEEZE SCANNER RESULTS")
-    print("="*80)
-    print(results_df.to_string(index=False))
-
-    # Optional: save to CSV
-    results_df.to_csv('gamma_squeeze_candidates.csv', index=False)
-    logger.info("Results saved to gamma_squeeze_candidates.csv")
-
 if __name__ == "__main__":
-    main()
+    report = run_scanner()
+
+    if not report.empty:
+        # Filter for quality alerts
+        alerts = report[report['Score'] >= 5]
+        
+        print("\n" + "="*60)
+        print(report.to_string(index=False))
+        print("="*60)
+
+        if not alerts.empty:
+            msg = "🚨 *GAMMA SQUEEZE ALERT* 🚨\n\n"
+            for _, row in alerts.head(5).iterrows():
+                msg += (f"Ticker: *{row['Ticker']}*\n"
+                        f"Price: ${row['Price']}\n"
+                        f"Short Float: {row['Short_Pct']}%\n"
+                        f"Net GEX: {row['Net_GEX']:,.0f}\n"
+                        f"Wall: {row['Wall']}\n"
+                        f"Score: *{row['Score']}*\n"
+                        f"---------------------------\n")
+            
+            send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+            logger.info("Alerts sent to Telegram.")
+        
+        report.to_csv("gamma_scan_results.csv", index=False)
+    else:
+        logger.info("Scan completed with no results.")
