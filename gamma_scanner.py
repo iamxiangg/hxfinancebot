@@ -880,36 +880,33 @@ def finviz_screen() -> list:
         logger.error(f"Finviz error: {e}")
         return []
 
-
 def build_universe() -> list:
     """Build stock universe, prioritizing Finviz-filtered names."""
     tickers = set()
-    
+
     for t in CUSTOM_TICKERS:
         t = t.strip().upper()
         if t:
             tickers.add(t)
-    
+
     finviz_tickers = finviz_screen()
     if finviz_tickers:
         tickers.update(finviz_tickers)
         return sorted(tickers)
-    
-      logger.info("Falling back to SP500 + custom")
-      try:
-          # Use CSV from GitHub as reliable SP500 source
-          url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
-          sp500_df = pd.read_csv(url)
-          # Assume first column contains ticker symbols
-          ticker_col = sp500_df.columns[0]
-          sp500_tickers = sp500_df[ticker_col].dropna().tolist()
-          tickers.update(t.replace(".", "-") for t in sp500_tickers)
-          logger.info(f"Loaded {len(sp500_tickers)} SP500 tickers from CSV")
-      except Exception as e:
-          logger.warning(f"SP500 CSV fetch failed: {e}")
 
-      return sorted(tickers)
+    logger.info("Falling back to SP500 + custom")
+    try:
+        # Use CSV from GitHub as reliable SP500 source
+        url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
+        sp500_df = pd.read_csv(url)
+        ticker_col = sp500_df.columns[0]
+        sp500_tickers = sp500_df[ticker_col].dropna().tolist()
+        tickers.update(t.replace(".", "-") for t in sp500_tickers)
+        logger.info(f"Loaded {len(sp500_tickers)} SP500 tickers from CSV")
+    except Exception as e:
+        logger.warning(f"SP500 CSV fetch failed: {e}")
 
+    return sorted(tickers)
 
 # =====================================================================
 # SECTION 12: TELEGRAM NOTIFICATION
