@@ -1,0 +1,84 @@
+name: Gamma Amplification Scanner
+
+on:
+  schedule:
+    # Mon-Fri: 8:30am ET, 4:00pm ET, 6:30pm ET
+    - cron: '30 12 * * 1-5'
+    - cron: '0 20 * * 1-5'
+    - cron: '30 22 * * 1-5'
+  
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Scan type'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - quick
+      tickers:
+        description: 'Specific tickers (comma-separated)'
+        required: false
+        type: string
+
+env:
+  PYTHON_VERSION: '3.11'
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  CUSTOM_TICKERS: 'GME,AMC,DJT,PLTR,MARA,MSTR,TSLA,SOFI,HOOD,COIN'
+  LOG_LEVEL: 'INFO'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: 🔍 Run scan
+        id: scan
+        env:
+          SCAN_TYPE: ${{ inputs.scan_type || 'full' }}
+          TICKERS: ${{ inputs.tickers || '' }}
+        run: |
+          if [ "$SCAN_TYPE" = "quick" ]; then
+            python gamma_scanner.py --quick
+          elif [ -n "$TICKERS" ]; then
+            python gamma_scanner.py --ticker "$TICKERS"
+          else
+            python gamma_scanner.py
+          fi
+      
+      - name: 📤 Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamma-scan-results-${{ github.run_id }}
+          path: gamma_scan_*.csv
+          retention-days: 7
+          if-no-files-found: ignore
+      
+      - name: 💬 Notify on failure
+        if: failure()
+        env:
+          FAIL_MSG: "❌ *Gamma Scan Failed*\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${FAIL_MSG}" \
+            -d "parse_mode=Markdown" \
+            --max-time 10
+
