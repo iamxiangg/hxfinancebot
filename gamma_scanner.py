@@ -858,7 +858,7 @@ def finviz_screen() -> list:
             'Average Volume': 'Over 1M',
             'Market Cap.': 'Small ($300mln to $2bln)',
             'Float Short': 'Over 10%',
-            'Relative Volume': 'Over 1.2',
+            'Relative Volume': 'Over 1.5',
             'Price': 'Over $5',
             'Option/Short': 'Optionable',
         }
