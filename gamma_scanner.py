@@ -895,20 +895,20 @@ def build_universe() -> list:
         tickers.update(finviz_tickers)
         return sorted(tickers)
     
-    logger.info("Falling back to SP500 + custom")
-    try:
-    # Use CSV from GitHub as reliable SP500 source
-    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
-    sp500_df = pd.read_csv(url)
-    # Assume first column contains ticker symbols
-    ticker_col = sp500_df.columns[0]
-    sp500_tickers = sp500_df[ticker_col].dropna().tolist()
-    tickers.update(t.replace(".", "-") for t in sp500_tickers)
-    logger.info(f"Loaded {len(sp500_tickers)} SP500 tickers from CSV")
-    except Exception as e:
-        logger.warning(f"SP500 CSV fetch failed: {e}")
+      logger.info("Falling back to SP500 + custom")
+      try:
+          # Use CSV from GitHub as reliable SP500 source
+          url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
+          sp500_df = pd.read_csv(url)
+          # Assume first column contains ticker symbols
+          ticker_col = sp500_df.columns[0]
+          sp500_tickers = sp500_df[ticker_col].dropna().tolist()
+          tickers.update(t.replace(".", "-") for t in sp500_tickers)
+          logger.info(f"Loaded {len(sp500_tickers)} SP500 tickers from CSV")
+      except Exception as e:
+          logger.warning(f"SP500 CSV fetch failed: {e}")
 
-    return sorted(tickers)
+      return sorted(tickers)
 
 
 # =====================================================================
