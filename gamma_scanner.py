@@ -852,16 +852,16 @@ def finviz_screen() -> list:
     try:
         # CORRECTED: Use Ticker instead of Overview for multi-tab filter access
         from finvizfinance.screener.ticker import Ticker
-        
+
         screener = Ticker()
-	filters = {
-	    'Average Volume': 'Over 1M',
-	    'Market Cap.': 'Small ($300mln to $2bln)',
-	    'Float Short': 'Over 10%',
-	    'Relative Volume': 'Over 1.2',
-	    'Price': 'Over $5',
-	    'Option/Short': 'Optionable',
-	}
+        filters = {
+            'Average Volume': 'Over 1M',
+            'Market Cap.': 'Small ($300mln to $2bln)',
+            'Float Short': 'Over 10%',
+            'Relative Volume': 'Over 1.2',
+            'Price': 'Over $5',
+            'Option/Short': 'Optionable',
+        }
         screener.set_filter(filters_dict=filters)
         df = screener.screener_view()
         
@@ -897,14 +897,14 @@ def build_universe() -> list:
     
     logger.info("Falling back to SP500 + custom")
     try:
-	# Use CSV from GitHub as reliable SP500 source
-	url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
-	sp500_df = pd.read_csv(url)
-	# Assume first column contains ticker symbols
-	ticker_col = sp500_df.columns[0]
-	sp500_tickers = sp500_df[ticker_col].dropna().tolist()
-	tickers.update(t.replace(".", "-") for t in sp500_tickers)
-	logger.info(f"Loaded {len(sp500_tickers)} SP500 tickers from CSV")
+    # Use CSV from GitHub as reliable SP500 source
+    url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
+    sp500_df = pd.read_csv(url)
+    # Assume first column contains ticker symbols
+    ticker_col = sp500_df.columns[0]
+    sp500_tickers = sp500_df[ticker_col].dropna().tolist()
+    tickers.update(t.replace(".", "-") for t in sp500_tickers)
+    logger.info(f"Loaded {len(sp500_tickers)} SP500 tickers from CSV")
     except Exception as e:
         logger.warning(f"SP500 CSV fetch failed: {e}")
 
