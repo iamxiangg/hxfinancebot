@@ -35,8 +35,9 @@ def finviz_prefilter() -> list:
         # optionally add: 'Borrow Rate' if available (FinvizElite)
     }
     screener = Overview()
-    screener.set_filter(filters)
     try:
+        # Unpack dict as keyword arguments (fix for newer finvizfinance versions)
+        screener.set_filter(**filters)
         df = screener.screener_view(columns=['Ticker', 'Volume', 'Short Float', 'Float'])
         tickers = df['Ticker'].tolist()
         logger.info(f"Finviz pre-filter returned {len(tickers)} tickers.")
