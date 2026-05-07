@@ -7,7 +7,7 @@ Optimizations:
 2. ThreadPoolExecutor parallelism (platform-aware worker count)
 3. Dynamic rate limiter — only sleeps when Yahoo rate-limits
 4. Early exit on NO_SIGNAL (skips report building)
-5. All derived data computed inline from pre-fetched data
+5. Compact Telegram notification (no CSV, no oversized messages)
 """
 import os
 import logging
@@ -66,22 +66,16 @@ class RateLimiter:
         """Sleep only if we've exceeded max requests/second."""
         now = time.time()
         with self.lock:
-            # Remove timestamps older than 1 second
             self.timestamps = [t for t in self.timestamps if now - t < 1.0]
-            
             if len(self.timestamps) >= self.max_per_second:
-                # We're over the limit — calculate how long to wait
                 oldest = self.timestamps[0]
                 wait_time = 1.0 - (now - oldest) + 0.05
                 if wait_time > 0:
                     time.sleep(wait_time)
-                # After sleeping, clean up old timestamps again
                 now = time.time()
                 self.timestamps = [t for t in self.timestamps if now - t < 1.0]
-            
             self.timestamps.append(time.time())
 
-# Global rate limiter instance
 _rate_limiter = RateLimiter(max_per_second=3)
 
 
@@ -197,7 +191,6 @@ def analyze_concentration(gex_by_strike: dict, current_price: float) -> dict:
     num_peaks = len(peaks)
     shape = "single_peak" if num_peaks <= 1 else "double_peak" if num_peaks == 2 else "multi_peak"
 
-    # Composite concentration score
     concentration_score = (
         gini * 0.30 +
         (1 - entropy_ratio) * 0.25 +
@@ -205,7 +198,6 @@ def analyze_concentration(gex_by_strike: dict, current_price: float) -> dict:
         (1 - min(effective_n / n, 1)) * 0.20
     )
 
-    # Calibrated loop gain
     loop_gain = concentration_score * (1 + wall_sharpness) * 0.45
 
     if loop_gain < 0.25:
@@ -256,14 +248,6 @@ def monte_carlo_cascade(
     num_simulations: int = 2000,
     max_steps: int = 50,
 ) -> dict:
-    """Monte Carlo simulation of gamma cascade feedback loop.
-    
-    net_gex should be the ORIGINAL signed value (negative = short gamma = squeeze potential).
-    If net_gex >= 0 (long gamma), there's no cascade possible.
-    
-    percent_self_sustaining = percentage of SIMULATIONS where the feedback loop
-    dominates the initial move for at least one step.
-    """
     if avg_dvol <= 0 or net_gex >= 0:
         return {
             "median_total_amplification": 0,
@@ -282,12 +266,12 @@ def monte_carlo_cascade(
         catalyst_move_pct = 1.5
 
     total_amplifications = []
-    self_sustaining_simulations = 0  # count SIMULATIONS, not steps
+    self_sustaining_simulations = 0
 
     for sim in range(num_simulations):
         price = current_price
         cumulative_move = 0
-        simulation_was_self_sustaining = False  # one boolean per simulation
+        simulation_was_self_sustaining = False
 
         for step in range(max_steps):
             step_move = np.random.normal(
@@ -305,7 +289,6 @@ def monte_carlo_cascade(
             price *= (1 + total_step_move)
             cumulative_move += total_step_move
 
-            # Check if feedback dominates the initial move (self-sustaining)
             if step > 0 and abs(price_impact / 100) > abs(step_move) * 0.5:
                 simulation_was_self_sustaining = True
 
@@ -318,8 +301,6 @@ def monte_carlo_cascade(
         total_amplifications.append(abs(cumulative_move) * 100)
 
     arr = sorted(total_amplifications)
-
-    # Percentage of SIMULATIONS that were self-sustaining (0-100%)
     percent_self_sustaining = round(self_sustaining_simulations / num_simulations * 100, 1)
 
     return {
@@ -339,9 +320,7 @@ def monte_carlo_cascade(
 
 def directional_factor(current_price: float, max_oi_strike: float,
                        price_history: list, lookback: int = 7) -> float:
-    """Dynamic directional factor using 7-day trend vs. wall."""
     base = 0.60
-
     if max_oi_strike is None or price_history is None or len(price_history) < lookback:
         return base
 
@@ -371,7 +350,6 @@ def directional_factor(current_price: float, max_oi_strike: float,
 # =====================================================================
 
 def finviz_screen() -> list:
-    """Screen Finviz for gamma squeeze candidates."""
     try:
         from finvizfinance.screener.ticker import Ticker
 
@@ -414,7 +392,6 @@ def finviz_screen() -> list:
 
 
 def build_universe() -> list:
-    """Build stock universe, prioritizing Finviz-filtered names."""
     tickers = set()
 
     for t in CUSTOM_TICKERS:
@@ -442,92 +419,92 @@ def build_universe() -> list:
 
 
 # =====================================================================
-# SECTION 6: TELEGRAM NOTIFICATION
+# SECTION 6: COMPACT TELEGRAM NOTIFICATION (no oversized messages)
 # =====================================================================
 
-def send_telegram(message: str) -> bool:
-    """Send message via Telegram with split support for long messages."""
+def send_telegram_compact(results: list, universe_size: int, elapsed: float) -> bool:
+    """
+    Send a compact Telegram notification that always fits within 4096 characters.
+    Uses a summary format: one line per ticker, no fancy markdown that could break.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured")
         return False
-    try:
-        if len(message) > 4000:
-            parts = []
-            current = ""
-            for line in message.split("\n"):
-                if len(current) + len(line) + 1 > 4000:
-                    parts.append(current)
-                    current = line
-                else:
-                    current += "\n" + line if current else line
-            if current:
-                parts.append(current)
 
-            for i, part in enumerate(parts):
-                header = f"(Part {i+1}/{len(parts)})\n" if len(parts) > 1 else ""
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": header + part,
-                          "parse_mode": "Markdown", "disable_web_page_preview": True},
-                    timeout=15,
-                ).raise_for_status()
-            return True
-        else:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": message,
-                      "parse_mode": "Markdown", "disable_web_page_preview": True},
-                timeout=15,
-            ).raise_for_status()
-            return True
+    try:
+        lines = []
+        # Header
+        lines.append(f"🤖 Gamma Scan v2.2 — {datetime.now().strftime('%H:%M UTC')}")
+        lines.append(f"📊 {universe_size} scanned → {len(results)} signals in {elapsed:.0f}s")
+        lines.append("")
+
+        high = [r for r in results if r["classification"] in ("EXTREME", "HIGH_CONVICTION")]
+        watch = [r for r in results if r["classification"] == "WATCH"]
+        structural = [r for r in results if r["classification"] == "STRUCTURAL"]
+        
+        # Helper to format one ticker
+        def format_ticker(r):
+            emoji = {"EXTREME": "🔴", "HIGH_CONVICTION": "🟡", "WATCH": "🔵", "STRUCTURAL": "⚪"}.get(r["classification"], "⚫")
+            cat = "📅" if r["catalyst_type"] == "EARNINGS" else "➖"
+            return f"{emoji} {r['ticker']:6s} ${r['price']:>6.1f} | {r['economic_score']*100:4.1f}% | Wall ${r['wall_strike']} | MC {r['mc_median']:4.1f}% | {cat} {r['days_to_catalyst']}d"
+
+        if high:
+            lines.append(f"🔴 HIGH CONVICTION ({len(high)})")
+            lines.append("─" * 40)
+            for r in high[:10]:  # Max 10 high conviction
+                lines.append(format_ticker(r))
+            lines.append("")
+
+        if watch:
+            lines.append(f"🔵 WATCH ({len(watch)})")
+            lines.append("─" * 40)
+            for r in watch[:5]:  # Max 5 watch
+                lines.append(format_ticker(r))
+            lines.append("")
+
+        if structural:
+            # Only show top structural if we have room
+            remaining = 3990 - sum(len(l) + 1 for l in lines)
+            structural_lines = []
+            for r in structural:
+                line = format_ticker(r)
+                structural_lines.append(line)
+                if sum(len(l) + 1 for l in structural_lines) > remaining:
+                    break
+            
+            if structural_lines:
+                lines.append(f"⚪ STRUCTURAL ({len(structural)} shown: {len(structural_lines)})")
+                lines.append("─" * 40)
+                lines.extend(structural_lines)
+                lines.append("")
+
+        lines.append("🤖 Pi5 Optimized · Dynamic Rate Limiter")
+
+        message = "\n".join(lines)
+
+        # Safety check: if still too long, truncate
+        if len(message) > 4096:
+            message = message[:4050] + "\n\n... truncated"
+
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            },
+            timeout=15,
+        ).raise_for_status()
+        logger.info("Telegram notification sent successfully")
+        return True
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Telegram HTTP error: {e.response.status_code} {e.response.text[:200]}")
+        return False
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
         return False
-
-
-def build_report(ticker: str, gex: dict, econ: dict, conc: dict, price_hist: list) -> str:
-    """Build detailed markdown report."""
-    emoji = {"EXTREME": "🔴", "HIGH_CONVICTION": "🟡", "WATCH": "🔵",
-             "STRUCTURAL": "⚪", "NO_SIGNAL": "⚫"}.get(econ["classification"], "⚫")
-
-    mc = econ.get("monte_carlo", {})
-
-    lines = [
-        f"{emoji} *{ticker}* — ${gex['price']:.2f}",
-        f"   ├ Score: *{econ['economic_score']*100:.1f}%* of daily vol → {econ['classification']}",
-        f"   ├ Net GEX: {format_dollar(gex['net_gex'])} {'(SHORT γ)' if gex['net_gex'] < 0 else '(LONG γ)'}",
-        f"   ├ Wall: ${gex['max_oi_strike']} | "
-        f"{'Above' if gex['distance_to_wall'] and gex['distance_to_wall'] > 0 else 'Below'} "
-        f"by {abs(gex['distance_to_wall'])*100:.1f}%",
-        f"   ├ MC sim: {mc.get('median_total_amplification', '?')}% median | "
-        f"p95: {mc.get('p95', '?')}% | "
-        f"self-sustaining: {mc.get('percent_self_sustaining', '?')}% of sims",
-        f"   ├ Cascade: {econ['cascade_class']} (loop: {econ['loop_gain']:.2f})",
-        f"   ├ P(hit): {econ['prob_hit_wall']:.0%} | Dir: {econ['directional_factor']:.2f}",
-        f"   ├ Shape: {conc.get('shape', '?')} | Gini: {conc.get('gini', 0):.2f}",
-        f"   ├ Catalyst: {econ['catalyst_type']} ({econ['days_to_catalyst']}d) "
-        f"→ {econ['catalyst_move_pct']:.1f}% avg ({econ['earnings_reliability']})",
-        f"   ├ IV: {econ['iv_rank']} ({econ['iv_percentile']*100:.0f}%ile, real) | "
-        f"P/C: {econ['pc_ratio']:.1f}",
-        f"   └ {econ['sizing']}",
-    ]
-
-    if price_hist and len(price_hist) >= 2:
-        trend = (price_hist[-1] - price_hist[0]) / price_hist[0] * 100
-        lines.insert(2, f"   ├ 5d trend: {trend:+.1f}%")
-
-    return "\n".join(lines)
-
-
-def format_dollar(val: float) -> str:
-    if abs(val) >= 1e9:
-        return f"${val/1e9:.1f}B"
-    elif abs(val) >= 1e6:
-        return f"${val/1e6:.1f}M"
-    elif abs(val) >= 1e3:
-        return f"${val/1e3:.0f}K"
-    else:
-        return f"${val:.0f}"
 
 
 # =====================================================================
@@ -539,7 +516,6 @@ def fetch_all_ticker_data(ticker: str) -> dict | None:
     Fetch ALL yfinance data for one ticker using a SINGLE yf.Ticker session.
     Uses dynamic rate limiting — only sleeps when hitting Yahoo limits.
     """
-    # ─── Rate limit: wait if we're going too fast ───
     _rate_limiter.wait_if_needed()
 
     max_attempts = 3
@@ -705,7 +681,6 @@ def process_ticker(ticker: str) -> dict | None:
     Returns None if no signal (early exit for speed).
     """
     try:
-        # ─── ONE round-trip to Yahoo ───
         data = fetch_all_ticker_data(ticker)
         if data is None:
             return None
@@ -716,11 +691,9 @@ def process_ticker(ticker: str) -> dict | None:
         max_oi_strike = data["max_oi_strike"]
         distance_to_wall = data["distance_to_wall"]
 
-        # ─── GATE 1: Must be short gamma (net_gex < 0) ───
         if net_gex >= 0:
             return None
 
-        # ─── Concentration Analysis ───
         conc = analyze_concentration(gex_by_strike, price)
 
         # ─── Earnings Days ───
@@ -877,60 +850,6 @@ def process_ticker(ticker: str) -> dict | None:
         else:
             return None
 
-        # ─── Build Reason ───
-        reason_parts = [
-            f"MC median: {mc['median_total_amplification']:.1f}%",
-            f"MC p95: {mc_p95:.1f}%",
-            f"Self-sustaining: {mc_self_sustaining:.0f}% of sims",
-            f"Loop: {loop_gain:.2f} ({conc.get('cascade_class', '?')})",
-        ]
-        if catalyst_type == "EARNINGS":
-            reason_parts.insert(0, f"Earnings in {days_to_catalyst}d ({catalyst_move_pct:.1f}% avg, {earnings_reliability})")
-        else:
-            reason_parts.insert(0, "No catalyst")
-        reason_parts.append(f"IV: {iv_rank} ({iv_percentile*100:.0f}%ile)")
-        reason_parts.append(f"P/C: {pc_ratio:.1f}")
-
-        # ─── Sizing ───
-        if classification == "EXTREME":
-            sizing = "Size: 5-8% of portfolio (high conviction)"
-        elif classification == "HIGH_CONVICTION":
-            sizing = "Size: 3-5% of portfolio (moderate conviction)"
-        elif classification == "WATCH":
-            sizing = "Size: 1-2%, tight stops (speculative)"
-        else:
-            sizing = "No position — monitor only"
-
-        econ_dict = {
-            "economic_score": round(economic_score, 4),
-            "classification": classification,
-            "first_step_amp": round(first_step_amp, 6),
-            "total_potential": round(total_potential, 4),
-            "loop_gain": loop_gain,
-            "cascade_class": conc.get("cascade_class", "?"),
-            "prob_hit_wall": round(prob_hit_wall, 3),
-            "directional_factor": round(direction, 2),
-            "catalyst_type": catalyst_type,
-            "days_to_catalyst": days_to_catalyst if days_to_catalyst else 999,
-            "catalyst_move_pct": round(catalyst_move_pct, 1),
-            "earnings_reliability": earnings_reliability,
-            "iv_percentile": iv_percentile,
-            "iv_rank": iv_rank,
-            "pc_ratio": round(pc_ratio, 2),
-            "pc_interpretation": pc_interpretation,
-            "monte_carlo": mc,
-            "sizing": sizing,
-        }
-
-        gex_dict = {
-            "price": price,
-            "net_gex": net_gex,
-            "max_oi_strike": max_oi_strike,
-            "distance_to_wall": distance_to_wall,
-        }
-
-        report = build_report(ticker, gex_dict, econ_dict, conc, closes)
-
         return {
             "ticker": ticker,
             "price": price,
@@ -953,9 +872,6 @@ def process_ticker(ticker: str) -> dict | None:
             "distance_to_wall": distance_to_wall,
             "concentration_shape": conc.get("shape", "?"),
             "concentration_score": conc.get("concentration_score", 0),
-            "reason": " | ".join(reason_parts),
-            "sizing": sizing,
-            "_report": report,
         }
 
     except Exception as e:
@@ -1001,6 +917,9 @@ def main():
     rank = {"EXTREME": 0, "HIGH_CONVICTION": 1, "WATCH": 2, "STRUCTURAL": 3}
     results.sort(key=lambda r: (rank.get(r["classification"], 99), -r["economic_score"]))
 
+    elapsed = (datetime.now() - start).total_seconds()
+
+    # ─── Console ───
     print("\n" + "=" * 100)
     print(f"  GAMMA AMPLIFICATION SCAN v2.2 — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"  Universe: {len(universe)} | Analyzed: {len(results)} signals")
@@ -1018,41 +937,9 @@ def main():
 
     print("=" * 100)
 
-    high = [r for r in results if r["classification"] in ("EXTREME", "HIGH_CONVICTION")]
-    watch = [r for r in results if r["classification"] == "WATCH"]
-    structural = len([r for r in results if r["classification"] == "STRUCTURAL"])
+    # ─── Compact Telegram (no CSV, no oversized messages) ───
+    send_telegram_compact(results, len(universe), elapsed)
 
-    msg_parts = [f"🤖 *Gamma Scan v2.2* — {datetime.now().strftime('%H:%M UTC')}"]
-    msg_parts.append(f"📊 {len(universe)} in universe → {len(results)} signals")
-    msg_parts.append(f"⚡ Pi5 Optimized: {MAX_WORKERS} workers, 1 session/ticker")
-
-    if high:
-        msg_parts.append(f"\n🔴 *HIGH CONVICTION ({len(high)})*")
-        msg_parts.append("━" * 45)
-        for r in high[:5]:
-            msg_parts.append(r["_report"])
-            msg_parts.append("")
-
-    if watch:
-        msg_parts.append(f"\n🔵 *WATCH ({len(watch)})*")
-        msg_parts.append("━" * 45)
-        for r in watch[:3]:
-            msg_parts.append(r["_report"])
-            msg_parts.append("")
-
-    msg_parts.append(f"\n📈 *Summary*: {len(high)} high | {len(watch)} watch | {structural} structural")
-    msg_parts.append("🤖 v2.2 — MC cascade + Calibrated Loop Gain + Real IV%ile + Pi5 Optimized")
-
-    send_telegram("\n".join(msg_parts))
-
-    try:
-        df = pd.DataFrame(results)
-        df.to_csv(f"gamma_scan_{datetime.now().strftime('%Y%m%d_%H%M')}_v2.csv", index=False)
-        logger.info(f"Saved to CSV ({len(results)} rows)")
-    except Exception as e:
-        logger.warning(f"CSV save failed: {e}")
-
-    elapsed = (datetime.now() - start).total_seconds()
     logger.info(f"✅ Scan complete in {elapsed:.1f}s")
 
 
