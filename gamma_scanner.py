@@ -4,17 +4,18 @@ Gamma Amplification Scanner — v2.2 (Raspberry Pi 5 Optimized)
 
 Optimizations:
 1. Single yf.Ticker session per ticker (was 5-6 redundant sessions)
-2. ThreadPoolExecutor parallelism (2 workers for Pi 5, rate-limit safe)
-3. Startup stagger to avoid synchronized rate limiting
-4. Rate-limit retry with exponential backoff
-5. Early exit on NO_SIGNAL (skips report building)
-6. All derived data computed inline from pre-fetched data
+2. ThreadPoolExecutor parallelism (platform-aware worker count)
+3. Dynamic rate limiter — only sleeps when Yahoo rate-limits
+4. Early exit on NO_SIGNAL (skips report building)
+5. All derived data computed inline from pre-fetched data
 """
 import os
 import logging
 import time
 import math
 import random
+import threading
+import platform
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -36,14 +37,53 @@ MIN_EARNINGS_HISTORY = 4
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0
-# Reduced to 2 workers to avoid Yahoo Finance rate limiting
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
+# Platform-aware worker count: Pi 5 (ARM) gets 2, GitHub Actions (x86) gets 5
+if platform.machine() in ('aarch64', 'armv7l', 'armv8l'):
+    DEFAULT_WORKERS = 2
+else:
+    DEFAULT_WORKERS = 5
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(DEFAULT_WORKERS)))
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL),
                     format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger(__name__)
 
 _cache = {}
+
+
+# =====================================================================
+# RATE LIMITER: tracks requests per second across all workers
+# =====================================================================
+
+class RateLimiter:
+    """Thread-safe rate limiter that only delays when hitting limits."""
+    def __init__(self, max_per_second=3):
+        self.max_per_second = max_per_second
+        self.lock = threading.Lock()
+        self.timestamps = []
+    
+    def wait_if_needed(self):
+        """Sleep only if we've exceeded max requests/second."""
+        now = time.time()
+        with self.lock:
+            # Remove timestamps older than 1 second
+            self.timestamps = [t for t in self.timestamps if now - t < 1.0]
+            
+            if len(self.timestamps) >= self.max_per_second:
+                # We're over the limit — calculate how long to wait
+                oldest = self.timestamps[0]
+                wait_time = 1.0 - (now - oldest) + 0.05
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                # After sleeping, clean up old timestamps again
+                now = time.time()
+                self.timestamps = [t for t in self.timestamps if now - t < 1.0]
+            
+            self.timestamps.append(time.time())
+
+# Global rate limiter instance
+_rate_limiter = RateLimiter(max_per_second=3)
+
 
 def cached(ttl_seconds=300):
     """Simple cache decorator."""
@@ -497,11 +537,10 @@ def format_dollar(val: float) -> str:
 def fetch_all_ticker_data(ticker: str) -> dict | None:
     """
     Fetch ALL yfinance data for one ticker using a SINGLE yf.Ticker session.
-    Includes startup stagger and rate-limit retry for Yahoo Finance.
+    Uses dynamic rate limiting — only sleeps when hitting Yahoo limits.
     """
-    # ─── Startup stagger: random delay to avoid synchronized rate limiting ───
-    stagger = random.uniform(0.3, 1.5)
-    time.sleep(stagger)
+    # ─── Rate limit: wait if we're going too fast ───
+    _rate_limiter.wait_if_needed()
 
     max_attempts = 3
     stock = None
@@ -626,9 +665,6 @@ def fetch_all_ticker_data(ticker: str) -> dict | None:
         result["current_iv"] = float(np.median(all_ivs))
     else:
         result["current_iv"] = 0.0
-
-    # ─── Rate limit cooldown before history call ───
-    time.sleep(0.3)
 
     # ─── 3. Full Price History ───
     try:
