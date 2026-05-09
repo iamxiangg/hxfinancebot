@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 
 # ---------- CONFIG ----------
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 POSITIONS_CSV = 'positions.csv'
 FLAGS_CSV = 'profit_flags.csv'
@@ -27,10 +27,10 @@ PROFIT_PLAN = [
 
 # ---------- TELEGRAM HELPERS ----------
 def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials not set.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     try:
         resp = requests.post(url, data=data, timeout=10)
