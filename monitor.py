@@ -40,7 +40,7 @@ def send_telegram(msg):
         print(f"Telegram send error: {e}")
 
 def get_updates(offset=0):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"offset": offset, "timeout": 10}
     try:
         resp = requests.get(url, params=params, timeout=15)
