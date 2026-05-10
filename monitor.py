@@ -15,7 +15,7 @@ UPDATE_ID_FILE = 'last_update_id.txt'
 
 # Thresholds
 DRAWDOWN_BUCKETS = [10, 20, 30, 40]          # percentages
-PROFIT_THRESHOLDS = [0.30, 0.50, 1.00]       # decimal
+PROFIT_THRESHOLDS = [0.30, 0.50, 1.00]       # decimal (kept for possible future use)
 
 # Profit-taking plan: (gain threshold, % of position to sell)
 PROFIT_PLAN = [
@@ -50,60 +50,61 @@ def get_updates(offset=0):
 
 # ---------- DATA LOADING ----------
 def load_positions():
-    return pd.read_csv(POSITIONS_CSV)
+    df = pd.read_csv(POSITIONS_CSV)
+    print(f"DEBUG: loaded {len(df)} positions from {POSITIONS_CSV}")
+    return df
 
 def load_flags():
     if not os.path.exists(FLAGS_CSV):
+        print(f"DEBUG: {FLAGS_CSV} not found, creating empty.")
         return pd.DataFrame(columns=['Ticker', 'Threshold', 'Fired'])
-    return pd.read_csv(FLAGS_CSV)
+    df = pd.read_csv(FLAGS_CSV)
+    print(f"DEBUG: loaded {len(df)} flag rows")
+    return df
 
 def save_flags(df):
     df.to_csv(FLAGS_CSV, index=False)
+    print(f"DEBUG: saved {len(df)} flags to {FLAGS_CSV}")
 
 def load_sales_log():
     if not os.path.exists(SALES_LOG_CSV):
+        print(f"DEBUG: {SALES_LOG_CSV} not found, creating empty.")
         return pd.DataFrame(columns=['Ticker', 'PercentSold', 'GainAtSale', 'Date'])
-    return pd.read_csv(SALES_LOG_CSV)
+    df = pd.read_csv(SALES_LOG_CSV)
+    print(f"DEBUG: loaded {len(df)} sales log rows")
+    return df
 
 def save_sales_log(df):
     df.to_csv(SALES_LOG_CSV, index=False)
+    print(f"DEBUG: saved {len(df)} sales to {SALES_LOG_CSV}")
 
 # ---------- HELPERS FOR PROFIT PLAN ----------
 def get_cumulative_sold(ticker, sales_df):
-    """Return total % sold for ticker (decimal, e.g. 0.10 = 10%)."""
     ticker_sales = sales_df[sales_df['Ticker'] == ticker]
     if ticker_sales.empty:
         return 0.0
-    return ticker_sales['PercentSold'].sum() / 100.0   # convert % to decimal
+    return ticker_sales['PercentSold'].sum() / 100.0
 
 def get_next_target(ticker, sales_df, current_gain=None):
-    """
-    Return a string describing the next profit-taking target.
-    If all tranches are completed, return None.
-    """
     cum_sold = get_cumulative_sold(ticker, sales_df)
     total_planned = 0.0
     for threshold, pct in PROFIT_PLAN:
         total_planned += pct
-        # If we haven't sold enough to cover this tranche, this is the next target
         if cum_sold < total_planned:
-            # Already sold part of this tranche? Suggest remaining.
             already_in_this_tranche = cum_sold - (total_planned - pct)
             if already_in_this_tranche < pct:
                 remaining_pct = pct - already_in_this_tranche
-                # If we are exactly at this threshold or above, suggest selling the remaining
                 if current_gain is not None and current_gain >= threshold:
                     return f"Sell {remaining_pct*100:.0f}% (to complete the {pct*100:.0f}% tranche at +{threshold*100:.0f}% gain)"
                 else:
                     return f"Next: sell {remaining_pct*100:.0f}% at +{threshold*100:.0f}% gain"
             else:
-                # This tranche is fully sold, move to next
                 continue
-    # All tranches completed
     return None
 
 # ---------- CHECK TICKER ----------
 def check_ticker(ticker, entry_price, quantity):
+    print(f"DEBUG: checking {ticker} (entry ${entry_price:.2f}, qty {quantity})")
     stock = yf.Ticker(ticker)
     try:
         hist = stock.history(period="1d")
@@ -111,6 +112,7 @@ def check_ticker(ticker, entry_price, quantity):
             send_telegram(f"⚠️ *{ticker}*: No data today (delisted or invalid?)")
             return
         current_price = hist['Close'].iloc[-1]
+        print(f"DEBUG: {ticker} current price ${current_price:.2f}")
     except Exception as e:
         send_telegram(f"⚠️ *{ticker}*: yfinance error – {str(e)[:100]}")
         return
@@ -123,6 +125,7 @@ def check_ticker(ticker, entry_price, quantity):
         else:
             ath = max(hist_1y['High'].max(), entry_price)
         drawdown_pct = (ath - current_price) / ath * 100
+        print(f"DEBUG: {ticker} drawdown {drawdown_pct:.1f}%")
     except Exception as e:
         drawdown_pct = None
         send_telegram(f"⚠️ *{ticker}*: Cannot compute ATH – {str(e)[:100]}")
@@ -145,11 +148,16 @@ def check_ticker(ticker, entry_price, quantity):
                 new_row = pd.DataFrame({'Ticker': [ticker], 'Threshold': [flag_key], 'Fired': [True]})
                 flags = pd.concat([flags, new_row], ignore_index=True)
                 save_flags(flags)
+                print(f"DEBUG: drawdown flag sent for {ticker} at {crossed_bucket}%")
+        else:
+            print(f"DEBUG: {ticker} no drawdown bucket crossed")
 
     # --- Profit check with plan suggestions ---
     gain_pct = (current_price - entry_price) / entry_price
-    sales_log = load_sales_log()   # needed for cumulative sold
+    print(f"DEBUG: {ticker} gain {gain_pct*100:.1f}%")
+    sales_log = load_sales_log()
     cum_sold = get_cumulative_sold(ticker, sales_log)
+    print(f"DEBUG: {ticker} cumulative sold {cum_sold*100:.1f}%")
 
     flags = load_flags()
     for threshold, pct in PROFIT_PLAN:
@@ -157,10 +165,8 @@ def check_ticker(ticker, entry_price, quantity):
             flag_key = f"PR_{threshold*100:.0f}"
             already_sent = not flags[(flags['Ticker'] == ticker) & (flags['Threshold'] == flag_key)].empty
             if not already_sent:
-                # Check if this tranche is already fully sold
                 total_planned_before = sum(p for t,p in PROFIT_PLAN if t < threshold)
                 if cum_sold < total_planned_before + pct:
-                    # Suggest selling the remaining
                     already_in_tranche = max(0, cum_sold - total_planned_before)
                     remaining = pct - already_in_tranche
                     if remaining > 0.01:
@@ -171,27 +177,29 @@ def check_ticker(ticker, entry_price, quantity):
                             f"(={pct*100:.0f}% tranche, already sold {already_in_tranche*100:.0f}%)"
                         )
                     else:
-                        # Already sold full tranche; still send generic alert?
                         send_telegram(f"💰 *{ticker}* gained {gain_pct*100:.1f}% (threshold +{threshold*100:.0f}%)")
                 else:
-                    # Tranche already completed, just generic alert
                     send_telegram(f"💰 *{ticker}* gained {gain_pct*100:.1f}% (threshold +{threshold*100:.0f}%)")
-                # Add flag
                 new_row = pd.DataFrame({'Ticker': [ticker], 'Threshold': [flag_key], 'Fired': [True]})
                 flags = pd.concat([flags, new_row], ignore_index=True)
                 save_flags(flags)
+                print(f"DEBUG: profit flag sent for {ticker} at {threshold*100:.0f}%")
         else:
-            # If the gain hasn't crossed this threshold, no need to flag
-            pass
+            print(f"DEBUG: {ticker} gain below {threshold*100:.0f}% – no action")
+
+    time.sleep(0.5)
 
 # ---------- SALE PARSING ----------
 def parse_sale_messages():
+    print("DEBUG: parsing sale messages")
     offset = 0
     if os.path.exists(UPDATE_ID_FILE):
         with open(UPDATE_ID_FILE) as f:
             offset = int(f.read().strip())
+        print(f"DEBUG: last update ID = {offset}")
 
     updates = get_updates(offset)
+    print(f"DEBUG: received {len(updates)} updates")
     sales_log = load_sales_log()
     new_entries = []
 
@@ -199,12 +207,14 @@ def parse_sale_messages():
         update_id = update['update_id']
         offset = update_id + 1
         msg = update.get('message', {}).get('text', '')
+        print(f"DEBUG: update {update_id}: '{msg[:50]}'")
         if msg.lower().startswith('sold '):
             try:
                 parts = msg.split()
                 ticker = parts[1].upper()
                 percent_sold = float(parts[2].replace('%', ''))
                 gain_at_sale = float(parts[4].replace('%', ''))
+                print(f"DEBUG: parsed sale: {ticker} {percent_sold}% at {gain_at_sale}%")
                 if percent_sold <= 0 or gain_at_sale < -100:
                     send_telegram(f"⚠️ Invalid sale message: `{msg}`")
                     continue
@@ -219,8 +229,6 @@ def parse_sale_messages():
                     f"✅ Logged sale: {ticker} {percent_sold}% at {gain_at_sale:.1f}% gain."
                 )
                 # After logging, suggest next target
-                sales_log_update = load_sales_log()   # reload with new data
-                # We haven't saved yet, so add the new entry temporarily
                 temp_sales = pd.concat([sales_log, pd.DataFrame(new_entries)], ignore_index=True)
                 next_target = get_next_target(ticker, temp_sales, current_gain=gain_at_sale)
                 if next_target:
@@ -229,26 +237,42 @@ def parse_sale_messages():
                     send_telegram(f"✅ *{ticker}*: All profit-taking tranches completed – use trailing stop now.")
             except (IndexError, ValueError) as e:
                 send_telegram(f"⚠️ Could not parse sale message: {msg} – {str(e)[:100]}")
+        else:
+            print(f"DEBUG: update {update_id} ignored (not 'sold' command)")
 
     if new_entries:
         new_df = pd.DataFrame(new_entries)
         sales_log = pd.concat([sales_log, new_df], ignore_index=True)
         save_sales_log(sales_log)
+        print(f"DEBUG: saved {len(new_entries)} new sale(s)")
 
     with open(UPDATE_ID_FILE, 'w') as f:
         f.write(str(offset))
+    print("DEBUG: finished parsing sale messages")
 
 # ---------- MAIN ----------
 def main():
+    print("DEBUG: script started")
+    
+    # Test Telegram connectivity (optional – comment out after first run)
+    # send_telegram("Test message from monitor.py – script is running.")
+    
     positions = load_positions()
+    print(f"DEBUG: positions shape = {positions.shape}")
+    if positions.empty:
+        print("WARNING: positions.csv is empty or has no data rows.")
+        return
+    
     for _, row in positions.iterrows():
         ticker = row['Ticker']
         entry = row['EntryPrice']
         qty = row['Quantity']
+        print(f"DEBUG: processing {ticker}...")
         check_ticker(ticker, entry, qty)
-        time.sleep(0.5)
 
+    print("DEBUG: finished checking all tickers, now parsing incoming messages")
     parse_sale_messages()
+    print("DEBUG: script finished successfully")
 
 if __name__ == '__main__':
     main()
