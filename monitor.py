@@ -92,7 +92,7 @@ def get_next_target(ticker, sales_df, current_gain=None):
                     return f"Next: sell {remaining_pct*100:.0f}% at +{threshold*100:.0f}% gain"
     return None
 
-# ---------- CHECK TICKER ----------
+# ---------- CHECK TICKER (returns action string if profit action needed) ----------
 def check_ticker(ticker, entry_price, quantity):
     print(f"DEBUG: checking {ticker}")
     stock = yf.Ticker(ticker)
@@ -100,11 +100,11 @@ def check_ticker(ticker, entry_price, quantity):
         hist = stock.history(period="1d")
         if hist.empty:
             send_telegram(f"⚠️ *{ticker}*: No data today (delisted or invalid?)")
-            return
+            return None
         current_price = hist['Close'].iloc[-1]
     except Exception as e:
         send_telegram(f"⚠️ *{ticker}*: yfinance error – {str(e)[:100]}")
-        return
+        return None
 
     # --- Drawdown (one-time alerts) ---
     try:
@@ -134,33 +134,34 @@ def check_ticker(ticker, entry_price, quantity):
                 flags = pd.concat([flags, new_row], ignore_index=True)
                 save_flags(flags)
 
-    # --- Profit alerts (daily reminder until sale is logged) ---
+    # --- Profit check – return action string if action needed ---
     gain_pct = (current_price - entry_price) / entry_price
     sales_log = load_sales_log()
     cum_sold = get_cumulative_sold(ticker, sales_log)
     print(f"DEBUG: {ticker} gain {gain_pct*100:.1f}%, cumulative sold {cum_sold*100:.1f}%")
 
+    action_lines = []
     for threshold, pct in PROFIT_PLAN:
         if gain_pct >= threshold:
             total_planned_before = sum(p for t, p in PROFIT_PLAN if t < threshold)
             if cum_sold < total_planned_before + pct:
-                # Sale for this threshold not yet completed → send reminder
                 already_in_tranche = max(0, cum_sold - total_planned_before)
                 remaining = pct - already_in_tranche
                 if remaining > 0.01:
+                    line = f"• {ticker}: sell {remaining*100:.0f}% (at +{threshold*100:.0f}% gain)"
+                    action_lines.append(line)
+                    # Also send individual alert
                     send_telegram(
                         f"💰 *{ticker}* gained {gain_pct*100:.1f}% "
                         f"(threshold +{threshold*100:.0f}% reached)\n"
                         f"👉 Sell {remaining*100:.0f}% of your position "
                         f"(={pct*100:.0f}% tranche, already sold {already_in_tranche*100:.0f}%)"
                     )
-                else:
-                    # Shouldn't happen because cum_sold < total, but just in case
-                    send_telegram(f"💰 *{ticker}* gained {gain_pct*100:.1f}% (threshold +{threshold*100:.0f}%)")
         else:
             print(f"DEBUG: {ticker} gain below {threshold*100:.0f}% – no action")
 
     time.sleep(0.5)
+    return action_lines if action_lines else None
 
 # ---------- SALE PARSING ----------
 def parse_sale_messages():
@@ -225,11 +226,23 @@ def main():
         print("WARNING: positions.csv is empty.")
         return
 
+    all_actions = []  # collect action strings for summary
+
     for _, row in positions.iterrows():
         ticker = row['Ticker']
         entry = row['EntryPrice']
         qty = row['Quantity']
-        check_ticker(ticker, entry, qty)
+        actions = check_ticker(ticker, entry, qty)
+        if actions:
+            all_actions.extend(actions)
+
+    # Send a single summary message if any actions exist
+    if all_actions:
+        summary = "📋 *Positions to sell today:*\n\n" + "\n".join(all_actions)
+        send_telegram(summary)
+    else:
+        send_telegram("✅ No profit-taking actions required today.")
+        print("DEBUG: no profit actions")
 
     print("DEBUG: now parsing incoming messages")
     parse_sale_messages()
