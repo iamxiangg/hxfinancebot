@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # URLs
-SP500_CSV_URL = "https://raw.githubusercontent.com/sinnaj-r/IV-Crush-Scanner/main/tickers/sp500.csv"  # example – replace with actual CSV URL
+SP500_CSV_URL = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"  # example – replace with actual CSV URL
 
 # Logging
 logging.basicConfig(
