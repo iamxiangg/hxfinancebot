@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # URLs
-SP500_CSV_URL = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"  # example – replace with actual CSV URL
+SP500_CSV_URL = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
 
 # Logging
 logging.basicConfig(
@@ -50,31 +50,38 @@ def download_sp500_csv() -> pd.DataFrame:
     try:
         resp = requests.get(SP500_CSV_URL, timeout=30)
         resp.raise_for_status()
-        # Assume CSV has headers: Symbol, Name, Sector, Volume (or similar)
         df = pd.read_csv(StringIO(resp.text))
         # Standardise column names – adjust as needed
         if 'Volume' not in df.columns and 'volume' in df.columns:
             df.rename(columns={'volume': 'Volume'}, inplace=True)
+        # If still no Volume, try to use a numeric column or skip
+        if 'Volume' not in df.columns:
+            # Look for any column that might be volume (e.g., 'AvgVol')
+            for col in df.columns:
+                if 'vol' in col.lower():
+                    df.rename(columns={col: 'Volume'}, inplace=True)
+                    break
         return df
     except Exception as e:
         logger.error(f"Failed to download S&P 500 CSV: {e}")
         raise
 
 def get_next_earnings_date(ticker: str, max_retries: int = 3) -> Optional[date]:
-    """Fetch next earnings date using yfinance calendar."""
+    """Fetch next earnings date using yfinance earnings_dates (DataFrame)."""
     for attempt in range(max_retries):
         try:
             stock = yf.Ticker(ticker)
-            cal = stock.calendar
-            if cal is None or 'Earnings Date' not in cal:
+            earnings = stock.earnings_dates
+            if earnings is None or earnings.empty:
                 return None
-            # Sometimes it's a list, sometimes a single value
-            e_date = cal['Earnings Date']
-            if isinstance(e_date, (list, pd.Series)):
-                e_date = e_date.iloc[0]
-            if isinstance(e_date, datetime):
-                e_date = e_date.date()
-            return e_date
+            # The index contains the earnings dates, first row is next upcoming
+            next_date = earnings.index[0]
+            if isinstance(next_date, pd.Timestamp):
+                return next_date.date()
+            elif isinstance(next_date, date):
+                return next_date
+            else:
+                return datetime.strptime(str(next_date)[:10], '%Y-%m-%d').date()
         except Exception as e:
             logger.warning(f"Attempt {attempt+1} for {ticker} earnings date: {e}")
             time.sleep(2)
@@ -112,38 +119,8 @@ def compute_expected_move(straddle_price: float, current_price: float) -> float:
         return 0
     return (straddle_price / current_price) * 100
 
-def compute_iv30_rv30(ticker: str, current_price: float) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Estimate IV30 and RV30.
-    IV30: Use front-month ATM straddle IV (mid).
-    RV30: Use yfinance historical daily returns (30 days).
-    Returns (iv30, rv30) as decimals.
-    """
-    try:
-        stock = yf.Ticker(ticker)
-        # Get nearest monthly expiry > 30 days away? Simpler: use 30-day vol from history
-        hist = stock.history(period="2mo")
-        if len(hist) < 30:
-            return None, None
-        returns = hist['Close'].pct_change().dropna()
-        rv30 = returns.tail(30).std() * np.sqrt(252)  # annualised
-        # IV30: use front month ATM option's implied vol (simplified: compute from straddle)
-        # For a quick proxy, we can fetch the near-term option with ~30 DTE
-        # But we already computed straddle for the front expiry. Instead approximate from mid price using Black-Scholes inverse?
-        # Simpler: use yfinance's implied volatility if available.
-        # Fallback: use historical vol as proxy? Not ideal. We'll compute IV from the ATM straddle.
-        # Since we already fetch chains later, we can compute IV there.
-        # For filter purpose, we'll compute IV30 from the front-month ATM option after we have it.
-        return None, rv30  # placeholder – will be filled later in main loop
-    except Exception as e:
-        logger.error(f"compute_iv30_rv30 {ticker}: {e}")
-        return None, None
-
 def compute_term_structure_slope(ticker: str, front_expiry: str, back_expiry: str, strike: float) -> Optional[float]:
-    """
-    Compute slope of IV term structure between front and back expiries.
-    Returns negative if front IV > back IV.
-    """
+    """Compute slope of IV term structure between front and back expiries."""
     front_chain = get_option_chain(ticker, front_expiry)
     back_chain = get_option_chain(ticker, back_expiry)
     if front_chain is None or back_chain is None:
@@ -152,17 +129,10 @@ def compute_term_structure_slope(ticker: str, front_expiry: str, back_expiry: st
     back_straddle = compute_straddle_price(back_chain, strike)
     if front_straddle is None or back_straddle is None:
         return None
-    # Convert to implied volatility? We'll use straddle price / strike as a proxy for volatility.
-    # But better to compute implied vol (not needed for slope if we assume same strike).
-    # Since strike is same, the ratio of straddle prices reflects relative volatility.
-    # Simpler: slope = (back_iv - front_iv) / (back_dte - front_dte)
-    # We'll compute approximate IV using straddle price / (strike * sqrt(dte/365)) * something.
-    # For robustness, we use a simplified IV approximation.
+
     def approx_iv(straddle_price, strike, days_to_expiry):
         if strike <= 0 or days_to_expiry <= 0:
             return 0
-        # Approximate ATM straddle = 0.8 * strike * iv * sqrt(dte/365) (Naïve)
-        # → iv ≈ straddle_price / (0.8 * strike * sqrt(dte/365))
         return straddle_price / (0.8 * strike * np.sqrt(days_to_expiry / 365))
 
     front_dte = (datetime.strptime(front_expiry, '%Y-%m-%d') - datetime.now()).days
@@ -202,7 +172,7 @@ def format_trade_setup(ticker: str, price: float, earnings_date: str,
                        volume: float, iv_rv_ratio: float, slope: float) -> str:
     """Format a trade setup card as HTML."""
     net_debit = front_straddle_price - back_straddle_price
-    max_risk = net_debit * 100  # per contract
+    max_risk = net_debit * 100
     breakeven_low = strike - net_debit
     breakeven_high = strike + net_debit
     msg = f"""
@@ -229,7 +199,7 @@ def scan():
     # 1. Download S&P 500 CSV and pre-filter by volume
     df = download_sp500_csv()
     if 'Volume' not in df.columns:
-        logger.error("CSV missing 'Volume' column. Using default volume column.")
+        logger.error("CSV missing 'Volume' column. Using default column.")
         # Try to use first numeric column as volume?
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         if len(numeric_cols) >= 1:
@@ -237,7 +207,6 @@ def scan():
         else:
             raise ValueError("Cannot identify volume column in CSV.")
 
-    # Filter by volume
     df_filtered = df[df['Volume'] >= VOLUME_MIN].copy()
     logger.info(f"Total S&P 500: {len(df)} | Volume-qualified: {len(df_filtered)}")
 
@@ -252,23 +221,19 @@ def scan():
         logger.info(f"Scanning {ticker} ({scanned}/{len(df_filtered)})...")
 
         try:
-            # Get stock price
             stock = yf.Ticker(ticker)
             hist = stock.history(period="5d")
             if hist.empty:
                 continue
             current_price = hist['Close'].iloc[-1]
 
-            # Get next earnings date
             earnings_date = get_next_earnings_date(ticker)
             if earnings_date is None:
                 continue
 
-            # Determine front expiry: first expiry after earnings
             expirations = stock.options
             if not expirations:
                 continue
-            # Filter expirations after earnings date
             expirations_dates = [datetime.strptime(e, '%Y-%m-%d').date() for e in expirations]
             front_expiry_date = None
             for ed in expirations_dates:
@@ -280,9 +245,8 @@ def scan():
             front_expiry_str = front_expiry_date.strftime('%Y-%m-%d')
             front_dte = (front_expiry_date - date.today()).days
             if front_dte > FRONT_DTE_MAX or front_dte <= 0:
-                continue  # not near enough
+                continue
 
-            # Back expiry: next monthly expiry after front (at least BACK_DTE_MIN days)
             back_expiry_date = None
             for ed in expirations_dates:
                 if ed > front_expiry_date:
@@ -294,36 +258,30 @@ def scan():
                 continue
             back_expiry_str = back_expiry_date.strftime('%Y-%m-%d')
 
-            # Get option chains for front and back
             front_chain = get_option_chain(ticker, front_expiry_str)
             back_chain = get_option_chain(ticker, back_expiry_str)
             if front_chain is None or back_chain is None:
                 continue
 
-            # Find ATM strike
             strikes = sorted(set(front_chain['calls']['strike'].tolist() + front_chain['puts']['strike'].tolist()))
             if not strikes:
                 continue
             strike = find_atm_strike(current_price, strikes)
 
-            # Compute straddle prices
             front_straddle = compute_straddle_price(front_chain, strike)
             back_straddle = compute_straddle_price(back_chain, strike)
             if front_straddle is None or back_straddle is None:
                 continue
 
-            # Expected move
             expected_move_pct = compute_expected_move(front_straddle, current_price)
-            expected_move_dollar = front_straddle  # straddle price ~ expected move in dollars
+            expected_move_dollar = front_straddle
 
             # IV30 / RV30 filter
             iv_rv_ratio = None
-            # Compute RV30 using historical returns
             hist_full = stock.history(period="2mo")
             if len(hist_full) >= 30:
                 returns = hist_full['Close'].pct_change().dropna()
                 rv30 = returns.tail(30).std() * np.sqrt(252)
-                # IV30 approximate from front straddle (using simplified IV)
                 dte_front = (front_expiry_date - date.today()).days
                 if dte_front > 0:
                     iv_approx = front_straddle / (0.8 * strike * np.sqrt(dte_front / 365))
@@ -335,14 +293,12 @@ def scan():
 
             # Term structure slope
             slope = compute_term_structure_slope(ticker, front_expiry_str, back_expiry_str, strike)
-            if slope is None or slope > SLOPE_MAX:  # slope must be more negative than threshold
+            if slope is None or slope > SLOPE_MAX:
                 logger.info(f"{ticker}: slope {slope} fails")
                 continue
 
-            # Volume check (already pre-filtered)
             volume = row['Volume']
 
-            # All filters passed → build setup
             earnings_date_str = earnings_date.strftime('%b %d, %Y')
             trade_card = format_trade_setup(
                 ticker, current_price, earnings_date_str,
