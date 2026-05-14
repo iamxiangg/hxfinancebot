@@ -74,7 +74,7 @@ FINVIZ_URL = (
 )
 
 # SP500 fallback list
-SP500_CSV = "sp500.csv"
+SP500_CSV = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
 
 # --------------------- CACHE WITH TTL --------------------- #
 class TTLCache:
