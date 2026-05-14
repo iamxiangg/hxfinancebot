@@ -29,7 +29,12 @@ import pandas as pd
 import requests
 import yfinance as yf
 from scipy.stats import norm, entropy
-from tqdm import tqdm  # new in v2.3
+
+# Optional tqdm – won't crash if not installed
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 # --------------------- CONFIGURATION --------------------- #
 logging.basicConfig(
@@ -39,12 +44,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Rate limiter settings (v2.3 - increased delays, backoff)
-BATCH_DELAY = 0.5       # was 0.3, increased to reduce 429s
+# Rate limiter settings (v2.3)
+BATCH_DELAY = 0.5       # seconds between ticker submissions
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2.0     # seconds base
 
-# Yfinance cache TTL (seconds) – new in v2.3
+# Cache TTL
 CACHE_TTL = 300  # 5 minutes
 
 # Black-Scholes constants
@@ -58,7 +63,7 @@ DEFAULT_TICKERS = os.environ.get(
 NUM_SIMS = 2000
 NUM_STEPS = 50
 
-# Class thresholds
+# Classification thresholds
 EXTREME_LOOP_GAIN = 0.65
 EXTREME_MC_P95 = 50
 EXTREME_SELF_SUSTAIN = 50
@@ -73,8 +78,8 @@ FINVIZ_URL = (
     "&ft=4&ar=180&c=1,2,3,4,5,6,7,25,61,65,67,68,69,70,71,72,73,74,75,76,77"
 )
 
-# SP500 fallback list
-SP500_CSV = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
+# SP500 CSV fallback (GitHub raw)
+SP500_CSV_URL = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
 
 # --------------------- CACHE WITH TTL --------------------- #
 class TTLCache:
@@ -116,7 +121,7 @@ class ConcentrationResult:
     hhi: float
     entropy: float
     loop_gain: float
-    peak_strike: float   # strike with maximum absolute GEX (wall)
+    peak_strike: float
     peak_gex: float
     strikes: list
     gex_values: list
@@ -150,7 +155,6 @@ class Signal:
 _yf_sessions = {}
 
 def _get_session(ticker: str):
-    """Reuse yfinance session for the same ticker."""
     if ticker not in _yf_sessions:
         session = requests.Session()
         session.headers['User-Agent'] = 'Mozilla/5.0'
@@ -205,7 +209,7 @@ def get_options_chain(ticker: str, price: float, iv: float) -> Optional[list]:
             return None
         
         today = datetime.now().date()
-        # Skip 0-DTE: only take expirations with days > 0
+        # Skip 0-DTE
         valid_exps = [
             e for e in exps
             if (datetime.strptime(e, '%Y-%m-%d').date() - today).days > 0
@@ -464,7 +468,6 @@ def process_ticker(ticker: str) -> Optional[Signal]:
         else:
             catalyst_days = None if days_to_earnings is None else 999
         
-        # FIX: missing closing parenthesis was here – now closed correctly
         ticker_data = TickerData(
             ticker=ticker,
             price=price,
@@ -472,7 +475,7 @@ def process_ticker(ticker: str) -> Optional[Signal]:
             dte=0,
             catalyst_move_pct=catalyst_move_pct,
             days_to_catalyst=catalyst_days
-        )   # <-- parenthesis closed
+        )
         
         options = get_options_chain(ticker, price, iv)
         if not options or len(options) < 2:
@@ -515,44 +518,51 @@ def process_ticker(ticker: str) -> Optional[Signal]:
 
 # --------------------- UNIVERSE BUILDING ------------------- #
 def build_universe(quick: bool = False, custom_tickers: Optional[List[str]] = None) -> List[str]:
-    """Build ticker universe: custom + Finviz + SP500 fallback.
-    If quick=True, only use the CUSTOM_TICKERS env list.
-    """
-    if quick:
-        tickers = set(t.strip().upper() for t in DEFAULT_TICKERS if t.strip())
-        logger.info(f"Quick mode: using {len(tickers)} custom tickers")
-        return sorted(tickers)
+    """Build ticker universe: custom env tickers + Finviz + fallback to SP500 CSV from GitHub."""
+    base_tickers = set(t.strip().upper() for t in DEFAULT_TICKERS if t.strip())
     
     if custom_tickers:
-        return sorted(set(t.strip().upper() for t in custom_tickers if t.strip()))
+        base_tickers.update(t.strip().upper() for t in custom_tickers if t.strip())
     
-    tickers = set()
-    for t in DEFAULT_TICKERS:
-        tickers.add(t.strip().upper())
+    if quick:
+        return sorted(base_tickers)
     
+    # 1) Try Finviz
+    finviz_ok = False
     try:
         resp = requests.get(FINVIZ_URL, timeout=10)
-        if resp.status_code == 200:
+        if resp.status_code == 200 and 'Ticker' in resp.text[:200]:
             df = pd.read_csv(StringIO(resp.text))
             finviz_tickers = df['Ticker'].dropna().unique().tolist()
             for t in finviz_tickers:
-                tickers.add(t.upper())
+                base_tickers.add(t.upper())
             logger.info(f"Finviz returned {len(finviz_tickers)} tickers")
+            finviz_ok = True
         else:
-            logger.warning(f"Finviz HTTP {resp.status_code}")
+            logger.info(f"Finviz unavailable (status {resp.status_code})")
     except Exception as e:
-        logger.warning(f"Finviz fetch failed: {e}")
+        logger.info(f"Finviz fetch failed: {e}")
     
-    if not tickers:
+    # 2) Fallback to SP500 CSV from GitHub (if Finviz failed or universe too small)
+    if not finviz_ok or len(base_tickers) < 50:
         try:
-            df = pd.read_csv(SP500_CSV)
-            for t in df['Symbol']:
-                tickers.add(t.upper())
-        except:
-            logger.error("No tickers from any source")
-            sys.exit(1)
+            resp = requests.get(SP500_CSV_URL, timeout=10)
+            if resp.status_code == 200:
+                df = pd.read_csv(StringIO(resp.text))
+                # The CSV may have column named 'Symbol' or 'Ticker'
+                col = 'Symbol' if 'Symbol' in df.columns else 'Ticker'
+                if col in df.columns:
+                    for t in df[col].dropna().unique():
+                        base_tickers.add(t.upper())
+                    logger.info(f"SP500 CSV from GitHub added {len(df)} tickers")
+                else:
+                    logger.warning("SP500 CSV missing expected column (Symbol/Ticker)")
+            else:
+                logger.warning(f"SP500 CSV fetch failed (status {resp.status_code})")
+        except Exception as e:
+            logger.warning(f"SP500 CSV fetch error: {e}")
     
-    return sorted(tickers)
+    return sorted(base_tickers)
 
 # --------------------- OUTPUT FORMATTING ------------------- #
 def format_signal(sig: Signal) -> str:
@@ -562,4 +572,157 @@ def format_signal(sig: Signal) -> str:
     prob_str = f"{sig.prob_hit_wall:.0f}%"
     
     if sig.days_to_catalyst != 999 and sig.days_to_catalyst is not None:
-        cat_icon
+        cat_icon = f"📅 {sig.days_to_catalyst}d"
+    else:
+        cat_icon = "➖ 999d"
+    
+    if sig.wall_strike > sig.price:
+        wall_dir = "▲"
+    elif sig.wall_strike < sig.price:
+        wall_dir = "▼"
+    else:
+        wall_dir = "="
+    
+    line = (
+        f"{sig.signal_type[:1]} {sig.ticker:6s} $ {sig.price:>5.1f} | "
+        f"Score {sig.score*100:>4.1f}% | Wall ${sig.wall_strike:.0f} {wall_dir} | "
+        f"Cat: {cat_str:>5s} | Gamma: {gamma_str:>5s} | MC: {mc_str:>5s} | "
+        f"P(Wall): {prob_str:>3s} | {cat_icon}"
+    )
+    if sig.trade_suggestion and sig.signal_type != "STRUCTURAL":
+        line += f"\n   → Trade: {sig.trade_suggestion}"
+    return line
+
+# --------------------- TELEGRAM NOTIFICATION --------------- #
+def send_telegram(message: str):
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'}
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+
+# --------------------- CSV LOGGING ------------------------- #
+def log_signal_to_csv(sig: Signal, filename: str = "gamma_signals.csv"):
+    try:
+        with open(filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(['timestamp', 'ticker', 'price', 'score', 'wall_strike',
+                                 'catalyst_move', 'gamma_amplification', 'mc_total',
+                                 'prob_hit_wall', 'days_to_catalyst', 'signal_type', 'trade_suggestion'])
+            writer.writerow([
+                datetime.now().isoformat(),
+                sig.ticker, sig.price, sig.score, sig.wall_strike,
+                sig.catalyst_move, sig.gamma_amplification, sig.mc_total,
+                sig.prob_hit_wall, sig.days_to_catalyst, sig.signal_type, sig.trade_suggestion
+            ])
+    except Exception as e:
+        logger.error(f"CSV log error: {e}")
+
+# --------------------- MAIN SCAN LOOP ---------------------- #
+def main():
+    parser = argparse.ArgumentParser(description='Gamma Amplification Scanner v2.3')
+    parser.add_argument('--quick', action='store_true',
+                        help='Scan only the CUSTOM_TICKERS list (no Finviz/SP500)')
+    parser.add_argument('--ticker', type=str, nargs='+',
+                        help='Scan one or more comma-separated tickers (replace universe)')
+    args = parser.parse_args()
+    
+    logger.info("🤖 Gamma Scan v2.3 starting...")
+    start_time = time.time()
+    
+    # Determine ticker list
+    if args.ticker:
+        tickers_input = []
+        for t in args.ticker:
+            tickers_input.extend(t.replace(',', ' ').split())
+        tickers = build_universe(quick=False, custom_tickers=tickers_input)
+    else:
+        tickers = build_universe(quick=args.quick)
+    
+    # Process with ThreadPoolExecutor
+    signals = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(process_ticker, t): t for t in tickers}
+        if tqdm:
+            pbar = tqdm(total=len(tickers), desc="Scanning", unit="ticker")
+        else:
+            pbar = None
+            logger.info("No tqdm – progress not shown")
+        
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                sig = future.result()
+                if sig:
+                    signals.append(sig)
+            except Exception as e:
+                logger.error(f"Unhandled error for {ticker}: {e}")
+            if pbar:
+                pbar.update(1)
+            else:
+                # Simple fallback: print a dot every 50 tickers
+                if len(signals) % 50 == 0 and len(signals) > 0:
+                    print(".", end="", flush=True)
+            time.sleep(BATCH_DELAY)
+        
+        if pbar:
+            pbar.close()
+    
+    signals.sort(key=lambda x: x.score, reverse=True)
+    
+    extreme = [s for s in signals if s.signal_type == "EXTREME"]
+    high_conv = [s for s in signals if s.signal_type == "HIGH CONVICTION"]
+    watch = [s for s in signals if s.signal_type == "WATCH"]
+    structural = [s for s in signals if s.signal_type == "STRUCTURAL"]
+    
+    elapsed = time.time() - start_time
+    
+    lines = [f"🤖 Gamma Scan v2.3 — {datetime.utcnow().strftime('%H:%M')} UTC"]
+    lines.append(f"📊 {len(tickers)} scanned → {len(signals)} signals in {elapsed:.0f}s\n")
+    
+    if extreme:
+        lines.append("🔴 EXTREME ({})".format(len(extreme)))
+        lines.append("─" * 40)
+        for s in extreme:
+            lines.append(format_signal(s))
+        lines.append("")
+    
+    if high_conv:
+        lines.append("🔴 HIGH CONVICTION ({})".format(len(high_conv)))
+        lines.append("─" * 40)
+        for s in high_conv:
+            lines.append(format_signal(s))
+        lines.append("")
+    
+    if watch:
+        lines.append("🟡 WATCH ({})".format(len(watch)))
+        lines.append("─" * 40)
+        for s in watch:
+            lines.append(format_signal(s))
+        lines.append("")
+    
+    if structural:
+        lines.append("⚪ STRUCTURAL ({} shown: {})".format(len(structural), min(9, len(structural))))
+        lines.append("─" * 40)
+        for s in structural[:9]:
+            lines.append(format_signal(s))
+        lines.append("")
+    
+    message = "\n".join(lines)
+    
+    # Log all signals to CSV
+    for s in signals:
+        log_signal_to_csv(s)
+    
+    print(message)
+    logger.info(f"Scan completed: {len(signals)} signals from {len(tickers)} tickers")
+    send_telegram(message)
+
+if __name__ == "__main__":
+    main()
