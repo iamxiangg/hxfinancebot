@@ -87,7 +87,7 @@ class Config:
     MAX_EXPIRATIONS = 2       # front month + next (avoid 0-DTE)
     MIN_DTE = 1               # skip 0-DTE
     MAX_DTE = 60              # avoid far-dated options
-    WALL_PROXIMITY = 0.20     # ⚡ CHANGED: 0.50 → 0.20 — only accept walls within 20% of spot
+    WALL_PROXIMITY = 0.50     # 50% — accept walls up to 50% from spot
     TOP_WALLS = 10            # only consider top N walls by abs net GEX
     MIN_OI = 100              # minimum open interest
     MIN_IV = 0.05             # minimum implied volatility
@@ -98,7 +98,7 @@ class Config:
     MC_SEED = 42
 
     # Screening
-    MIN_IV_FILTER = 0.35      # ⚡ CHANGED: 0.20 → 0.35 — only stocks with ≥35% IV (stronger gamma effects)
+    MIN_IV_FILTER = 0.20      # minimum implied volatility to consider for signals
     NET_GEX_NEGATIVE = True   # only generate signals for net GEX < 0
 
     # Score & classification
@@ -572,7 +572,7 @@ def economic_score(mc_results: Dict[str, Any], data: Dict[str, Any],
 
     if score >= 75:
         classification = 'EXTREME'
-    elif score >= 68:       # ⚡ CHANGED: 60 → 68 — tighten HIGH_CONVICTION threshold
+    elif score >= 60:
         classification = 'HIGH_CONVICTION'
     elif score >= 40:
         classification = 'WATCH'
@@ -766,7 +766,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default='gamma_signals.csv',
                         help='CSV output file')
     parser.add_argument('--wall-proximity', type=float, default=Config.WALL_PROXIMITY,
-                        help='Wall proximity threshold (default 0.20 = 20%%)')
+                        help='Wall proximity threshold (default 0.50 = 50%%)')
     parser.add_argument('--workers', type=int, default=Config.MAX_WORKERS,
                         help='Number of concurrent workers')
     parser.add_argument('--no-telegram', action='store_true',
