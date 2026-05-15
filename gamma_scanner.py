@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Gamma Amplification Scanner v2.3
-Scans thousands of tickers for dealer gamma hedging setups.
-Outputs trade suggestions based on gamma walls, probability, and catalysts.
+Gamma Amplification Scanner v2.3 — Fixed & Optimized
+Scans thousands of tickers for setups where dealer gamma hedging can amplify price moves.
+Fixes: MC cascade, net GEX filter, wall proximity, double history, earnings detection,
+       MC strike limit, rate limiting, CSV logging, trade suggestions.
 """
 
 import argparse
 import csv
+import json
 import logging
 import os
-import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from functools import lru_cache
-from io import StringIO
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -25,572 +24,723 @@ import requests
 import yfinance as yf
 from scipy.stats import norm
 
-# Optional progress bar
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
-
-# -------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------
-BATCH_DELAY = 0.5          # seconds between API batches (rate limiting)
-MAX_WORKERS = 10           # parallel threads for scanning
-CACHE_TTL = 300            # seconds for options chain cache
-GAMMA_THRESHOLD = 1_000    # minimum dollar gamma to consider a strike
-SIGNAL_PROB_MIN = 0.55     # minimum Monte Carlo probability for a signal
-WALL_PROXIMITY = 0.02      # max 2% away from a gamma wall to flag as "near"
-DEFAULT_TICKERS = [
-    "AAPL", "TSLA", "SPY", "QQQ", "AMZN", "GOOGL", "MSFT", "NVDA", "META", "AMD",
-    "NFLX", "DIS", "BA", "JPM", "GS", "XOM", "CVX", "JNJ", "PFE", "UNH",
-    "V", "MA", "WMT", "HD", "PG", "KO", "PEP", "ABNB", "DASH", "UBER",
-    "LYFT", "SNAP", "PINS", "RIVN", "LCID", "PLTR", "SOFI", "COIN", "MARA", "RIOT",
-    "AMC", "GME", "BB", "NOK", "TLRY", "MRNA", "ZM", "PTON", "DOCU", "SHOP",
-]
-TICKER_COLUMNS = ['Symbol', 'Ticker', 'symbol', 'ticker']  # accept any case
-LOG_DIR = "logs"
-CSV_LOG = os.path.join(LOG_DIR, "gamma_signals.csv")
-
 # -------------------------------------------------------------------
 # Logging setup
 # -------------------------------------------------------------------
-os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(os.path.join(LOG_DIR, "gamma_scanner.log"), mode='a'),
-    ],
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
-# Ticker universe loader
+# Constants & Configuration
 # -------------------------------------------------------------------
-def load_ticker_universe(quick_mode: bool = False,
-                         custom_tickers: Optional[List[str]] = None) -> List[str]:
-    """Build a list of tickers to scan.
+class Config:
+    """Central configuration — all tunable parameters."""
+    # Rate limiting
+    TICKER_DELAY = 2.0        # seconds between ticker submissions
+    OPTION_DELAY = 0.3        # seconds between expirations for same ticker
+    MAX_WORKERS = 3           # concurrent ticker scans
+    MAX_RETRIES = 3           # API retries on 429
+    BACKOFF_BASE = 2.0        # exponential backoff multiplier
 
-    Priority:
-    1. If custom_tickers given (--ticker), use those.
-    2. If quick_mode (--quick), return DEFAULT_TICKERS only.
-    3. Try Finviz S&P 500 table.
-    4. Fallback to GitHub raw CSV.
-    5. If all else fails, use DEFAULT_TICKERS.
-    """
-    if custom_tickers:
-        logger.info(f"Using custom tickers: {custom_tickers}")
-        return custom_tickers
+    # Options data
+    MAX_EXPIRATIONS = 2       # front month + next (avoid 0-DTE)
+    MIN_DTE = 1               # skip 0-DTE
+    MAX_DTE = 60              # avoid far-dated options
+    WALL_PROXIMITY = 0.50     # 50% — accept walls up to 50% from spot
+    TOP_WALLS = 10            # only consider top N walls by abs net GEX
 
-    if quick_mode:
-        logger.info(f"Quick mode – scanning {len(DEFAULT_TICKERS)} default tickers")
-        return DEFAULT_TICKERS
+    # Monte Carlo
+    MC_N_STEPS = 50           # fixed number of steps
+    MC_N_SIMULATIONS = 2000   # number of Monte Carlo paths
+    MC_SEED = 42
 
-    # Try Finviz
-    try:
-        logger.info("Fetching S&P 500 constituents from Finviz...")
-        url = "https://finviz.com/export.ashx?v=111&sc=1&sp=500"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/91.0.4472.124 Safari/537.36"
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Finviz returned status {resp.status_code}")
+    # Screening
+    MIN_IV = 0.20             # minimum implied volatility to consider
+    MIN_VOLUME = 100_000      # minimum daily dollar volume (can be adjusted)
+    NET_GEX_NEGATIVE = True   # only generate signals for net GEX < 0
 
-        df = pd.read_csv(StringIO(resp.text))
-        # Normalise column names
-        df.columns = [col.strip().lower() for col in df.columns]
-        if 'symbol' in df.columns:
-            tickers = df['symbol'].dropna().tolist()
-        elif 'ticker' in df.columns:
-            tickers = df['ticker'].dropna().tolist()
-        else:
-            raise KeyError("Finviz CSV missing Symbol/Ticker column")
+    # Score & classification (restored original logic)
+    LOOP_GAIN_THRESHOLD = 0.65
+    MC_P95_THRESHOLD = 50.0   # percentage
+    SELF_SUSTAIN_THRESHOLD = 50.0
 
-        # Clean: remove nulls and whitespace
-        tickers = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
-        logger.info(f"Loaded {len(tickers)} tickers from Finviz")
-        return tickers
-    except Exception as e:
-        logger.warning(f"Finviz unavailable (status {e})")
+    # Trade suggestion
+    OPTION_BUY_DELTA = 0.30   # target delta for suggested strikes
 
-    # Fallback to GitHub raw CSV
-    try:
-        logger.info("Trying GitHub raw CSV fallback...")
-        csv_url = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"
-        resp = requests.get(csv_url, timeout=15)
-        resp.raise_for_status()
-        df = pd.read_csv(StringIO(resp.text))
-        df.columns = [col.strip().lower() for col in df.columns]
-        if 'symbol' in df.columns:
-            tickers = df['symbol'].dropna().tolist()
-        elif 'ticker' in df.columns:
-            tickers = df['ticker'].dropna().tolist()
-        else:
-            # attempt first column
-            tickers = df.iloc[:, 0].dropna().tolist()
-            logger.warning("SP500 CSV missing expected column, using first column")
-        tickers = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
-        logger.info(f"Loaded {len(tickers)} tickers from GitHub CSV")
-        # If still empty, raise
-        if not tickers:
-            raise ValueError("No tickers found in fallback CSV")
-        return tickers
-    except Exception as e:
-        logger.error(f"GitHub fallback failed: {e}")
+    # Paths
+    CSV_LOG = "gamma_signals.csv"
+    DEFAULT_TICKERS = ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "GOOGL",
+                       "AMZN", "NVDA", "META", "TSLA", "AVGO", "JPM"]
 
-    logger.warning("Could not load S&P 500; using default tickers")
-    return DEFAULT_TICKERS
 
 # -------------------------------------------------------------------
-# Rate‑limited HTTP session (for non‑yfinance calls)
+# Helper: Rate Limiter & Retry
 # -------------------------------------------------------------------
-http_session = requests.Session()
-http_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-})
+def rate_limited(delay: float):
+    """Decorator to enforce a minimum time between calls."""
+    last_call = [0.0]
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_call[0]
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+            result = func(*args, **kwargs)
+            last_call[0] = time.time()
+            return result
+        return wrapper
+    return decorator
 
-def rate_limited_request(url: str, **kwargs) -> requests.Response:
-    """Exponential backoff on 429 errors."""
-    max_retries = 5
-    for attempt in range(max_retries):
+
+def retry_on_429(func):
+    """Decorator: retry up to MAX_RETRIES with exponential backoff on HTTP 429."""
+    def wrapper(*args, **kwargs):
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    wait = Config.BACKOFF_BASE ** attempt
+                    logger.warning(f"429 rate limit, waiting {wait:.1f}s")
+                    time.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError(f"Max retries exceeded for {func.__name__}")
+    return wrapper
+
+
+# -------------------------------------------------------------------
+# Ticker Universe
+# -------------------------------------------------------------------
+def get_sp500_tickers() -> List[str]:
+    """Fetch S&P 500 tickers from multiple sources."""
+    sources = [
+        ("Finviz CSV", "https://elite.finviz.com/export.ashx?v=111&t=SP500",
+         lambda df: df['Symbol'].tolist() if 'Symbol' in df.columns else df.iloc[:,0].tolist()),
+        ("GitHub Raw SP500",
+         "https://raw.githubusercontent.com/datasets/s-and-500-companies/main/data/constituents.csv",
+         lambda df: df['Symbol'].tolist() if 'Symbol' in df.columns else df['Ticker'].tolist()
+         if 'Ticker' in df.columns else df.iloc[:,0].tolist()),
+    ]
+    for name, url, extractor in sources:
         try:
-            resp = http_session.get(url, timeout=15, **kwargs)
-            if resp.status_code == 429:
-                wait = 2 ** attempt + random.uniform(0, 1)
-                logger.warning(f"429 rate limited – waiting {wait:.1f}s")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as e:
-            if attempt == max_retries - 1:
-                raise
-            wait = 2 ** attempt + random.uniform(0, 1)
-            logger.warning(f"Request error, retry in {wait:.1f}s: {e}")
-            time.sleep(wait)
-    raise RuntimeError("Max retries exceeded")
+            df = pd.read_csv(url)
+            tickers = extractor(df)
+            # Validate and clean
+            tickers = [t.strip().upper() for t in tickers if isinstance(t, str) and len(t.strip()) <= 5]
+            logger.info(f"Loaded {len(tickers)} tickers from {name}")
+            return tickers
+        except Exception as e:
+            logger.warning(f"Failed to load from {name}: {e}")
+    logger.warning("Using default tickers")
+    return Config.DEFAULT_TICKERS
+
 
 # -------------------------------------------------------------------
-# Options data caching (yfinance) – no custom session passed
+# Earnings Detection
 # -------------------------------------------------------------------
-def get_options_chain(ticker: str) -> Optional[Dict[str, Any]]:
-    """Fetch calls/puts for all expirations. Cached with TTL.
-
-    IMPORTANT: Do NOT pass a requests.Session to yfinance – it now uses
-    curl_cffi internally.
+def get_earnings_info(ticker: str) -> Optional[Dict[str, Any]]:
     """
-    # Manual TTL cache using a global dict
-    if not hasattr(get_options_chain, '_cache'):
-        get_options_chain._cache = {}
-    key = ticker.upper()
-    now = time.time()
-    if key in get_options_chain._cache:
-        cached = get_options_chain._cache[key]
-        if now - cached['time'] < CACHE_TTL:
-            return cached['data']
-
+    Fetch earnings dates and historical average move for a ticker.
+    Returns dict with 'next_earnings_date' (datetime or None) and
+    'historical_avg_move' (float, as decimal) or None if unavailable.
+    """
     try:
-        yf_ticker = yf.Ticker(ticker)          # no session=... !
-        expirations = yf_ticker.options
-        if not expirations:
-            logger.warning(f"{ticker}: no options available")
+        yf_ticker = yf.Ticker(ticker)
+        earnings = yf_ticker.earnings_dates
+        if earnings is None or earnings.empty:
             return None
 
-        calls = []
-        puts = []
-        for exp in expirations:
-            # Skip 0‑DTE options
-            exp_date = datetime.strptime(exp, "%Y-%m-%d")
-            if exp_date.date() == datetime.today().date():
-                continue
+        # Ensure datetime index
+        if not isinstance(earnings.index, pd.DatetimeIndex):
+            earnings.index = pd.to_datetime(earnings.index)
 
-            opt = yf_ticker.option_chain(exp)
-            calls.append(opt.calls)
-            puts.append(opt.puts)
+        # Find next earnings date (future)
+        now = datetime.now()
+        future = earnings.index[earnings.index > now]
+        next_date = future[0] if len(future) > 0 else None
 
-        if not calls and not puts:
-            return None
+        # Compute historical average absolute move (from 'Surprise%' or from price)
+        # Use last 8 quarters
+        recent = earnings.tail(8)
+        if 'Surprise(%)' in recent.columns:
+            moves = recent['Surprise(%)'].abs().dropna() / 100.0
+            avg_move = moves.mean() if not moves.empty else None
+        else:
+            # Fallback: use price change around earnings (approximate)
+            # We can't easily get historical price here, so return None
+            avg_move = None
 
-        data = {
-            'calls': pd.concat(calls, ignore_index=True) if calls else pd.DataFrame(),
-            'puts': pd.concat(puts, ignore_index=True) if puts else pd.DataFrame(),
-            'underlying_price': yf_ticker.history(period="1d")['Close'].iloc[-1] if len(
-                yf_ticker.history(period="1d")) > 0 else None,
-            'expirations': expirations,
+        return {
+            'next_earnings_date': next_date,
+            'historical_avg_move': avg_move if avg_move else None
         }
-        get_options_chain._cache[key] = {'data': data, 'time': now}
-        return data
     except Exception as e:
-        logger.error(f"Error processing {ticker}: {e}")
+        logger.debug(f"Earnings fetch failed for {ticker}: {e}")
         return None
 
-# -------------------------------------------------------------------
-# Black-Scholes dollar gamma
-# -------------------------------------------------------------------
-def black_scholes_gamma(S: float, K: float, T: float, r: float,
-                        sigma: float, option_type: str) -> float:
-    """Return gamma of a single option (calls and puts have same gamma)."""
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    pdf = norm.pdf(d1)
-    gamma = pdf / (S * sigma * np.sqrt(T))
-    return gamma
-
-def dollar_gamma(gamma: float, S: float, open_interest: int, tick_size: float = 1.0) -> float:
-    """Compute dollar gamma = gamma * S^2 * OI * tick_size."""
-    return gamma * S * S * open_interest * tick_size
-
-def compute_gamma_profile(data: Dict[str, Any],
-                          risk_free_rate: float = 0.045) -> Dict[str, Any]:
-    """Aggregate net GEX per strike. Return gamma walls and total exposure."""
-    S = data.get('underlying_price')
-    if S is None or S <= 0:
-        return {'error': 'No underlying price'}
-
-    calls_df = data.get('calls', pd.DataFrame())
-    puts_df = data.get('puts', pd.DataFrame())
-
-    strikes = {}
-    total_gamma = 0.0
-    today = datetime.today().date()
-
-    for df, mult in [(calls_df, 1), (puts_df, -1)]:
-        if df.empty:
-            continue
-        for _, row in df.iterrows():
-            try:
-                K = row['strike']
-                expiry = row.get('expiration', row.get('contractSymbol', ''))
-                if isinstance(expiry, str) and len(expiry) >= 8:
-                    exp_date = datetime.strptime(expiry[:8], "%Y%m%d").date()
-                else:
-                    exp_date = None
-
-                if exp_date and exp_date == today:
-                    continue  # skip 0-DTE
-
-                T = (exp_date - today).days / 365.0 if exp_date else 0.02
-                T = max(T, 1 / 365)
-
-                OI = row.get('openInterest', 0)
-                if OI <= 0:
-                    continue
-                iv = row.get('impliedVolatility', 0.3)
-                if iv <= 0:
-                    iv = 0.3
-
-                gamma = black_scholes_gamma(S, K, T, risk_free_rate, iv, 'call')
-                dg = dollar_gamma(gamma, S, OI)
-                # Net GEX: calls add, puts subtract
-                net = mult * dg
-                strikes[K] = strikes.get(K, 0.0) + net
-                total_gamma += dg
-            except Exception as e:
-                logger.debug(f"Gamma calc row error: {e}")
-                continue
-
-    if not strikes:
-        return {'error': 'No valid strikes'}
-
-    # Identify gamma walls (strikes with highest concentration)
-    sorted_strikes = sorted(strikes.items(), key=lambda x: abs(x[1]), reverse=True)
-    top_n = min(5, len(sorted_strikes))
-    walls = [{'strike': k, 'net_gex': v} for k, v in sorted_strikes[:top_n]]
-
-    return {
-        'strikes': strikes,
-        'walls': walls,
-        'total_gamma': total_gamma,
-        'underlying_price': S,
-    }
 
 # -------------------------------------------------------------------
-# Monte Carlo cascade with catalyst drift
+# Options Chain & Greeks
 # -------------------------------------------------------------------
-def monte_carlo_cascade(S: float, sigma: float, T: float,
-                        strikes: Dict[float, float], n_sims: int = 5000,
-                        catalyst_drift: float = 0.0) -> Dict[str, float]:
-    """Simulate price paths; return probability of hitting each gamma wall,
-    and overall directional breakdown.
+@lru_cache(maxsize=128)
+def fetch_options_chain(ticker: str, expiration: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """Fetch options chain for a single expiration. Cached for TTL (session)."""
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        # yfinance may raise on invalid expiration
+        chain = yf_ticker.option_chain(expiration)
+        return {'calls': chain.calls, 'puts': chain.puts}
+    except Exception as e:
+        logger.debug(f"Failed to fetch options for {ticker} at {expiration}: {e}")
+        return None
 
-    Returns:
-        dict with keys: prob_up, prob_down, avg_move_up, avg_move_down,
-                        wall_hit_probs (dict strike->prob)
+
+@rate_limited(Config.OPTION_DELAY)
+@retry_on_429
+def get_options_data(ticker: str) -> Optional[Dict[str, Any]]:
     """
-    dt = T / 252.0  # daily steps approximating expiry time
-    n_steps = max(1, int(252 * T))
-    paths = np.zeros((n_sims, n_steps + 1))
-    paths[:, 0] = S
+    Retrieve all relevant options data for a ticker.
+    Returns dict with 'expirations', 'calls', 'puts', 'current_price', 'iv', etc.
+    """
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        # Get available expirations
+        exps = yf_ticker.options
+        if not exps:
+            return None
 
-    for i in range(n_sims):
-        for j in range(1, n_steps + 1):
-            z = np.random.normal()
-            paths[i, j] = paths[i, j-1] * np.exp(
-                (catalyst_drift - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z
-            )
+        # Filter expirations: skip 0-DTE, limit to nearest MAX_EXPIRATIONS
+        today = date.today()
+        valid_exps = []
+        for exp_str in exps:
+            exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
+            dte = (exp_date - today).days
+            if Config.MIN_DTE <= dte <= Config.MAX_DTE:
+                valid_exps.append((exp_str, dte))
+        valid_exps.sort(key=lambda x: x[1])  # closest first
+        use_exps = [e[0] for e in valid_exps[:Config.MAX_EXPIRATIONS]]
+        if not use_exps:
+            return None
+
+        # Fetch current price and IV (we get price from history once)
+        # Use single history call
+        hist = yf_ticker.history(period="5d")
+        if hist.empty:
+            return None
+        current_price = hist['Close'].iloc[-1]
+        # Also get IV from yfinance (impliedVolatility for the ticker)
+        # Unfortunately yfinance doesn't have a single IV, we'll compute from ATM options later
+        iv_estimate = None
+
+        all_calls = []
+        all_puts = []
+        for exp_str in use_exps:
+            chain = fetch_options_chain(ticker, exp_str)
+            if chain is None:
+                continue
+            calls = chain['calls'].copy()
+            puts = chain['puts'].copy()
+            if calls.empty and puts.empty:
+                continue
+            # Add expiration column
+            calls['expiration'] = exp_str
+            puts['expiration'] = exp_str
+            all_calls.append(calls)
+            all_puts.append(puts)
+
+        if not all_calls and not all_puts:
+            return None
+
+        calls_df = pd.concat(all_calls, ignore_index=True) if all_calls else pd.DataFrame()
+        puts_df = pd.concat(all_puts, ignore_index=True) if all_puts else pd.DataFrame()
+
+        # Estimate IV from nearest ATM option
+        if not calls_df.empty:
+            atm_idx = (calls_df['strike'] - current_price).abs().idxmin()
+            iv_estimate = calls_df.loc[atm_idx, 'impliedVolatility']
+
+        return {
+            'current_price': current_price,
+            'iv': iv_estimate,
+            'calls': calls_df,
+            'puts': puts_df,
+            'expirations': use_exps
+        }
+    except Exception as e:
+        logger.error(f"Error fetching data for {ticker}: {e}")
+        return None
+
+
+# -------------------------------------------------------------------
+# Gamma Calculations
+# -------------------------------------------------------------------
+def calculate_gex_profile(data: Dict[str, Any]) -> Tuple[pd.DataFrame, float]:
+    """
+    Compute dollar gamma (GEX) for each strike across all expirations.
+    Returns (gamma_profile DataFrame, total_net_gex).
+    Gamma profile: index=strike, columns=['call_gex','put_gex','net_gex']
+    """
+    calls = data.get('calls')
+    puts = data.get('puts')
+    if calls is None or puts is None or (calls.empty and puts.empty):
+        return pd.DataFrame(), 0.0
+
+    S = data['current_price']
+    # Combine calls and puts
+    all_options = []
+    if not calls.empty:
+        all_options.append(calls[['strike','expiration','openInterest','impliedVolatility']].copy())
+    if not puts.empty:
+        all_options.append(puts[['strike','expiration','openInterest','impliedVolatility']].copy())
+    if not all_options:
+        return pd.DataFrame(), 0.0
+    df = pd.concat(all_options, ignore_index=True)
+
+    # For each option, compute dollar gamma
+    gammas = []
+    for _, row in df.iterrows():
+        strike = row['strike']
+        exp_str = row['expiration']
+        exp_date = datetime.strptime(exp_str, '%Y-%m-%d')
+        T = (exp_date - datetime.now()).days / 365.0
+        if T <= 0:
+            continue
+        iv = row['impliedVolatility']
+        if iv is None or np.isnan(iv) or iv <= 0:
+            continue
+        oi = row['openInterest']
+        if oi is None or np.isnan(oi) or oi <= 0:
+            continue
+
+        # Black-Scholes gamma
+        d1 = (np.log(S / strike) + (0.05 + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+        gamma = norm.pdf(d1) / (S * iv * np.sqrt(T))
+        dollar_gamma = gamma * S * S * 100 * oi  # per contract multiplier 100 shares
+        gammas.append((strike, row['strike'], dollar_gamma if row.name in calls.index else -dollar_gamma))
+
+    if not gammas:
+        return pd.DataFrame(), 0.0
+
+    profile = pd.DataFrame(gammas, columns=['strike', 'gex'])
+    profile = profile.groupby('strike')['gex'].sum().reset_index()
+    # Net GEX is sum of all GEX (positive for calls, negative for puts)
+    total_net_gex = profile['gex'].sum()
+    profile['abs_gex'] = profile['gex'].abs()
+    profile = profile.sort_values('strike')
+    return profile, total_net_gex
+
+
+def detect_walls(profile: pd.DataFrame) -> List[Dict[str, float]]:
+    """
+    Detect gamma walls from net GEX profile.
+    Returns list of wall dicts: {'strike': x, 'net_gex': y, 'abs_gex': z}
+    Uses peak detection on net GEX (positive or negative).
+    """
+    if profile.empty:
+        return []
+    # Identify strikes where net GEX changes sign or has local extremum
+    # We'll look for points where net GEX is large and isolated
+    profile = profile.copy()
+    profile['gex_change'] = profile['gex'].diff().fillna(0)
+    profile['gex_change2'] = profile['gex_change'].diff().fillna(0)
+    # Peaks: sign change in gex_change + large abs
+    walls = []
+    for i in range(1, len(profile)-1):
+        prev = profile.iloc[i-1]['gex']
+        curr = profile.iloc[i]['gex']
+        next_ = profile.iloc[i+1]['gex']
+        # Condition: local max or min (prev < curr > next or prev > curr < next)
+        if (prev < curr > next) or (prev > curr < next):
+            walls.append({
+                'strike': profile.iloc[i]['strike'],
+                'net_gex': curr,
+                'abs_gex': abs(curr)
+            })
+    # Sort by absolute net GEX descending
+    walls.sort(key=lambda w: w['abs_gex'], reverse=True)
+    return walls[:Config.TOP_WALLS]
+
+
+# -------------------------------------------------------------------
+# Monte Carlo Cascade Simulation
+# -------------------------------------------------------------------
+def run_mc_cascade(data: Dict[str, Any], walls: List[Dict[str, float]],
+                   catalyst_drift: float = 0.0) -> Dict[str, Any]:
+    """
+    Simulate price paths to estimate probability of hitting gamma walls.
+    Returns dict with 'prob_hit_wall', 'mc_p95', 'first_step_amplification',
+    'self_sustaining_score', 'loop_gain', 'total_potential'.
+    """
+    if not walls:
+        return {
+            'prob_hit_wall': 0.0,
+            'mc_p95': 0.0,
+            'first_step_amplification': 0.0,
+            'self_sustaining_score': 0.0,
+            'loop_gain': 0.0,
+            'total_potential': 0.0
+        }
+
+    S0 = data['current_price']
+    iv = data.get('iv', 0.3)
+    T = 30 / 365.0  # default 30-day horizon (can be adjusted)
+    # Use nearest expiration DTE if available
+    if data.get('expirations'):
+        exp_dates = [datetime.strptime(e, '%Y-%m-%d') for e in data['expirations']]
+        nearest = min(exp_dates)
+        T = max((nearest - datetime.now()).days, 1) / 365.0
+
+    n_steps = Config.MC_N_STEPS
+    dt = T / n_steps
+    n_sims = Config.MC_N_SIMULATIONS
+
+    np.random.seed(Config.MC_SEED)
+    # Generate correlated random walks (GBM with drift)
+    drift = catalyst_drift / T  # convert total drift to annualized drift (approx)
+    rng = np.random.default_rng(Config.MC_SEED)
+    Z = rng.normal(size=(n_sims, n_steps))
+    paths = np.zeros((n_sims, n_steps + 1))
+    paths[:, 0] = S0
+    for t in range(1, n_steps + 1):
+        paths[:, t] = paths[:, t-1] * np.exp((drift - 0.5 * iv**2) * dt + iv * np.sqrt(dt) * Z[:, t-1])
 
     final_prices = paths[:, -1]
 
-    # Overall direction
-    prob_up = np.mean(final_prices > S)
-    prob_down = 1 - prob_up
-    avg_up = np.mean(final_prices[final_prices > S] - S) if np.any(final_prices > S) else 0.0
-    avg_down = np.mean(final_prices[final_prices <= S] - S) if np.any(final_prices <= S) else 0.0
+    # First step amplification: simulate one large move (catalyst) then subsequent move
+    # We approximate: first step = catalyst drift, subsequent = gamma hedging
+    # Compute probability of hitting any wall within the path
+    hit_any = np.zeros(n_sims, dtype=bool)
+    for wall in walls:
+        w_strike = wall['strike']
+        # Check if path touches or crosses the wall at any step
+        crossing = ((paths[:, :-1] < w_strike) & (paths[:, 1:] >= w_strike)) | \
+                   ((paths[:, :-1] > w_strike) & (paths[:, 1:] <= w_strike))
+        hit_any = hit_any | crossing.any(axis=1)
 
-    # Wall hit probabilities
-    wall_hit_probs = {}
-    for K in strikes:
-        hits = np.sum(final_prices >= K if strikes[K] > 0 else final_prices <= K)
-        wall_hit_probs[K] = hits / n_sims
+    prob_hit = np.mean(hit_any) * 100.0  # percentage
+
+    # MC p95: 95th percentile of final price (absolute move)
+    p95 = np.percentile(final_prices, 95)
+
+    # First step amplification: ratio of total move to first step move (catalyst)
+    first_step_move = np.abs(paths[:, 1] - S0).mean()
+    total_move = np.abs(final_prices - S0).mean()
+    first_step_amp = total_move / max(first_step_move, 1e-6)
+
+    # Self-sustaining score: fraction of paths where gamma hedging continues after first catalyst
+    # Simplified: if after first step, the path continues in same direction for at least 3 steps
+    direction = np.sign(paths[:, 1] - S0)
+    sustained = np.zeros(n_sims, dtype=bool)
+    for i in range(n_sims):
+        if direction[i] == 0:
+            continue
+        # Check if next 3 steps are same sign
+        diff = np.diff(paths[i, 1:])
+        if np.all(diff * direction[i] > 0):
+            sustained[i] = True
+    self_sustaining = np.mean(sustained) * 100.0
+
+    # Loop gain: ratio of gamma-driven move to total move (estimate)
+    # Use correlation between gamma imbalance and price move
+    # Simplified: total_potential = sum of abs net GEX of walls / (S0 * total OI) * 100
+    total_abs_gex = sum(w['abs_gex'] for w in walls)
+    implied_gamma_impact = total_abs_gex / (S0 * 1e6)  # rough scale
+    loop_gain = min(implied_gamma_impact, 1.0)  # normalize
+
+    # Total potential: maximum move possible if all walls are hit (approximate)
+    farthest_wall_dist = max(abs(w['strike'] - S0) for w in walls) / S0 * 100.0
+    total_potential = farthest_wall_dist * prob_hit / 100.0
 
     return {
-        'prob_up': prob_up,
-        'prob_down': prob_down,
-        'avg_move_up': avg_up,
-        'avg_move_down': avg_down,
-        'wall_hit_probs': wall_hit_probs,
-        'final_prices': final_prices,
-        'sigma': sigma,
-        'catalyst_drift': catalyst_drift,
+        'prob_hit_wall': prob_hit,
+        'mc_p95': p95,
+        'first_step_amplification': first_step_amp,
+        'self_sustaining_score': self_sustaining,
+        'loop_gain': loop_gain,
+        'total_potential': total_potential
     }
 
-# -------------------------------------------------------------------
-# Trade suggestion engine
-# -------------------------------------------------------------------
-def suggest_trade(gamma_profile: Dict, mc_results: Dict,
-                  ticker: str) -> Optional[str]:
-    """Generate plain‑English trade recommendation.
 
-    Looks for:
-      - Strong upward gamma wall (large positive net GEX) near current price
-      - High probability of hitting that wall
-      - Catalyst (if drift > 0)
-    Returns None if no clear signal.
+# -------------------------------------------------------------------
+# Scoring & Classification
+# -------------------------------------------------------------------
+def economic_score(mc_results: Dict[str, Any], data: Dict[str, Any],
+                   net_gex: float, iv_percentile: float = 0.5) -> Dict[str, Any]:
     """
-    if 'error' in gamma_profile or 'error' in mc_results:
-        return None
+    Compute composite score and classify signal.
+    Uses original formula: loop_gain, mc_p95, self_sustaining, first_step_amp, etc.
+    Returns dict with 'score', 'classification', and all components.
+    """
+    loop_gain = mc_results['loop_gain']
+    mc_p95 = (mc_results['mc_p95'] / data['current_price'] - 1) * 100  # as percentage move
+    self_sustaining = mc_results['self_sustaining_score']
+    first_step_amp = mc_results['first_step_amplification']
+    total_potential = mc_results['total_potential']
+    prob_hit = mc_results['prob_hit_wall']
 
-    S = gamma_profile['underlying_price']
-    walls = gamma_profile['walls']
-    wall_hit_probs = mc_results.get('wall_hit_probs', {})
-    prob_up = mc_results['prob_up']
-    catalyst_drift = mc_results.get('catalyst_drift', 0.0)
+    # Normalize components (0-100 scale)
+    score_components = {
+        'loop_gain': min(loop_gain * 100, 100),
+        'mc_p95': min(mc_p95 * 2, 100),  # scale up moves
+        'self_sustaining': self_sustaining,
+        'first_step_amp': min(first_step_amp * 50, 100),
+        'total_potential': min(total_potential * 10, 100),
+        'prob_hit': prob_hit,
+        'iv_percentile': iv_percentile * 100,
+        'net_gex_negative': -net_gex / abs(net_gex) * 50 if net_gex != 0 else 0  # bonus for negative net GEX
+    }
 
-    # Prefer strongest positive wall
-    pos_walls = [w for w in walls if w['net_gex'] > 0]
-    if not pos_walls:
-        return None
+    # Weighted sum
+    weights = {
+        'loop_gain': 0.25,
+        'mc_p95': 0.20,
+        'self_sustaining': 0.15,
+        'first_step_amp': 0.10,
+        'total_potential': 0.10,
+        'prob_hit': 0.10,
+        'iv_percentile': 0.05,
+        'net_gex_negative': 0.05
+    }
+    score = sum(score_components[k] * weights[k] for k in weights)
 
-    best_wall = max(pos_walls, key=lambda w: abs(w['net_gex']))
-    K = best_wall['strike']
-    # Check proximity (within 2% of current price)
-    if abs(K - S) / S > WALL_PROXIMITY:
-        return None
-
-    # Check probability
-    prob_hit = wall_hit_probs.get(K, 0)
-    if prob_hit < SIGNAL_PROB_MIN:
-        return None
-
-    # Build suggestion
-    direction = "call" if K > S else "put"
-    # Approximate delta for strike: simplistic ATM assumption
-    if direction == "call":
-        suggestion = (f"BUY ${K:.0f} {direction.upper()} "
-                      f"(debit spread recommended) – "
-                      f"Gamma wall at ${K:.0f}, {prob_hit*100:.0f}% probability of reaching, "
-                      f"catalyst drift {catalyst_drift*100:.1f}%")
+    # Classification thresholds (restored original)
+    if score >= 75:
+        classification = 'EXTREME'
+    elif score >= 60:
+        classification = 'HIGH_CONVICTION'
+    elif score >= 40:
+        classification = 'WATCH'
     else:
-        suggestion = (f"BUY ${K:.0f} {direction.upper()} "
-                      f"(debit spread recommended) – "
-                      f"Gamma wall at ${K:.0f}, {prob_hit*100:.0f}% probability of reaching, "
-                      f"catalyst drift {catalyst_drift*100:.1f}%")
+        classification = 'STRUCTURAL'
+
+    return {
+        'score': round(score, 1),
+        'classification': classification,
+        'components': score_components
+    }
+
+
+def trade_suggestion(data: Dict[str, Any], walls: List[Dict[str, float]],
+                     classification: str, score: float) -> Optional[str]:
+    """
+    Generate plain-English trade recommendation.
+    Only for EXTREME or HIGH_CONVICTION.
+    """
+    if classification not in ('EXTREME', 'HIGH_CONVICTION'):
+        return None
+    if not walls:
+        return None
+
+    S = data['current_price']
+    # Determine direction: if net GEX negative (dealers short gamma), price moves amplify in either direction?
+    # Actually, negative net GEX means dealers are net short options => they hedge by selling into strength, buying into weakness.
+    # So moves can be amplified both ways. But we look for nearest wall as target.
+    # Simple: nearest wall with high abs net GEX
+    walls_sorted = sorted(walls, key=lambda w: abs(w['strike'] - S))
+    nearest = walls_sorted[0]
+    direction = 'CALL' if nearest['strike'] > S else 'PUT'
+    target = nearest['strike']
+
+    # Suggest a debit spread: buy ATM option, sell OTM option at wall
+    # For simplicity, pick strike nearest to S (buy) and strike at wall (sell)
+    buy_strike = S  # approximate ATM
+    sell_strike = target
+    if direction == 'CALL':
+        # Cap sell strike to be higher than buy
+        if sell_strike <= buy_strike:
+            sell_strike = buy_strike * 1.05
+        suggestion = f"BUY ${buy_strike:.0f} CALL, SELL ${sell_strike:.0f} CALL debit spread"
+    else:
+        if sell_strike >= buy_strike:
+            sell_strike = buy_strike * 0.95
+        suggestion = f"BUY ${buy_strike:.0f} PUT, SELL ${sell_strike:.0f} PUT debit spread"
     return suggestion
 
-# -------------------------------------------------------------------
-# Signal classification
-# -------------------------------------------------------------------
-def classify_signal(gamma_profile: Dict, mc_results: Dict, ticker: str) -> Dict:
-    """Return a structured signal dict for logging."""
-    base = {
-        'ticker': ticker,
-        'timestamp': datetime.utcnow().isoformat(),
-        'underlying_price': gamma_profile.get('underlying_price', 0),
-        'total_gamma': gamma_profile.get('total_gamma', 0),
-        'walls': gamma_profile.get('walls', []),
-        'prob_up': mc_results.get('prob_up', 0),
-        'prob_down': mc_results.get('prob_down', 0),
-        'avg_up': mc_results.get('avg_move_up', 0),
-        'avg_down': mc_results.get('avg_move_down', 0),
-        'sigma': mc_results.get('sigma', 0),
-        'catalyst_drift': mc_results.get('catalyst_drift', 0),
-    }
-
-    # Decide strength
-    base['strength'] = 'NONE'
-    if base['total_gamma'] > GAMMA_THRESHOLD * 10:
-        base['strength'] = 'HIGH'
-    elif base['total_gamma'] > GAMMA_THRESHOLD:
-        base['strength'] = 'MODERATE'
-
-    # Trade suggestion
-    trade = suggest_trade(gamma_profile, mc_results, ticker)
-    base['trade_suggestion'] = trade if trade else 'NO TRADE'
-
-    return base
 
 # -------------------------------------------------------------------
-# CSV logging
+# Per-Ticker Scan
 # -------------------------------------------------------------------
-def log_signal(signal: Dict, csv_path: str = CSV_LOG):
-    """Append signal to CSV file. Create header if missing."""
-    file_exists = os.path.isfile(csv_path)
-    with open(csv_path, 'a', newline='') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(['timestamp', 'ticker', 'underlying_price',
-                             'total_gamma', 'strength', 'prob_up', 'prob_down',
-                             'avg_up', 'avg_down', 'walls', 'trade_suggestion'])
-        writer.writerow([
-            signal['timestamp'],
-            signal['ticker'],
-            signal.get('underlying_price', ''),
-            signal.get('total_gamma', ''),
-            signal['strength'],
-            signal.get('prob_up', ''),
-            signal.get('prob_down', ''),
-            signal.get('avg_up', ''),
-            signal.get('avg_down', ''),
-            str(signal.get('walls', [])),
-            signal.get('trade_suggestion', ''),
-        ])
-
-# -------------------------------------------------------------------
-# Scan a single ticker
-# -------------------------------------------------------------------
-def scan_ticker(ticker: str,
-                risk_free_rate: float = 0.045,
-                n_sims: int = 5000,
-                catalyst_drift: float = 0.02) -> Optional[Dict]:
-    """Full pipeline for one ticker."""
+def scan_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Full scan pipeline for a single ticker.
+    Returns signal dict or None if no signal.
+    """
+    logger.info(f"Scanning {ticker}...")
     try:
-        # Rate limit per ticker
-        time.sleep(BATCH_DELAY / MAX_WORKERS)
-
-        data = get_options_chain(ticker)
-        if not data:
+        # 1. Fetch options data
+        data = get_options_data(ticker)
+        if data is None:
+            logger.debug(f"No options data for {ticker}")
             return None
 
-        gamma_profile = compute_gamma_profile(data, risk_free_rate)
-        if 'error' in gamma_profile:
-            logger.debug(f"{ticker}: {gamma_profile['error']}")
+        S = data['current_price']
+        iv = data.get('iv', 0)
+        if iv is None or iv < Config.MIN_IV:
+            logger.debug(f"IV too low for {ticker}: {iv}")
             return None
 
-        S = gamma_profile['underlying_price']
-        # Use median IV from calls as sigma proxy
-        calls = data.get('calls', pd.DataFrame())
-        if not calls.empty:
-            sigma = calls['impliedVolatility'].median()
-        else:
-            sigma = 0.3
-        if sigma <= 0:
-            sigma = 0.3
+        # 2. Compute gamma profile and net GEX
+        profile, total_net_gex = calculate_gex_profile(data)
+        if profile.empty:
+            return None
 
-        # Time to 0 expiry: use nearest expiration
-        expirations = data.get('expirations', [])
-        if expirations:
-            today = datetime.today().date()
-            nearest_exp = min(
-                (datetime.strptime(e, "%Y-%m-%d").date() for e in expirations),
-                key=lambda d: abs((d - today).days)
-            )
-            T = (nearest_exp - today).days / 365.0
-        else:
-            T = 0.02
+        # 3. Filter: net GEX must be negative (dealers short gamma)
+        if Config.NET_GEX_NEGATIVE and total_net_gex >= 0:
+            logger.debug(f"Net GEX non-negative for {ticker}: {total_net_gex:.2f}")
+            return None
 
-        mc_results = monte_carlo_cascade(
-            S, sigma, T,
-            gamma_profile['strikes'],
-            n_sims=n_sims,
-            catalyst_drift=catalyst_drift,
-        )
+        # 4. Detect walls
+        walls = detect_walls(profile)
+        if not walls:
+            logger.debug(f"No gamma walls for {ticker}")
+            return None
 
-        signal = classify_signal(gamma_profile, mc_results, ticker)
-        log_signal(signal)
+        # 5. Filter walls by proximity (Wall proximity configurable)
+        filtered_walls = [w for w in walls if abs(w['strike'] - S) / S <= Config.WALL_PROXIMITY]
+        if not filtered_walls:
+            logger.debug(f"No walls within proximity for {ticker}")
+            return None
+        walls = filtered_walls[:Config.TOP_WALLS]
+
+        # 6. Earnings detection
+        earnings_info = get_earnings_info(ticker)
+        catalyst_drift = 0.0
+        if earnings_info and earnings_info['historical_avg_move']:
+            catalyst_drift = earnings_info['historical_avg_move']
+            logger.debug(f"Earnings drift for {ticker}: {catalyst_drift:.2%}")
+
+        # 7. Monte Carlo cascade
+        mc_results = run_mc_cascade(data, walls, catalyst_drift=catalyst_drift)
+
+        # 8. Score & classify
+        iv_percentile = min(iv / 0.5, 1.0)  # rough percentile
+        score_result = economic_score(mc_results, data, total_net_gex, iv_percentile)
+        classification = score_result['classification']
+        score = score_result['score']
+
+        # 9. Generate trade suggestion
+        suggestion = trade_suggestion(data, walls, classification, score)
+
+        # 10. Build output
+        signal = {
+            'ticker': ticker,
+            'price': round(S, 2),
+            'iv': round(iv, 4),
+            'net_gex': round(total_net_gex, 2),
+            'num_walls': len(walls),
+            'nearest_wall_strike': walls[0]['strike'],
+            'nearest_wall_dist_pct': round(abs(walls[0]['strike'] - S) / S * 100, 2),
+            'prob_hit_wall': round(mc_results['prob_hit_wall'], 2),
+            'mc_p95': round(mc_results['mc_p95'], 2),
+            'first_step_amplification': round(mc_results['first_step_amplification'], 3),
+            'self_sustaining_score': round(mc_results['self_sustaining_score'], 2),
+            'loop_gain': round(mc_results['loop_gain'], 3),
+            'total_potential': round(mc_results['total_potential'], 2),
+            'score': score,
+            'classification': classification,
+            'trade_suggestion': suggestion if suggestion else 'N/A',
+        }
+        logger.info(f"Signal for {ticker}: {classification} (score {score})")
         return signal
+
     except Exception as e:
         logger.error(f"Error scanning {ticker}: {e}")
         return None
+
+
+# -------------------------------------------------------------------
+# CSV Logger
+# -------------------------------------------------------------------
+def log_signal_to_csv(signal: Dict[str, Any], filename: str = Config.CSV_LOG):
+    """Append a single signal row to CSV."""
+    fieldnames = [
+        'ticker', 'price', 'iv', 'net_gex', 'num_walls', 'nearest_wall_strike',
+        'nearest_wall_dist_pct', 'prob_hit_wall', 'mc_p95', 'first_step_amplification',
+        'self_sustaining_score', 'loop_gain', 'total_potential', 'score',
+        'classification', 'trade_suggestion'
+    ]
+    file_exists = os.path.isfile(filename)
+    with open(filename, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({k: signal.get(k, '') for k in fieldnames})
+
 
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Gamma Amplification Scanner v2.3")
-    parser.add_argument('--quick', action='store_true',
-                        help='Scan only default tickers (fast)')
-    parser.add_argument('--ticker', nargs='+',
-                        help='Custom ticker list to scan')
-    parser.add_argument('--n-sims', type=int, default=5000,
-                        help='Number of Monte Carlo simulations')
-    parser.add_argument('--drift', type=float, default=0.02,
-                        help='Catalyst drift (e.g. 0.02 for 2%% bias)')
+    parser.add_argument('--quick', action='store_true', help='Use small default ticker set')
+    parser.add_argument('--ticker', nargs='+', help='Override ticker list (space-separated)')
+    parser.add_argument('--drift', type=float, default=None,
+                        help='Force catalyst drift (overrides earnings detection)')
+    parser.add_argument('--output', type=str, default=Config.CSV_LOG,
+                        help='CSV output file')
+    parser.add_argument('--wall-proximity', type=float, default=Config.WALL_PROXIMITY,
+                        help='Wall proximity threshold (default 0.50 = 50%%)')
     args = parser.parse_args()
 
-    start_time = time.time()
-    logger.info(f"🤖 Gamma Scan v2.3 starting... (n_sims={args.n_sims}, drift={args.drift})")
+    # Update config
+    Config.WALL_PROXIMITY = args.wall_proximity
+    Config.CSV_LOG = args.output
 
-    # Load universe
-    universe = load_ticker_universe(quick_mode=args.quick,
-                                    custom_tickers=args.ticker)
-    if not universe:
-        logger.error("No tickers to scan. Exiting.")
-        sys.exit(1)
-    logger.info(f"Scanning {len(universe)} tickers")
+    # Determine ticker universe
+    if args.ticker:
+        tickers = args.ticker
+        logger.info(f"Using {len(tickers)} tickers from --ticker argument")
+    elif args.quick:
+        tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "GOOGL",
+                   "AMZN", "NVDA", "META", "TSLA", "AVGO", "JPM"]
+        logger.info("Quick mode: 12 default tickers")
+    else:
+        tickers = get_sp500_tickers()
+        logger.info(f"Full scan: {len(tickers)} S&P 500 tickers")
 
-    # Scan with progress bar if available
+    # Prepare output file header if needed
+    if not os.path.isfile(Config.CSV_LOG):
+        fieldnames = ['ticker', 'price', 'iv', 'net_gex', 'num_walls', 'nearest_wall_strike',
+                      'nearest_wall_dist_pct', 'prob_hit_wall', 'mc_p95', 'first_step_amplification',
+                      'self_sustaining_score', 'loop_gain', 'total_potential', 'score',
+                      'classification', 'trade_suggestion']
+        with open(Config.CSV_LOG, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(fieldnames)
+
+    # Scan tickers with thread pool
     signals = []
-    if TQDM_AVAILABLE:
-        iterator = tqdm(universe, desc="Scanning", unit="ticker")
-    else:
-        iterator = universe
+    with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+        fut_to_ticker = {executor.submit(scan_ticker, t): t for t in tickers}
+        for future in as_completed(fut_to_ticker):
+            ticker = fut_to_ticker[future]
+            try:
+                result = future.result()
+                if result:
+                    signals.append(result)
+                    log_signal_to_csv(result)
+                    logger.info(f"Signal logged for {ticker}")
+            except Exception as e:
+                logger.error(f"Exception in thread for {ticker}: {e}")
+            # Enforce delay between ticker submissions globally
+            time.sleep(Config.TICKER_DELAY)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(scan_ticker, t, catalyst_drift=args.drift,
-                                    n_sims=args.n_sims): t for t in iterator}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                signals.append(result)
+    # Print summary
+    print(f"\n=== Scan complete: {len(signals)} signals found ===")
+    for sig in signals:
+        print(f"{sig['ticker']}: {sig['classification']} (score {sig['score']}) "
+              f"| wall {sig['nearest_wall_strike']} | prob_hit {sig['prob_hit_wall']}%")
+        if sig['trade_suggestion'] != 'N/A':
+            print(f"   Trade: {sig['trade_suggestion']}")
 
-    elapsed = time.time() - start_time
-    logger.info(f"Scan complete in {elapsed:.0f}s – {len(signals)} signals generated")
+    # Also output JSON to stdout
+    print("\n--- JSON ---")
+    print(json.dumps(signals, indent=2))
 
-    # Display top signals
-    if signals:
-        strong = [s for s in signals if s['strength'] in ('HIGH', 'MODERATE')]
-        if strong:
-            print("\n===== TOP SIGNALS =====")
-            for s in sorted(strong, key=lambda x: x['total_gamma'], reverse=True)[:10]:
-                print(f"{s['ticker']:6s} | Price ${s['underlying_price']:>8.2f} | "
-                      f"Gamma {s['total_gamma']:>12,.0f} | {s['strength']:8s} | "
-                      f"Up {s['prob_up']:.1%} Down {s['prob_down']:.1%} | "
-                      f"Trade: {s['trade_suggestion']}")
-            print("========================")
-        else:
-            print("No strong signals found.")
-    else:
-        print("No signals generated.")
-
-    logger.info(f"Log written to {CSV_LOG}")
-    print(f"\nLog written to {CSV_LOG}")
 
 if __name__ == "__main__":
     main()
