@@ -87,7 +87,7 @@ class Config:
     MAX_EXPIRATIONS = 2       # front month + next (avoid 0-DTE)
     MIN_DTE = 1               # skip 0-DTE
     MAX_DTE = 60              # avoid far-dated options
-    WALL_PROXIMITY = 0.50     # 50% — accept walls up to 50% from spot
+    WALL_PROXIMITY = 0.20     # 50% — accept walls up to 50% from spot
     TOP_WALLS = 10            # only consider top N walls by abs net GEX
     MIN_OI = 100              # minimum open interest
     MIN_IV = 0.05             # minimum implied volatility
@@ -98,7 +98,7 @@ class Config:
     MC_SEED = 42
 
     # Screening
-    MIN_IV_FILTER = 0.20      # minimum implied volatility to consider for signals
+    MIN_IV_FILTER = 0.35      # minimum implied volatility to consider for signals
     NET_GEX_NEGATIVE = True   # only generate signals for net GEX < 0
 
     # Score & classification
