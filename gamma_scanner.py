@@ -121,7 +121,7 @@ def get_sp500_tickers() -> List[str]:
         ("Finviz CSV", "https://elite.finviz.com/export.ashx?v=111&t=SP500",
          lambda df: df['Symbol'].tolist() if 'Symbol' in df.columns else df.iloc[:,0].tolist()),
         ("GitHub Raw SP500",
-         "https://raw.githubusercontent.com/datasets/s-and-500-companies/main/data/constituents.csv",
+         "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv",
          lambda df: df['Symbol'].tolist() if 'Symbol' in df.columns else df['Ticker'].tolist()
          if 'Ticker' in df.columns else df.iloc[:,0].tolist()),
     ]
