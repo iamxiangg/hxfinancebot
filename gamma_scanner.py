@@ -116,21 +116,7 @@ class Config:
 
 
 # =============================================================================
-# Scan statistics counters (visible at INFO level)
-# =============================================================================
-scan_stats = {
-    'total': 0,
-    'no_data': 0,
-    'low_iv': 0,
-    'net_gex_positive': 0,
-    'no_walls': 0,
-    'walls_too_far': 0,
-    'passed': 0
-}
-
-
-# =============================================================================
-# Telegram Notifier
+# Telegram Notifier — NEW (requested feature)
 # =============================================================================
 class TelegramNotifier:
     """Send alerts to Telegram bot. Configure via env vars or config file."""
@@ -186,11 +172,10 @@ class TelegramNotifier:
         return self.send_message(text)
 
     def send_daily_summary(self, signals: List[Dict[str, Any]]) -> bool:
-        """Send a daily summary of all signals found (sorted by score descending)."""
+        """Send a daily summary of all signals found."""
         if not self.enabled or not signals:
             return False
         
-        # Signals should already be sorted by score descending from run_scanner
         extreme = [s for s in signals if s.get('classification') == 'EXTREME']
         high = [s for s in signals if s.get('classification') == 'HIGH_CONVICTION']
         watch = [s for s in signals if s.get('classification') == 'WATCH']
@@ -201,10 +186,13 @@ class TelegramNotifier:
         text += f"🟠 HIGH_CONVICTION: {len(high)}\n"
         text += f"🟡 WATCH: {len(watch)}\n\n"
         
-        text += "<b>🏆 Top Signals (by score):</b>\n"
-        for s in signals[:10]:  # Show top 10 overall, sorted by score
-            emoji = {'EXTREME': '🔴', 'HIGH_CONVICTION': '🟠', 'WATCH': '🟡'}.get(s['classification'], '⚪')
-            text += f"  {emoji} {s['ticker']} — Score {s['score']} — ${s['price']:.2f}\n"
+        if extreme:
+            text += "<b>Top Signals:</b>\n"
+            for s in extreme[:5]:
+                text += f"  {s['ticker']} — Score {s['score']} — ${s['price']:.2f}\n"
+        if high:
+            for s in high[:3]:
+                text += f"  {s['ticker']} — Score {s['score']} — ${s['price']:.2f}\n"
         
         return self.send_message(text)
 
@@ -513,4 +501,349 @@ def simulate_cascade(data: Dict[str, Any], walls: List[Dict[str, float]],
     total_move = np.abs(final_prices - S0).mean()
     first_step_amp = total_move / max(first_step_move, 1e-6)
 
-   
+    # Self-sustaining score
+    direction = np.sign(paths[:, 1] - S0)
+    sustained = np.zeros(n_sims, dtype=bool)
+    for i in range(n_sims):
+        if direction[i] == 0:
+            continue
+        diff = np.diff(paths[i, 1:])
+        if np.all(diff * direction[i] > 0):
+            sustained[i] = True
+    self_sustaining = np.mean(sustained) * 100.0
+
+    # Loop gain
+    total_abs_gex = sum(w['abs_gex'] for w in walls)
+    implied_gamma_impact = total_abs_gex / (S0 * 1e6)
+    loop_gain = min(implied_gamma_impact, 1.0)
+
+    # Total potential
+    farthest_wall_dist = max(abs(w['strike'] - S0) for w in walls) / S0 * 100.0
+    total_potential = farthest_wall_dist * prob_hit / 100.0
+
+    return {
+        'prob_hit_wall': prob_hit,
+        'mc_p95': p95,
+        'first_step_amplification': first_step_amp,
+        'self_sustaining_score': self_sustaining,
+        'loop_gain': loop_gain,
+        'total_potential': total_potential
+    }
+
+
+# =============================================================================
+# 7. ECONOMIC SCORING & CLASSIFICATION
+# =============================================================================
+def economic_score(mc_results: Dict[str, Any], data: Dict[str, Any],
+                   net_gex: float, iv_percentile: float = 0.5) -> Dict[str, Any]:
+    """
+    Compute composite score and classify signal.
+    Returns dict with 'score', 'classification', and 'components'.
+    """
+    loop_gain = mc_results['loop_gain']
+    mc_p95 = (mc_results['mc_p95'] / data['current_price'] - 1) * 100
+    self_sustaining = mc_results['self_sustaining_score']
+    first_step_amp = mc_results['first_step_amplification']
+    total_potential = mc_results['total_potential']
+    prob_hit = mc_results['prob_hit_wall']
+
+    score_components = {
+        'loop_gain': min(loop_gain * 100, 100),
+        'mc_p95': min(abs(mc_p95) * 2, 100),
+        'self_sustaining': self_sustaining,
+        'first_step_amp': min(first_step_amp * 50, 100),
+        'total_potential': min(total_potential * 10, 100),
+        'prob_hit': prob_hit,
+        'iv_percentile': iv_percentile * 100,
+        'net_gex_negative': (-net_gex / abs(net_gex) * 50) if net_gex != 0 else 0
+    }
+
+    weights = {
+        'loop_gain': 0.25,
+        'mc_p95': 0.20,
+        'self_sustaining': 0.15,
+        'first_step_amp': 0.10,
+        'total_potential': 0.10,
+        'prob_hit': 0.10,
+        'iv_percentile': 0.05,
+        'net_gex_negative': 0.05
+    }
+    score = sum(score_components[k] * weights[k] for k in weights)
+
+    if score >= 75:
+        classification = 'EXTREME'
+    elif score >= 60:
+        classification = 'HIGH_CONVICTION'
+    elif score >= 40:
+        classification = 'WATCH'
+    else:
+        classification = 'STRUCTURAL'
+
+    return {
+        'score': round(score, 1),
+        'classification': classification,
+        'components': score_components
+    }
+
+
+# =============================================================================
+# FIX #2: trade_suggestion — same-strike fix
+# =============================================================================
+def trade_suggestion(data: Dict[str, Any], walls: List[Dict[str, float]],
+                     classification: str, score: float) -> Optional[str]:
+    """Generate plain-English trade recommendation for strong signals."""
+    if classification not in ('EXTREME', 'HIGH_CONVICTION'):
+        return None
+    if not walls:
+        return None
+
+    S = data['current_price']
+    walls_sorted = sorted(walls, key=lambda w: abs(w['strike'] - S))
+    nearest = walls_sorted[0]
+    direction = 'CALL' if nearest['strike'] > S else 'PUT'
+    target = nearest['strike']
+
+    # Buy at nearest standard strike below (CALL) or above (PUT) spot
+    buy_strike = np.floor(S) if direction == 'CALL' else np.ceil(S)
+    sell_strike = target
+
+    # Enforce minimum 5% spread to avoid same-strike rounding
+    min_spread = S * 0.05
+    if direction == 'CALL':
+        if sell_strike <= buy_strike + min_spread:
+            sell_strike = buy_strike + min_spread
+        suggestion = f"BUY ${buy_strike:.0f} CALL, SELL ${sell_strike:.0f} CALL debit spread"
+    else:
+        if sell_strike >= buy_strike - min_spread:
+            sell_strike = buy_strike - min_spread
+        suggestion = f"BUY ${buy_strike:.0f} PUT, SELL ${sell_strike:.0f} PUT debit spread"
+    return suggestion
+
+
+# =============================================================================
+# 8. MAIN SCANNER
+# =============================================================================
+def scan_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """Full scan pipeline for a single ticker."""
+    logger.info(f"Scanning {ticker}...")
+    try:
+        # 1. Fetch options data
+        data = get_options_data(ticker)
+        if data is None:
+            logger.debug(f"No options data for {ticker}")
+            return None
+
+        S = data['current_price']
+        iv = data.get('iv', 0)
+        if iv is None or iv < Config.MIN_IV_FILTER:
+            logger.debug(f"IV too low for {ticker}: {iv}")
+            return None
+
+        # 2. Compute gamma profile and net GEX
+        profile, total_net_gex = calculate_gex_profile(data)
+        if profile.empty:
+            return None
+
+        # 3. Filter: net GEX must be negative (dealers short gamma)
+        if Config.NET_GEX_NEGATIVE and total_net_gex >= 0:
+            logger.debug(f"Net GEX non-negative for {ticker}: {total_net_gex:.2f}")
+            return None
+
+        # 4. Detect walls
+        walls = find_gamma_walls(profile, num_walls=Config.TOP_WALLS)
+        if not walls:
+            logger.debug(f"No gamma walls for {ticker}")
+            return None
+
+        # 5. Filter walls by proximity
+        filtered_walls = [w for w in walls if abs(w['strike'] - S) / S <= Config.WALL_PROXIMITY]
+        if not filtered_walls:
+            logger.debug(f"No walls within {Config.WALL_PROXIMITY:.0%} for {ticker}")
+            return None
+        # FIX #1: Sort walls by proximity to spot so walls[0] = nearest wall
+        walls = sorted(filtered_walls, key=lambda w: abs(w['strike'] - S))[:Config.TOP_WALLS]
+
+        # 6. Earnings detection
+        earnings_info = get_earnings_info(ticker)
+        catalyst_drift = 0.0
+        if earnings_info and earnings_info['historical_avg_move']:
+            catalyst_drift = earnings_info['historical_avg_move']
+            logger.debug(f"Earnings drift for {ticker}: {catalyst_drift:.2%}")
+
+        # 7. Monte Carlo cascade
+        mc_results = simulate_cascade(data, walls, catalyst_drift=catalyst_drift)
+
+        # 8. Score & classify
+        iv_percentile = min(iv / 0.5, 1.0)
+        score_result = economic_score(mc_results, data, total_net_gex, iv_percentile)
+        classification = score_result['classification']
+        score = score_result['score']
+
+        # 9. Generate trade suggestion
+        suggestion = trade_suggestion(data, walls, classification, score)
+
+        # 10. Build output
+        signal = {
+            'ticker': ticker,
+            'price': round(S, 2),
+            'iv': round(iv, 4),
+            'net_gex': round(total_net_gex, 2),
+            'num_walls': len(walls),
+            'nearest_wall_strike': walls[0]['strike'],
+            'nearest_wall_dist_pct': round(abs(walls[0]['strike'] - S) / S * 100, 2),
+            'prob_hit_wall': round(mc_results['prob_hit_wall'], 2),
+            'mc_p95': round(mc_results['mc_p95'], 2),
+            'first_step_amplification': round(mc_results['first_step_amplification'], 3),
+            'self_sustaining_score': round(mc_results['self_sustaining_score'], 2),
+            'loop_gain': round(mc_results['loop_gain'], 3),
+            'total_potential': round(mc_results['total_potential'], 2),
+            'score': score,
+            'classification': classification,
+            'trade_suggestion': suggestion if suggestion else 'N/A',
+        }
+        logger.info(f"Signal for {ticker}: {classification} (score {score})")
+        return signal
+
+    except Exception as e:
+        logger.error(f"Error scanning {ticker}: {e}")
+        return None
+
+
+# =============================================================================
+# CSV Logger
+# =============================================================================
+def log_signal_to_csv(signal: Dict[str, Any], filename: str = Config.CSV_LOG):
+    """Append a single signal row to CSV with thread safety."""
+    fieldnames = [
+        'ticker', 'price', 'iv', 'net_gex', 'num_walls', 'nearest_wall_strike',
+        'nearest_wall_dist_pct', 'prob_hit_wall', 'mc_p95', 'first_step_amplification',
+        'self_sustaining_score', 'loop_gain', 'total_potential', 'score',
+        'classification', 'trade_suggestion'
+    ]
+    file_exists = os.path.isfile(filename)
+    with open(filename, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({k: signal.get(k, '') for k in fieldnames})
+
+
+# =============================================================================
+# FIX #3: run_scanner — summary first, then individual alerts
+# =============================================================================
+def run_scanner(ticker_list: List[str], output_csv: str = 'gamma_signals.csv',
+                telegram: Optional[TelegramNotifier] = None) -> List[Dict[str, Any]]:
+    """Scan all tickers with thread pool and write results."""
+    signals = []
+    
+    with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+        fut_to_ticker = {executor.submit(scan_ticker, t): t for t in ticker_list}
+        for future in as_completed(fut_to_ticker):
+            ticker = fut_to_ticker[future]
+            try:
+                result = future.result()
+                if result:
+                    signals.append(result)
+                    log_signal_to_csv(result, filename=output_csv)
+                    logger.info(f"Signal logged for {ticker}")
+            except Exception as e:
+                logger.error(f"Exception in thread for {ticker}: {e}")
+            # Enforce delay between ticker submissions
+            time.sleep(Config.TICKER_DELAY)
+
+    # Send daily summary FIRST (top of Telegram chat)
+    if telegram and signals:
+        telegram.send_daily_summary(signals)
+
+    # Then send individual signal alerts
+    if telegram:
+        for sig in signals:
+            if sig['classification'] in ('EXTREME', 'HIGH_CONVICTION'):
+                telegram.send_signal_alert(sig)
+
+    return signals
+
+
+# =============================================================================
+# 10. ENTRY POINT
+# =============================================================================
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Gamma Amplification Scanner v2.3")
+    parser.add_argument('--quick', action='store_true', help='Use small default ticker set')
+    parser.add_argument('--ticker', nargs='+', help='Override ticker list (space-separated)')
+    parser.add_argument('--drift', type=float, default=None,
+                        help='Force catalyst drift (overrides earnings detection)')
+    parser.add_argument('--output', type=str, default='gamma_signals.csv',
+                        help='CSV output file')
+    parser.add_argument('--wall-proximity', type=float, default=Config.WALL_PROXIMITY,
+                        help='Wall proximity threshold (default 0.50 = 50%%)')
+    parser.add_argument('--workers', type=int, default=Config.MAX_WORKERS,
+                        help='Number of concurrent workers')
+    parser.add_argument('--no-telegram', action='store_true',
+                        help='Disable Telegram notifications')
+    args = parser.parse_args()
+
+    # Update config
+    Config.WALL_PROXIMITY = args.wall_proximity
+    Config.CSV_LOG = args.output
+    Config.MAX_WORKERS = args.workers
+
+    # Determine ticker universe
+    if args.ticker:
+        tickers = args.ticker
+        logger.info(f"Using {len(tickers)} tickers from --ticker argument")
+    elif args.quick:
+        tickers = Config.DEFAULT_TICKERS
+        logger.info("Quick mode: 12 default tickers")
+    else:
+        # ===== RETAINED FROM TEMPLATE: CSV loading with volume filter =====
+        tickers = load_tickers_from_csv()
+        if not tickers:
+            logger.warning("No tickers from CSV, using defaults")
+            tickers = Config.DEFAULT_TICKERS
+
+    logger.info(f"Total tickers to scan: {len(tickers)}")
+
+    # Initialize Telegram notifier
+    telegram = None if args.no_telegram else TelegramNotifier()
+
+    # Prepare output CSV
+    if not os.path.isfile(Config.CSV_LOG):
+        fieldnames = ['ticker', 'price', 'iv', 'net_gex', 'num_walls', 'nearest_wall_strike',
+                      'nearest_wall_dist_pct', 'prob_hit_wall', 'mc_p95', 'first_step_amplification',
+                      'self_sustaining_score', 'loop_gain', 'total_potential', 'score',
+                      'classification', 'trade_suggestion']
+        with open(Config.CSV_LOG, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(fieldnames)
+
+    # Run scanner
+    print(f"Starting gamma scanner with {len(tickers)} tickers...")
+    signals = run_scanner(tickers, output_csv=Config.CSV_LOG, telegram=telegram)
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Scan complete: {len(signals)} signals found")
+    print(f"{'='*60}")
+    
+    # Group by classification
+    by_class = {}
+    for sig in signals:
+        cls = sig['classification']
+        by_class.setdefault(cls, []).append(sig)
+    
+    for cls in ['EXTREME', 'HIGH_CONVICTION', 'WATCH', 'STRUCTURAL']:
+        if cls in by_class:
+            print(f"\n{cls}: {len(by_class[cls])}")
+            for sig in by_class[cls][:5]:  # show top 5
+                print(f"  {sig['ticker']}: score {sig['score']} | "
+                      f"${sig['price']:.2f} | wall ${sig['nearest_wall_strike']:.0f} | "
+                      f"prob_hit {sig['prob_hit_wall']:.1f}%")
+                if sig['trade_suggestion'] != 'N/A':
+                    print(f"    → {sig['trade_suggestion']}")
+
+    # JSON output
+    print(f"\n--- JSON ---")
+    print(json.dumps(signals, indent=2))
+    
+    print(f"\n✅ Results saved to {Config.CSV_LOG}")
