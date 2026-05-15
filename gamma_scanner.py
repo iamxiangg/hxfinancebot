@@ -116,7 +116,7 @@ class Config:
 
 
 # =============================================================================
-# Telegram Notifier — NEW (requested feature)
+# Telegram Notifier
 # =============================================================================
 class TelegramNotifier:
     """Send alerts to Telegram bot. Configure via env vars or config file."""
@@ -208,7 +208,7 @@ def fetch_options_chain(ticker: str, expiration: str) -> Optional[Dict[str, pd.D
         opt = stock.option_chain(expiration)
         return {'calls': opt.calls, 'puts': opt.puts}
     except Exception as e:
-        logger.debug(f"  - Error fetching options for {ticker} @ {expiration}: {e}")
+        logger.info(f"  ⚠️ Options fetch failed for {ticker} @ {expiration}: {e}")
         return None
 
 def get_nearest_expirations(ticker: str, num_expiries: int = 3) -> List[str]:
@@ -242,12 +242,14 @@ def get_options_data(ticker: str) -> Optional[Dict[str, Any]]:
         # Get spot price from history (single call)
         hist = yf_ticker.history(period="5d")
         if hist.empty:
+            logger.info(f"  ⚠️ No price history for {ticker}")
             return None
         current_price = hist['Close'].iloc[-1]
 
         # Get nearest expirations
         use_exps = get_nearest_expirations(ticker, num_expiries=Config.MAX_EXPIRATIONS)
         if not use_exps:
+            logger.info(f"  ⚠️ No suitable expirations for {ticker}")
             return None
 
         all_calls = []
@@ -267,6 +269,7 @@ def get_options_data(ticker: str) -> Optional[Dict[str, Any]]:
             all_puts.append(puts)
 
         if not all_calls and not all_puts:
+            logger.info(f"  ⚠️ No option chains returned for {ticker}")
             return None
 
         calls_df = pd.concat(all_calls, ignore_index=True) if all_calls else pd.DataFrame()
@@ -431,7 +434,7 @@ def get_earnings_info(ticker: str) -> Optional[Dict[str, Any]]:
             'historical_avg_move': avg_move if avg_move else None
         }
     except Exception as e:
-        logger.debug(f"Earnings fetch failed for {ticker}: {e}")
+        logger.info(f"  ⚠️ Earnings fetch failed for {ticker}: {e}")
         return None
 
 
@@ -587,7 +590,7 @@ def economic_score(mc_results: Dict[str, Any], data: Dict[str, Any],
 
 
 # =============================================================================
-# FIX #2: trade_suggestion — same-strike fix
+# trade_suggestion — with minimum spread to prevent same-strike rounding
 # =============================================================================
 def trade_suggestion(data: Dict[str, Any], walls: List[Dict[str, float]],
                      classification: str, score: float) -> Optional[str]:
@@ -630,37 +633,38 @@ def scan_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         # 1. Fetch options data
         data = get_options_data(ticker)
         if data is None:
-            logger.debug(f"No options data for {ticker}")
+            logger.info(f"  ⚠️ No options data for {ticker}")
             return None
 
         S = data['current_price']
         iv = data.get('iv', 0)
         if iv is None or iv < Config.MIN_IV_FILTER:
-            logger.debug(f"IV too low for {ticker}: {iv}")
+            logger.info(f"  ⚠️ IV too low for {ticker}: {iv}")
             return None
 
         # 2. Compute gamma profile and net GEX
         profile, total_net_gex = calculate_gex_profile(data)
         if profile.empty:
+            logger.info(f"  ⚠️ Empty gamma profile for {ticker}")
             return None
 
         # 3. Filter: net GEX must be negative (dealers short gamma)
         if Config.NET_GEX_NEGATIVE and total_net_gex >= 0:
-            logger.debug(f"Net GEX non-negative for {ticker}: {total_net_gex:.2f}")
+            logger.info(f"  ⚠️ Net GEX non-negative for {ticker}: {total_net_gex:.2f}")
             return None
 
         # 4. Detect walls
         walls = find_gamma_walls(profile, num_walls=Config.TOP_WALLS)
         if not walls:
-            logger.debug(f"No gamma walls for {ticker}")
+            logger.info(f"  ⚠️ No gamma walls for {ticker}")
             return None
 
         # 5. Filter walls by proximity
         filtered_walls = [w for w in walls if abs(w['strike'] - S) / S <= Config.WALL_PROXIMITY]
         if not filtered_walls:
-            logger.debug(f"No walls within {Config.WALL_PROXIMITY:.0%} for {ticker}")
+            logger.info(f"  ⚠️ No walls within {Config.WALL_PROXIMITY:.0%} for {ticker}")
             return None
-        # FIX #1: Sort walls by proximity to spot so walls[0] = nearest wall
+        # Sort walls by proximity to spot so walls[0] = nearest wall
         walls = sorted(filtered_walls, key=lambda w: abs(w['strike'] - S))[:Config.TOP_WALLS]
 
         # 6. Earnings detection
@@ -668,7 +672,7 @@ def scan_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         catalyst_drift = 0.0
         if earnings_info and earnings_info['historical_avg_move']:
             catalyst_drift = earnings_info['historical_avg_move']
-            logger.debug(f"Earnings drift for {ticker}: {catalyst_drift:.2%}")
+            logger.info(f"  ℹ️ Earnings drift for {ticker}: {catalyst_drift:.2%}")
 
         # 7. Monte Carlo cascade
         mc_results = simulate_cascade(data, walls, catalyst_drift=catalyst_drift)
@@ -701,7 +705,7 @@ def scan_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             'classification': classification,
             'trade_suggestion': suggestion if suggestion else 'N/A',
         }
-        logger.info(f"Signal for {ticker}: {classification} (score {score})")
+        logger.info(f"  ✅ SIGNAL: {ticker} — {classification} (score {score})")
         return signal
 
     except Exception as e:
@@ -729,7 +733,7 @@ def log_signal_to_csv(signal: Dict[str, Any], filename: str = Config.CSV_LOG):
 
 
 # =============================================================================
-# FIX #3: run_scanner — summary first, then individual alerts
+# 9. RUNNER — summary first, then individual alerts
 # =============================================================================
 def run_scanner(ticker_list: List[str], output_csv: str = 'gamma_signals.csv',
                 telegram: Optional[TelegramNotifier] = None) -> List[Dict[str, Any]]:
@@ -745,7 +749,7 @@ def run_scanner(ticker_list: List[str], output_csv: str = 'gamma_signals.csv',
                 if result:
                     signals.append(result)
                     log_signal_to_csv(result, filename=output_csv)
-                    logger.info(f"Signal logged for {ticker}")
+                    logger.info(f"  ✅ Signal logged for {ticker}")
             except Exception as e:
                 logger.error(f"Exception in thread for {ticker}: {e}")
             # Enforce delay between ticker submissions
@@ -796,7 +800,7 @@ if __name__ == '__main__':
         tickers = Config.DEFAULT_TICKERS
         logger.info("Quick mode: 12 default tickers")
     else:
-        # ===== RETAINED FROM TEMPLATE: CSV loading with volume filter =====
+        # CSV loading with volume filter
         tickers = load_tickers_from_csv()
         if not tickers:
             logger.warning("No tickers from CSV, using defaults")
