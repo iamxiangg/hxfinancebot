@@ -172,10 +172,11 @@ class TelegramNotifier:
         return self.send_message(text)
 
     def send_daily_summary(self, signals: List[Dict[str, Any]]) -> bool:
-        """Send a daily summary of all signals found."""
+        """Send a daily summary of all signals found (sorted by score descending)."""
         if not self.enabled or not signals:
             return False
         
+        # Signals should already be sorted by score descending from run_scanner
         extreme = [s for s in signals if s.get('classification') == 'EXTREME']
         high = [s for s in signals if s.get('classification') == 'HIGH_CONVICTION']
         watch = [s for s in signals if s.get('classification') == 'WATCH']
@@ -186,13 +187,10 @@ class TelegramNotifier:
         text += f"🟠 HIGH_CONVICTION: {len(high)}\n"
         text += f"🟡 WATCH: {len(watch)}\n\n"
         
-        if extreme:
-            text += "<b>Top Signals:</b>\n"
-            for s in extreme[:5]:
-                text += f"  {s['ticker']} — Score {s['score']} — ${s['price']:.2f}\n"
-        if high:
-            for s in high[:3]:
-                text += f"  {s['ticker']} — Score {s['score']} — ${s['price']:.2f}\n"
+        text += "<b>🏆 Top Signals (by score):</b>\n"
+        for s in signals[:10]:  # Show top 10 overall, sorted by score
+            emoji = {'EXTREME': '🔴', 'HIGH_CONVICTION': '🟠', 'WATCH': '🟡'}.get(s['classification'], '⚪')
+            text += f"  {emoji} {s['ticker']} — Score {s['score']} — ${s['price']:.2f}\n"
         
         return self.send_message(text)
 
@@ -588,29 +586,55 @@ def economic_score(mc_results: Dict[str, Any], data: Dict[str, Any],
 
 def trade_suggestion(data: Dict[str, Any], walls: List[Dict[str, float]],
                      classification: str, score: float) -> Optional[str]:
-    """Generate plain-English trade recommendation for strong signals."""
+    """
+    Generate plain-English trade recommendation using actual listed strikes.
+    BUY ATM / SELL at wall strike as a debit vertical spread.
+    """
     if classification not in ('EXTREME', 'HIGH_CONVICTION'):
         return None
     if not walls:
         return None
 
     S = data['current_price']
+    
+    # Get available strikes from the options chain to find actual listed strikes
+    all_calls = data.get('calls', pd.DataFrame())
+    all_puts = data.get('puts', pd.DataFrame())
+    
     walls_sorted = sorted(walls, key=lambda w: abs(w['strike'] - S))
     nearest = walls_sorted[0]
     direction = 'CALL' if nearest['strike'] > S else 'PUT'
     target = nearest['strike']
-
-    buy_strike = S
-    sell_strike = target
+    
+    # Choose the correct chain (calls for bullish, puts for bearish)
+    chain = all_calls if direction == 'CALL' else all_puts
+    if chain.empty:
+        return None
+    available_strikes = sorted(chain['strike'].unique())
+    if not available_strikes:
+        return None
+    
+    # Find actual listed strike nearest to current price (buy leg)
+    buy_strike = min(available_strikes, key=lambda k: abs(k - S))
+    # Find actual listed strike nearest to the wall (sell leg)
+    sell_strike = min(available_strikes, key=lambda k: abs(k - target))
+    
     if direction == 'CALL':
+        # Debit call spread: buy strike < sell strike
         if sell_strike <= buy_strike:
-            sell_strike = buy_strike * 1.05
-        suggestion = f"BUY ${buy_strike:.0f} CALL, SELL ${sell_strike:.0f} CALL debit spread"
+            above = [k for k in available_strikes if k > buy_strike]
+            if not above:
+                return None
+            sell_strike = above[0]
+        return f"BUY ${buy_strike:.0f} CALL, SELL ${sell_strike:.0f} CALL debit spread"
     else:
+        # Debit put spread: buy strike > sell strike
         if sell_strike >= buy_strike:
-            sell_strike = buy_strike * 0.95
-        suggestion = f"BUY ${buy_strike:.0f} PUT, SELL ${sell_strike:.0f} PUT debit spread"
-    return suggestion
+            below = [k for k in available_strikes if k < buy_strike]
+            if not below:
+                return None
+            sell_strike = below[0]
+        return f"BUY ${buy_strike:.0f} PUT, SELL ${sell_strike:.0f} PUT debit spread"
 
 
 # =============================================================================
@@ -738,18 +762,24 @@ def run_scanner(ticker_list: List[str], output_csv: str = 'gamma_signals.csv',
                     signals.append(result)
                     log_signal_to_csv(result, filename=output_csv)
                     logger.info(f"Signal logged for {ticker}")
-                    
-                    # Send Telegram alert for strong signals
-                    if telegram and result['classification'] in ('EXTREME', 'HIGH_CONVICTION'):
-                        telegram.send_signal_alert(result)
+                    # Individual alerts moved below — sent AFTER summary
             except Exception as e:
                 logger.error(f"Exception in thread for {ticker}: {e}")
             # Enforce delay between ticker submissions
             time.sleep(Config.TICKER_DELAY)
 
-    # Send daily summary to Telegram
+    # Sort signals by score descending so summary shows strongest first
+    signals.sort(key=lambda s: s['score'], reverse=True)
+
+    # 1️⃣ Send daily summary FIRST (top names & scores)
     if telegram and signals:
         telegram.send_daily_summary(signals)
+
+    # 2️⃣ THEN send individual detailed alerts for strong signals
+    if telegram:
+        for signal in signals:
+            if signal['classification'] in ('EXTREME', 'HIGH_CONVICTION'):
+                telegram.send_signal_alert(signal)
 
     return signals
 
