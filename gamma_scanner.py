@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gamma Squeeze Scanner – v2.1 (Diagnostic Edition)
+Gamma Squeeze Scanner – v2.2 (Diagnostic Edition)
 Scans S&P 500 stocks for gamma amplification signals.
 Sends Telegram alerts with trade suggestions.
 """
@@ -139,9 +139,10 @@ def get_spot_price(ticker: str) -> Optional[float]:
     except Exception:
         return None
 
-def get_options_data(ticker: str, max_expiries: int = 3) -> Optional[pd.DataFrame]:
+def get_options_data(ticker: str, spot: float, max_expiries: int = 3) -> Optional[pd.DataFrame]:
     """
     Fetch call option chains for the next few expiries.
+    Uses spot passed from scan_ticker for consistency.
     Returns a DataFrame with columns: ['strike','price','volume','gex','iv','expiry_date','type']
     or None on failure.
     """
@@ -186,15 +187,15 @@ def get_options_data(ticker: str, max_expiries: int = 3) -> Optional[pd.DataFram
                 if pd.isna(volume): volume = 0
                 if pd.isna(oi): oi = 0
 
-                # Compute IV on the fly
-                iv = compute_bs_iv(S, K, T, r, price, 'call')
+                # Compute IV using the passed spot
+                iv = compute_bs_iv(spot, K, T, r, price, 'call')
                 if iv is None or iv < 0.0001:
                     continue
 
                 # GEX = gamma * openInterest * spot * 100
-                d1 = (np.log(S/K) + (r + 0.5*iv**2)*T) / (iv*np.sqrt(T))
-                gamma = norm.pdf(d1) / (S * iv * np.sqrt(T))
-                gex = gamma * oi * S * 100
+                d1 = (np.log(spot/K) + (r + 0.5*iv**2)*T) / (iv*np.sqrt(T))
+                gamma = norm.pdf(d1) / (spot * iv * np.sqrt(T))
+                gex = gamma * oi * spot * 100
 
                 rows.append({
                     'strike': K,
@@ -320,8 +321,8 @@ def scan_ticker(ticker: str) -> Optional[dict]:
     if DIAGNOSTIC:
         print(f"[DIAG] {ticker} spot = {S:.2f}")
 
-    # 2) Get options data (includes IV computation internally)
-    opt_df = get_options_data(ticker)
+    # 2) Get options data (pass spot)
+    opt_df = get_options_data(ticker, S)
     if opt_df is None:
         logger.info(f"⚠️ No options data for {ticker}")
         return None
@@ -330,7 +331,7 @@ def scan_ticker(ticker: str) -> Optional[dict]:
         print(f"[DIAG] Columns: {opt_df.columns.tolist()}")
         print(f"[DIAG] First 5 rows:\n{opt_df.head()}")
 
-    # 3) Compute average IV (should already be in opt_df)
+    # 3) Compute average IV
     avg_iv = opt_df['iv'].mean()
     if DIAGNOSTIC:
         print(f"[DIAG] {ticker} avg IV = {avg_iv:.6f} (from {len(opt_df)} options)")
