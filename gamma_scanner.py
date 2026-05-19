@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-gamma_scanner.py – S&P 500 Gamma Squeeze Scanner v2.3 (Fixed & Merged)
+gamma_scanner.py – S&P 500 Gamma Squeeze Scanner v2.4 (Filtered + Trade Fix)
 Uses options data from Yahoo Finance to compute GEX profiles,
 detect walls, run cascade simulations, score tickers, and send Telegram alerts.
 
 Fixes applied:
   - MC dt calculation (n_steps=50, dt=T/n_steps)
   - net_gex < 0 filter (dealers must be short gamma)
-  - Wall proximity configurable (default 50%)
+  - Wall proximity configurable (default 15%)
   - Single history() call per ticker
   - Earnings detection (historical avg move as catalyst drift)
   - MC strike loop limited to top 10 walls
-  - Trade suggestion engine
+  - Trade suggestion engine (formatting fixed for low-priced stocks)
   - Rate limiting with exponential backoff
   - CSV logging with all fields
   - Telegram notification support
@@ -87,7 +87,7 @@ class Config:
     MAX_EXPIRATIONS = 2       # front month + next (avoid 0-DTE)
     MIN_DTE = 1               # skip 0-DTE
     MAX_DTE = 60              # avoid far-dated options
-    WALL_PROXIMITY = 0.20     # 50% — accept walls up to 50% from spot
+    WALL_PROXIMITY = 0.15     # ⚡ TIGHTENED: 0.50→0.20→0.15 — only accept walls within 15% of spot
     TOP_WALLS = 10            # only consider top N walls by abs net GEX
     MIN_OI = 100              # minimum open interest
     MIN_IV = 0.05             # minimum implied volatility
@@ -98,7 +98,7 @@ class Config:
     MC_SEED = 42
 
     # Screening
-    MIN_IV_FILTER = 0.35      # minimum implied volatility to consider for signals
+    MIN_IV_FILTER = 0.50      # ⚡ TIGHTENED: 0.20→0.35→0.50 — only stocks with ≥50% IV (strong gamma)
     NET_GEX_NEGATIVE = True   # only generate signals for net GEX < 0
 
     # Score & classification
@@ -572,7 +572,7 @@ def economic_score(mc_results: Dict[str, Any], data: Dict[str, Any],
 
     if score >= 75:
         classification = 'EXTREME'
-    elif score >= 60:
+    elif score >= 72:       # ⚡ TIGHTENED: 60→68→72 — higher bar for HIGH_CONVICTION
         classification = 'HIGH_CONVICTION'
     elif score >= 40:
         classification = 'WATCH'
@@ -605,11 +605,13 @@ def trade_suggestion(data: Dict[str, Any], walls: List[Dict[str, float]],
     if direction == 'CALL':
         if sell_strike <= buy_strike:
             sell_strike = buy_strike * 1.05
-        suggestion = f"BUY ${buy_strike:.0f} CALL, SELL ${sell_strike:.0f} CALL debit spread"
+        # ⚡ FIXED: .2f instead of .0f — shows decimal strikes for sub-$50 stocks
+        suggestion = f"BUY ${buy_strike:.2f} CALL, SELL ${sell_strike:.2f} CALL debit spread"
     else:
         if sell_strike >= buy_strike:
             sell_strike = buy_strike * 0.95
-        suggestion = f"BUY ${buy_strike:.0f} PUT, SELL ${sell_strike:.0f} PUT debit spread"
+        # ⚡ FIXED: .2f instead of .0f
+        suggestion = f"BUY ${buy_strike:.2f} PUT, SELL ${sell_strike:.2f} PUT debit spread"
     return suggestion
 
 
@@ -758,7 +760,7 @@ def run_scanner(ticker_list: List[str], output_csv: str = 'gamma_signals.csv',
 # 10. ENTRY POINT
 # =============================================================================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Gamma Amplification Scanner v2.3")
+    parser = argparse.ArgumentParser(description="Gamma Amplification Scanner v2.4")
     parser.add_argument('--quick', action='store_true', help='Use small default ticker set')
     parser.add_argument('--ticker', nargs='+', help='Override ticker list (space-separated)')
     parser.add_argument('--drift', type=float, default=None,
@@ -766,7 +768,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default='gamma_signals.csv',
                         help='CSV output file')
     parser.add_argument('--wall-proximity', type=float, default=Config.WALL_PROXIMITY,
-                        help='Wall proximity threshold (default 0.50 = 50%%)')
+                        help='Wall proximity threshold (default 0.15 = 15%%)')
     parser.add_argument('--workers', type=int, default=Config.MAX_WORKERS,
                         help='Number of concurrent workers')
     parser.add_argument('--no-telegram', action='store_true',
