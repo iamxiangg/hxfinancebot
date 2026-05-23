@@ -1,8 +1,8 @@
 name: Portfolio Monitor
 
 on:
-  schedule:
-    - cron: '0 14 * * 1-5'   # Monday-Friday at 14:00 UTC
+  repository_dispatch:
+    types: [portfolio_check]
   workflow_dispatch:          # manual trigger from GitHub Actions tab
 
 jobs:
