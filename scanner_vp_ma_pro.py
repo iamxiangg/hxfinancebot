@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 VP_MA_Scan – Volume Profile + 50-MA + RSI Scanner
-Triggers: Support BUY, Breakout BUY, SELL
-Improved Telegram format with annotations for clarity.
+Sends Telegram message with signals AND non-signal reasons.
 """
 
 import os
 import sys
 import math
+import traceback
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -44,7 +44,6 @@ def get_ticker_data(ticker):
         if df.empty:
             return None
         df = flatten_multiindex(df)
-        # Rename columns to standard names
         rename_map = {}
         for col in df.columns:
             lower = col.lower()
@@ -65,11 +64,7 @@ def get_ticker_data(ticker):
         return None
 
 def compute_volume_profile(df, lookback=LOOKBACK):
-    """
-    Compute Volume Profile for the last `lookback` bars.
-    Returns: vp_dict with keys: value_area_high, value_area_low, poc, 
-             hvn_levels, lvn_levels, bucket_width, buckets.
-    """
+    """Compute Volume Profile for last `lookback` bars."""
     if len(df) < lookback:
         lookback = len(df)
     recent = df.tail(lookback).copy()
@@ -79,7 +74,6 @@ def compute_volume_profile(df, lookback=LOOKBACK):
     if price_range == 0:
         return None
 
-    # Dynamic bucket width
     avg_price = recent['Close'].mean()
     bucket_width = max(avg_price * 0.001, 0.01)
     num_buckets = int(price_range / bucket_width)
@@ -90,7 +84,6 @@ def compute_volume_profile(df, lookback=LOOKBACK):
         bucket_width = price_range / 10
         num_buckets = 10
 
-    # Build volume per bucket
     buckets = {}
     for _, row in recent.iterrows():
         low = row['Low']
@@ -112,10 +105,8 @@ def compute_volume_profile(df, lookback=LOOKBACK):
     sorted_volumes = [buckets[p] for p in sorted_prices]
     total_volume = sum(sorted_volumes)
 
-    # Point of Control (POC)
     poc_price = max(buckets, key=buckets.get)
 
-    # Find Value Area (70%)
     target_volume = total_volume * VALUE_AREA_PCT
     poc_idx = sorted_prices.index(poc_price)
     cum_vol = 0
@@ -135,7 +126,6 @@ def compute_volume_profile(df, lookback=LOOKBACK):
     val = sorted_prices[left_idx]
     vah = sorted_prices[right_idx]
 
-    # HVN / LVN detection (simple: top/bottom 20% of volume)
     volume_threshold_high = np.percentile(sorted_volumes, 80)
     volume_threshold_low  = np.percentile(sorted_volumes, 20)
     hvn_levels = [p for p, v in zip(sorted_prices, sorted_volumes) if v >= volume_threshold_high]
@@ -179,11 +169,10 @@ def detect_signals(ticker, df):
     signals = []
     vp = compute_volume_profile(df)
     if vp is None:
-        return signals
+        return signals, None   # No VP data
 
     df_indicators = compute_indicators(df)
     last = df_indicators.iloc[-1]
-    prev = df_indicators.iloc[-2] if len(df_indicators) > 1 else last
 
     close_price = last['Close']
     ma50 = last['MA50']
@@ -195,7 +184,10 @@ def detect_signals(ticker, df):
     lvn_levels = vp['lvn_levels']
 
     if pd.isna(ma50) or pd.isna(rsi):
-        return signals
+        return signals, None
+
+    # Collect reasons for no signal (used for debug output)
+    reasons = []
 
     # ── Support BUY ──────────────────────────────────────────
     if (close_price >= ma50 * 0.98) and (close_price <= ma50 * 1.02):
@@ -219,9 +211,18 @@ def detect_signals(ticker, df):
                         'va_range': f"${round(val,2)}–${round(vah,2)}",
                         'poc': round(poc, 2)
                     })
+                    return signals, None  # signal found, no reason needed
+                else:
+                    reasons.append("risk/reward below 1.5")
+            else:
+                reasons.append(f"RSI out of buy range (currently {rsi:.1f})")
+        else:
+            reasons.append("price not in lower half of VA")
+    else:
+        reasons.append(f"price not near 50-MA (difference {abs(close_price-ma50)/ma50*100:.1f}%)")
 
-    # ── Breakout BUY ────────────────────────────────────────
-    if (close_price > vah) and (rsi < RSI_BREAKOUT_MAX):
+    # ── Breakout BUY (only if no Support BUY) ────────────────
+    if not signals and (close_price > vah) and (rsi < RSI_BREAKOUT_MAX):
         lvn_near = nearest_lvn(lvn_levels, close_price)
         if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
             if close_price > ma50:
@@ -242,9 +243,18 @@ def detect_signals(ticker, df):
                         'poc': round(poc, 2),
                         'near_lvn': round(lvn_near, 2)
                     })
+                    return signals, None
+                else:
+                    reasons.append("breakout risk/reward below 1.5")
+            else:
+                reasons.append("breakout but below 50-MA")
+        else:
+            reasons.append("breakout but no nearby LVN")
+    elif not signals:
+        reasons.append(f"price below VAH or RSI too high ({rsi:.1f})")
 
     # ── SELL signal ─────────────────────────────────────────
-    if (close_price < val) and (rsi >= RSI_SELL_LOW) and (rsi <= RSI_SELL_HIGH):
+    if not signals and (close_price < val) and (rsi >= RSI_SELL_LOW) and (rsi <= RSI_SELL_HIGH):
         lvn_near = nearest_lvn(lvn_levels, close_price)
         if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
             if close_price < ma50:
@@ -264,7 +274,20 @@ def detect_signals(ticker, df):
                         'va_range': f"${round(val,2)}–${round(vah,2)}",
                         'poc': round(poc, 2)
                     })
-    return signals
+                    return signals, None
+                else:
+                    reasons.append("sell risk/reward below 1.5")
+            else:
+                reasons.append("sell but above 50-MA")
+        else:
+            reasons.append("sell but no nearby LVN")
+    else:
+        if close_price < val:
+            reasons.append("below VAL but RSI not in sell range")
+
+    if not reasons:
+        reasons.append("unknown (no signal criteria met)")
+    return signals, ", ".join(reasons)
 
 # ─── Telegram Notification ──────────────────────────────────────
 
@@ -311,6 +334,44 @@ def format_signal_message(signal):
     lines.append(f"<a href='{tv_link}'>📊 View on TradingView</a>")
     return "\n".join(lines)
 
+def build_full_message(signals, no_signal_reasons):
+    """Build the entire Telegram message (signals + non-signal reasons)."""
+    parts = []
+    # Signals section
+    if signals:
+        header = f"<b>🔍 VP_MA Scan – {len(signals)} signal(s)</b>"
+        parts.append(header)
+        for sig in signals:
+            parts.append(format_signal_message(sig))
+        if no_signal_reasons:
+            parts.append("<b>Stocks without signals:</b>")
+            for ticker, reason in no_signal_reasons.items():
+                parts.append(f"• {ticker} – {reason}")
+            # Simple "what to watch" hint
+            parts.append("<b>⚠️ What to watch next:</b>")
+            for ticker, reason in no_signal_reasons.items():
+                if "RSI overbought" in reason or "RSI too high" in reason:
+                    parts.append(f"• {ticker} → wait for RSI to drop below 60")
+                elif "below VAL" in reason:
+                    parts.append(f"• {ticker} → wait for recovery above VAL")
+                elif "not near 50-MA" in reason:
+                    parts.append(f"• {ticker} → wait for pullback to 50-MA")
+                elif "no Volume Profile" in reason:
+                    parts.append(f"• {ticker} → insufficient volume data")
+                else:
+                    parts.append(f"• {ticker} → monitor for improvement")
+    else:
+        # No signals at all – only non-signal reasons
+        if no_signal_reasons:
+            header = "<b>🔍 VP_MA Scan – no signals found</b>"
+            parts.append(header)
+            parts.append("<b>All watchlist tickers failed to meet criteria:</b>")
+            for ticker, reason in no_signal_reasons.items():
+                parts.append(f"• {ticker} – {reason}")
+        else:
+            parts = ["<b>🔍 VP_MA Scan completed – no setups found.</b>"]
+    return "\n\n".join(parts)
+
 # ─── Main Scan ──────────────────────────────────────────────────
 
 def main():
@@ -330,6 +391,7 @@ def main():
         sys.exit(1)
 
     all_signals = []
+    no_signal_reasons = {}
     total = len(tickers)
     for idx, ticker in enumerate(tickers, 1):
         print(f"Scanning {ticker}... ({idx}/{total})")
@@ -337,48 +399,42 @@ def main():
         df = get_ticker_data(ticker)
         if df is None or len(df) < 60:
             print(f"   ⚠️  Insufficient data for {ticker}")
+            no_signal_reasons[ticker] = "insufficient data (<60 days)"
             continue
-        signals = detect_signals(ticker, df)
+        signals, reason = detect_signals(ticker, df)
         if signals:
             all_signals.extend(signals)
             for s in signals:
                 print(f"   ✅ {s['type']} on {ticker}")
-
-    print(f"\nDone. Found {len(all_signals)} signals.")
-
-    # ── Build and send Telegram message ──────────────────────
-    if all_signals:
-        # Split signals into chunks (Telegram max ~4096 chars)
-        chunks = []
-        current = []
-        current_len = 0
-        sep = "\n\n"
-        for sig in all_signals:
-            msg = format_signal_message(sig)
-            msg_len = len(msg)
-            if current_len + msg_len + len(sep) > 3800:
-                chunks.append(sep.join(current))
-                current = [msg]
-                current_len = msg_len
+        else:
+            if reason:
+                no_signal_reasons[ticker] = reason
+                print(f"   ❌ No signal – {reason}")
             else:
-                current.append(msg)
-                current_len += msg_len + len(sep)
-        if current:
-            chunks.append(sep.join(current))
+                no_signal_reasons[ticker] = "unknown error"
 
-        success = True
-        for i, chunk in enumerate(chunks):
-            header = f"<b>🔍 VP_MA Scan – {len(all_signals)} signals</b>\n\n" if i == 0 else ""
-            msg = header + chunk
-            if not send_telegram(msg):
-                success = False
-                print(f"⚠️  Failed to send chunk {i+1}")
-        if success:
-            print("✅ Telegram messages sent successfully.")
+    print(f"\nDone. Found {len(all_signals)} signals, {len(no_signal_reasons)} non-signaled.")
+
+    # Build and send Telegram message
+    full_msg = build_full_message(all_signals, no_signal_reasons)
+    
+    # Split into chunks if too long (Telegram limit ~4096 chars)
+    # We split on double newline, trying to keep whole sections together
+    chunk_size = 3800
+    if len(full_msg) <= chunk_size:
+        send_telegram(full_msg)
     else:
-        msg = "<b>🔍 VP_MA Scan completed – no setups found.</b>"
-        send_telegram(msg)
-        print("ℹ️  No setups to report. Telegram notified.")
+        # Simple split on paragraph boundaries
+        paragraphs = full_msg.split("\n\n")
+        chunk = ""
+        for para in paragraphs:
+            if len(chunk) + len(para) + 2 > chunk_size:
+                send_telegram(chunk)
+                chunk = para
+            else:
+                chunk = (chunk + "\n\n" + para).strip()
+        if chunk:
+            send_telegram(chunk)
 
 if __name__ == "__main__":
     try:
