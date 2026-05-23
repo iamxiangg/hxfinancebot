@@ -1,568 +1,493 @@
 #!/usr/bin/env python3
 """
-VP_MA_Scan – Automated Stock Scanner with Volume Profile, 50-MA, and RSI confluence.
-Generates trade signals and sends Telegram notifications.
+VP_MA_Scan – Volume Profile + 50-MA + RSI Scanner
+Sends concise Telegram message: signals + categorised non‑signal reasons.
 """
 
 import os
 import sys
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple
-
+import math
+import traceback
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator
 
-# -------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-WATCHLIST_FILE = "positions.csv"
+# ─── Configuration ──────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+WATCHLIST_FILE     = "positions.csv"
+LOOKBACK           = 300
+VALUE_AREA_PCT     = 0.70
+MIN_RR_RATIO       = 1.5
+RSI_BUY_LOW        = 40
+RSI_BUY_HIGH       = 60
+RSI_SELL_LOW       = 30
+RSI_SELL_HIGH      = 50
+RSI_BREAKOUT_MAX   = 65
 
-# Trading parameters
-VA_PERCENT = 0.70
-MIN_RR = 1.5
-LOOKBACK_DAYS = 120  # enough for volume profile
-MAX_BUCKETS = 500
-MIN_BUCKET_PRICE = 0.01
-VA_MIDPOINT_MAX_PERCENT = 0.50  # support BUY: price must be in lower 50% of VA
-MA_PERIOD = 50
-RSI_PERIOD = 14
+# ─── Helper Functions ───────────────────────────────────────────
 
-# Breakout & Short targets/stops
-BREAKOUT_TARGET_MULT = 1.05
-BREAKOUT_STOP_MULT = 0.98
-SHORT_TARGET_MULT = 0.95
-SHORT_STOP_MULT = 1.02
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-
-# -------------------------------------------------------------------
-# Helper functions
-# -------------------------------------------------------------------
-def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex columns from yfinance."""
+def flatten_multiindex(df):
+    """Flatten yfinance MultiIndex columns to single level."""
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join(col).strip() for col in df.columns.values]
+        df.columns = ['_'.join(col).strip() for col in df.columns.values]
     return df
 
-
-def calculate_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(span=period, adjust=False).mean()
-    avg_loss = loss.ewm(span=period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def calculate_volume_profile(price: pd.Series, volume: pd.Series, va_percent: float = VA_PERCENT, max_buckets: int = MAX_BUCKETS):
-    """
-    Compute Value Area (VAH, VAL, POC), Volume Nodes (HVN, LVN).
-    Returns dict or None if insufficient data.
-    """
-    if len(price) < 20:
+def get_ticker_data(ticker):
+    """Download OHLCV data using yfinance."""
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="6mo", interval="1d")
+        if df.empty:
+            return None
+        df = flatten_multiindex(df)
+        rename_map = {}
+        for col in df.columns:
+            lower = col.lower()
+            if 'close' in lower:
+                rename_map[col] = 'Close'
+            elif 'high' in lower:
+                rename_map[col] = 'High'
+            elif 'low' in lower:
+                rename_map[col] = 'Low'
+            elif 'volume' in lower:
+                rename_map[col] = 'Volume'
+        df.rename(columns=rename_map, inplace=True)
+        required = ['Close', 'High', 'Low', 'Volume']
+        if not all(c in df.columns for c in required):
+            return None
+        return df
+    except Exception:
         return None
 
-    # Determine bucket width dynamically (0.1% of average price, min $0.01)
-    avg_price = price.mean()
-    bucket_width = max(avg_price * 0.001, MIN_BUCKET_PRICE)
-
-    # Build price buckets
-    min_price = price.min()
-    max_price = price.max()
-    nb_buckets = min(max_buckets, int((max_price - min_price) / bucket_width) + 1)
-    if nb_buckets < 10:
+def compute_volume_profile(df, lookback=LOOKBACK):
+    """Compute Volume Profile for last `lookback` bars."""
+    if len(df) < lookback:
+        lookback = len(df)
+    recent = df.tail(lookback).copy()
+    price_min = recent['Low'].min()
+    price_max = recent['High'].max()
+    price_range = price_max - price_min
+    if price_range == 0:
         return None
 
-    bins = np.linspace(min_price, max_price, nb_buckets + 1)
-    bucket_indices = np.digitize(price, bins=bins) - 1  # 0-indexed
+    avg_price = recent['Close'].mean()
+    bucket_width = max(avg_price * 0.001, 0.01)
+    num_buckets = int(price_range / bucket_width)
+    if num_buckets > 500:
+        bucket_width = price_range / 500
+        num_buckets = 500
+    elif num_buckets < 10:
+        bucket_width = price_range / 10
+        num_buckets = 10
 
-    # Aggregate volume per bucket
-    bucket_volumes = np.zeros(nb_buckets)
-    for idx, vol in zip(bucket_indices, volume):
-        if 0 <= idx < nb_buckets:
-            bucket_volumes[idx] += vol
+    buckets = {}
+    for _, row in recent.iterrows():
+        low = row['Low']
+        high = row['High']
+        vol = row['Volume']
+        if vol == 0:
+            continue
+        low_idx = int((low - price_min) / bucket_width)
+        high_idx = int((high - price_min) / bucket_width)
+        for i in range(low_idx, high_idx + 1):
+            price_level = price_min + i * bucket_width
+            price_level = round(price_level, 2)
+            buckets[price_level] = buckets.get(price_level, 0) + vol / (high_idx - low_idx + 1)
 
-    # Find POC (bucket with max volume)
-    poc_bucket = np.argmax(bucket_volumes)
-    poc_price = (bins[poc_bucket] + bins[poc_bucket + 1]) / 2
+    if not buckets:
+        return None
 
-    # Build sorted volume profile (by price)
-    bucket_centers = (bins[:-1] + bins[1:]) / 2
-    profile = sorted(zip(bucket_centers, bucket_volumes), key=lambda x: x[0])
-    centers, volumes = zip(*profile) if profile else ([], [])
+    sorted_prices = sorted(buckets.keys())
+    sorted_volumes = [buckets[p] for p in sorted_prices]
+    total_volume = sum(sorted_volumes)
 
-    total_volume = sum(volumes)
-    target_volume = total_volume * va_percent
+    poc_price = max(buckets, key=buckets.get)
 
-    # Start from POC outward
-    poc_idx = np.where(np.isclose(centers, poc_price))[0][0]
-    included = [poc_idx]
-    current_vol = volumes[poc_idx]
-    left = poc_idx - 1
-    right = poc_idx + 1
-
-    while current_vol < target_volume:
-        left_vol = volumes[left] if left >= 0 else 0
-        right_vol = volumes[right] if right < len(volumes) else 0
-        if left_vol >= right_vol and left >= 0:
-            included.append(left)
-            current_vol += left_vol
-            left -= 1
-        elif right < len(volumes):
-            included.append(right)
-            current_vol += right_vol
-            right += 1
+    target_volume = total_volume * VALUE_AREA_PCT
+    poc_idx = sorted_prices.index(poc_price)
+    cum_vol = 0
+    left_idx = poc_idx
+    right_idx = poc_idx
+    while cum_vol < target_volume and (left_idx > 0 or right_idx < len(sorted_prices)-1):
+        if left_idx > 0 and (right_idx == len(sorted_prices)-1 or 
+                             sorted_volumes[left_idx-1] >= sorted_volumes[right_idx+1]):
+            left_idx -= 1
+            cum_vol += sorted_volumes[left_idx]
+        elif right_idx < len(sorted_prices)-1:
+            right_idx += 1
+            cum_vol += sorted_volumes[right_idx]
         else:
             break
 
-    included.sort()
-    val_price = centers[included[0]]
-    vah_price = centers[included[-1]]
+    val = sorted_prices[left_idx]
+    vah = sorted_prices[right_idx]
 
-    # Determine High Volume Nodes (HVN) and Low Volume Nodes (LVN)
-    mean_vol = np.mean(volumes)
-    std_vol = np.std(volumes)
-    hvn_threshold = mean_vol + 0.5 * std_vol
-    lvn_threshold = mean_vol - 0.5 * std_vol
-
-    hvn_prices = [c for c, v in zip(centers, volumes) if v >= hvn_threshold]
-    lvn_prices = [c for c, v in zip(centers, volumes) if v <= lvn_threshold and v > 0]
+    volume_threshold_high = np.percentile(sorted_volumes, 80)
+    volume_threshold_low  = np.percentile(sorted_volumes, 20)
+    hvn_levels = [p for p, v in zip(sorted_prices, sorted_volumes) if v >= volume_threshold_high]
+    lvn_levels = [p for p, v in zip(sorted_prices, sorted_volumes) if v <= volume_threshold_low]
 
     return {
-        "val": val_price,
-        "vah": vah_price,
-        "poc": poc_price,
-        "hvn": hvn_prices,
-        "lvn": lvn_prices,
-        "buckets": list(zip(centers, volumes)),
+        'value_area_low': val,
+        'value_area_high': vah,
+        'poc': poc_price,
+        'hvn_levels': hvn_levels,
+        'lvn_levels': lvn_levels,
+        'bucket_width': bucket_width,
+        'buckets': buckets
     }
 
+def compute_indicators(df):
+    """Add 50-MA and RSI (14) to dataframe."""
+    df = df.copy()
+    df['MA50'] = SMAIndicator(close=df['Close'], window=50).sma_indicator()
+    df['RSI']  = RSIIndicator(close=df['Close'], window=14).rsi()
+    return df
 
-def find_nearest_lvn(price: float, lvn_list: List[float], direction: str = "above") -> Optional[float]:
-    """Find nearest LVN above or below the given price."""
+def calculate_risk_reward(entry, stop, target):
+    """Return risk:reward ratio. 0 if invalid."""
+    risk  = abs(entry - stop)
+    reward = abs(target - entry)
+    if risk == 0:
+        return 0
+    return reward / risk
+
+def nearest_lvn(lvn_list, price):
+    """Return the LVN level closest to price."""
     if not lvn_list:
         return None
-    candidates = [lvn for lvn in lvn_list if (direction == "above" and lvn > price) or (direction == "below" and lvn < price)]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda x: abs(x - price))
+    return min(lvn_list, key=lambda x: abs(x - price))
 
+# ─── Signal Detection ───────────────────────────────────────────
 
-def categorize_reason(ticker: str, close: float, ma50: float, rsi: float, vp: Optional[dict]) -> str:
-    """
-    Determine the reason a ticker did NOT generate a signal.
-    Returns a human-readable string.
-    """
-    reasons = []
-    if ma50 is None or np.isnan(ma50):
-        return "Insufficient data (no 50‑MA)"
-    ma50 = float(ma50)
-    close = float(close)
-
-    # Distance from 50-MA
-    pct_from_ma = abs(close - ma50) / ma50 * 100
-    if pct_from_ma > 10:
-        return "Very far from 50‑MA"
-    if pct_from_ma > 5:
-        reasons.append("Far from 50‑MA")
-
-    if rsi is None or np.isnan(rsi):
-        reasons.append("RSI not available")
-    else:
-        rsi = float(rsi)
-
+def detect_signals(ticker, df):
+    """Check for Support BUY, Breakout BUY, SELL signals."""
+    signals = []
+    vp = compute_volume_profile(df)
     if vp is None:
-        reasons.append("Volume Profile not available")
-        return "; ".join(reasons) if reasons else "Unknown"
+        return signals, None   # No VP data
 
-    val = vp["val"]
-    vah = vp["vah"]
-    poc = vp["poc"]
+    df_indicators = compute_indicators(df)
+    last = df_indicators.iloc[-1]
 
-    # Check for Support BUY conditions
-    va_midpoint = (val + vah) / 2
-    if close <= va_midpoint:
-        reasons.append("Below VA midpoint (support BUY possible)")
+    close_price = last['Close']
+    ma50 = last['MA50']
+    rsi  = last['RSI']
+    val  = vp['value_area_low']
+    vah  = vp['value_area_high']
+    poc  = vp['poc']
+    va_mid = (val + vah) / 2
+    lvn_levels = vp['lvn_levels']
+
+    if pd.isna(ma50) or pd.isna(rsi):
+        return signals, None
+
+    # Collect reasons for no signal
+    reasons = []
+
+    # ── Support BUY ──────────────────────────────────────────
+    if (close_price >= ma50 * 0.98) and (close_price <= ma50 * 1.02):
+        if val <= close_price <= va_mid:
+            if RSI_BUY_LOW <= rsi <= RSI_BUY_HIGH:
+                stop = max(val, poc)
+                if close_price - stop < 0.01 * close_price:
+                    stop = val * 0.98
+                target = vah
+                rr = calculate_risk_reward(close_price, stop, target)
+                if rr >= MIN_RR_RATIO:
+                    signals.append({
+                        'type': 'Support BUY',
+                        'ticker': ticker,
+                        'entry': close_price,
+                        'stop': stop,
+                        'target': target,
+                        'rr': round(rr, 2),
+                        'rsi': round(rsi, 1),
+                        'ma50': round(ma50, 2),
+                        'va_range': f"${round(val,2)}–${round(vah,2)}",
+                        'poc': round(poc, 2)
+                    })
+                    return signals, None
+                else:
+                    reasons.append("risk/reward below 1.5")
+            else:
+                reasons.append(f"RSI out of buy range ({rsi:.1f})")
+        else:
+            reasons.append("price not in lower half of VA")
     else:
-        if close <= vah * 1.02:
-            reasons.append("Near VAH (breakout candidate but no LVN gap)")
+        reasons.append(f"far from 50-MA ({abs(close_price-ma50)/ma50*100:.1f}%)")
+
+    # ── Breakout BUY (only if no Support BUY) ────────────────
+    if not signals and (close_price > vah) and (rsi < RSI_BREAKOUT_MAX):
+        lvn_near = nearest_lvn(lvn_levels, close_price)
+        if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
+            if close_price > ma50:
+                stop = vah * 0.98
+                target = close_price * 1.05
+                rr = calculate_risk_reward(close_price, stop, target)
+                if rr >= MIN_RR_RATIO:
+                    signals.append({
+                        'type': 'Breakout BUY',
+                        'ticker': ticker,
+                        'entry': close_price,
+                        'stop': stop,
+                        'target': target,
+                        'rr': round(rr, 2),
+                        'rsi': round(rsi, 1),
+                        'ma50': round(ma50, 2),
+                        'va_range': f"${round(val,2)}–${round(vah,2)}",
+                        'poc': round(poc, 2),
+                        'near_lvn': round(lvn_near, 2)
+                    })
+                    return signals, None
+                else:
+                    reasons.append("breakout R:R < 1.5")
+            else:
+                reasons.append("breakout but below 50-MA")
         else:
-            reasons.append("Above VAH with no clear pattern")
+            reasons.append("breakout no nearby LVN")
+    elif not signals:
+        reasons.append(f"price not above VAH or RSI too high ({rsi:.1f})")
 
-    # Check RSI for each signal type
-    if rsi is not None:
-        if 40 <= rsi <= 60:
-            pass  # neutral
-        elif rsi < 40:
-            reasons.append("RSI oversold")
-        else:  # rsi > 60
-            reasons.append("RSI overbought")
-
-    # Check LVN for breakout/short
-    if close > vah:
-        nearest_lvn_above = find_nearest_lvn(close, vp.get("lvn", []), "above")
-        if nearest_lvn_above is not None and (nearest_lvn_above - close) / close < 0.02:
-            reasons.append("LVN gap for breakout present")
+    # ── SELL signal ─────────────────────────────────────────
+    if not signals and (close_price < val) and (rsi >= RSI_SELL_LOW) and (rsi <= RSI_SELL_HIGH):
+        lvn_near = nearest_lvn(lvn_levels, close_price)
+        if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
+            if close_price < ma50:
+                stop = val * 1.02
+                target = close_price * 0.95
+                rr = calculate_risk_reward(close_price, stop, target)
+                if rr >= MIN_RR_RATIO:
+                    signals.append({
+                        'type': 'SELL (Short)',
+                        'ticker': ticker,
+                        'entry': close_price,
+                        'stop': stop,
+                        'target': target,
+                        'rr': round(rr, 2),
+                        'rsi': round(rsi, 1),
+                        'ma50': round(ma50, 2),
+                        'va_range': f"${round(val,2)}–${round(vah,2)}",
+                        'poc': round(poc, 2)
+                    })
+                    return signals, None
+                else:
+                    reasons.append("sell R:R < 1.5")
+            else:
+                reasons.append("sell but above 50-MA")
         else:
-            reasons.append("No clear LVN above for breakout")
-    elif close < val:
-        nearest_lvn_below = find_nearest_lvn(close, vp.get("lvn", []), "below")
-        if nearest_lvn_below is not None and (close - nearest_lvn_below) / close < 0.02:
-            reasons.append("LVN gap for short present")
-        else:
-            reasons.append("No clear LVN below for short")
+            reasons.append("sell no nearby LVN")
+    else:
+        if close_price < val:
+            reasons.append("below VAL but RSI not in sell range")
 
-    # Combine reasons
-    return "; ".join(reasons) if reasons else "No specific reason"
+    if not reasons:
+        reasons.append("unknown reason")
+    return signals, ", ".join(reasons)
 
+# ─── Telegram Notification ──────────────────────────────────────
 
-# -------------------------------------------------------------------
-# Signal detection
-# -------------------------------------------------------------------
-def check_support_buy(ticker: str, close: float, ma50: float, rsi: float, vp: dict) -> Optional[dict]:
-    """Support BUY logic: price in lower 50% of VA, within 2% of 50-MA, RSI 40-60."""
-    if ma50 is None or np.isnan(ma50) or rsi is None or np.isnan(rsi):
-        return None
-    if not (40 <= rsi <= 60):
-        return None
-
-    val = vp["val"]
-    vah = vp["vah"]
-    va_midpoint = (val + vah) / 2
-    if close > va_midpoint:
-        return None
-
-    # Close within 2% of 50-MA
-    pct_from_ma = abs(close - ma50) / ma50 * 100
-    if pct_from_ma > 2:
-        return None
-
-    # Stops: VAL or POC (whichever is lower)
-    stop = min(val, vp["poc"])
-    # Target: VAH or next HVN above
-    hvns_above = [h for h in vp.get("hvn", []) if h > close]
-    target = vp["vah"] if not hvns_above else min(hvns_above)
-
-    # Risk/Reward
-    risk = close - stop
-    reward = target - close
-    if risk <= 0 or reward <= 0 or (reward / risk) < MIN_RR:
-        return None
-
-    return {
-        "action": "BUY",
-        "type": "Support",
-        "entry": round(close, 2),
-        "stop": round(stop, 2),
-        "target": round(target, 2),
-        "rr": round(reward / risk, 2),
-        "rationale": f"Support BUY: price {close:.2f} below VA midpoint {va_midpoint:.2f}, "
-                     f"within {pct_from_ma:.1f}% of 50‑MA ({ma50:.2f}), RSI {rsi:.1f} (40‑60). "
-                     f"Stop at VAL/POC ${stop:.2f}, target VAH/HVN ${target:.2f}.",
-        "stop_reason": "VAL / POC",
-    }
-
-
-def check_breakout_buy(ticker: str, close: float, ma50: float, rsi: float, vp: dict) -> Optional[dict]:
-    """Breakout BUY: price above VAH, near LVN, RSI <65, above 50-MA."""
-    if ma50 is None or np.isnan(ma50) or rsi is None or np.isnan(rsi):
-        return None
-    if close <= ma50:
-        return None
-    if rsi >= 65:
-        return None
-
-    vah = vp["vah"]
-    if close <= vah:
-        return None
-
-    # Near an LVN above? (within 2% of close)
-    lvn_above = find_nearest_lvn(close, vp.get("lvn", []), "above")
-    if lvn_above is None:
-        return None
-    gap_pct = (lvn_above - close) / close * 100
-    if gap_pct > 2:
-        return None
-
-    # Target: close * 1.05
-    target = close * BREAKOUT_TARGET_MULT
-    stop = vah * BREAKOUT_STOP_MULT
-
-    risk = close - stop
-    reward = target - close
-    if risk <= 0 or reward <= 0 or (reward / risk) < MIN_RR:
-        return None
-
-    return {
-        "action": "BUY",
-        "type": "Breakout",
-        "entry": round(close, 2),
-        "stop": round(stop, 2),
-        "target": round(target, 2),
-        "rr": round(reward / risk, 2),
-        "rationale": f"Breakout BUY: price {close:.2f} above VAH {vah:.2f}, "
-                     f"near LVN {lvn_above:.2f} (gap {gap_pct:.1f}%), "
-                     f"RSI {rsi:.1f} (<65), above 50‑MA {ma50:.2f}. "
-                     f"Target ${target:.2f}, stop ${stop:.2f} (VAH × 0.98).",
-        "stop_reason": "VAH × 0.98",
-    }
-
-
-def check_short(ticker: str, close: float, ma50: float, rsi: float, vp: dict) -> Optional[dict]:
-    """SELL short: price below VAL, near LVN, RSI 30-50, below 50-MA."""
-    if ma50 is None or np.isnan(ma50) or rsi is None or np.isnan(rsi):
-        return None
-    if close >= ma50:
-        return None
-    if not (30 <= rsi <= 50):
-        return None
-
-    val = vp["val"]
-    if close >= val:
-        return None
-
-    # Near an LVN below?
-    lvn_below = find_nearest_lvn(close, vp.get("lvn", []), "below")
-    if lvn_below is None:
-        return None
-    gap_pct = (close - lvn_below) / close * 100
-    if gap_pct > 2:
-        return None
-
-    target = close * SHORT_TARGET_MULT
-    stop = val * SHORT_STOP_MULT
-
-    risk = stop - close
-    reward = close - target
-    if risk <= 0 or reward <= 0 or (reward / risk) < MIN_RR:
-        return None
-
-    return {
-        "action": "SELL",
-        "type": "Short",
-        "entry": round(close, 2),
-        "stop": round(stop, 2),
-        "target": round(target, 2),
-        "rr": round(reward / risk, 2),
-        "rationale": f"Short SELL: price {close:.2f} below VAL {val:.2f}, "
-                     f"near LVN {lvn_below:.2f} (gap {gap_pct:.1f}%), "
-                     f"RSI {rsi:.1f} (30‑50), below 50‑MA {ma50:.2f}. "
-                     f"Target ${target:.2f}, stop ${stop:.2f} (VAL × 1.02).",
-        "stop_reason": "VAL × 1.02",
-    }
-
-
-# -------------------------------------------------------------------
-# Scanner
-# -------------------------------------------------------------------
-def scan_ticker(ticker: str) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Scan a single ticker. Returns (signal_dict, reason_string).
-    signal_dict is None if no signal.
-    """
-    try:
-        # Download data
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=LOOKBACK_DAYS + 20)  # extra buffer
-        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
-        if df.empty:
-            return None, "No data"
-
-        df = flatten_columns(df)
-
-        # Rename columns based on yfinance output
-        # Typical columns: 'Open', 'High', 'Low', 'Close', 'Volume', or 'Adj Close'
-        # We need close and volume
-        close_col = "Close" if "Close" in df.columns else ("Adj Close" if "Adj Close" in df.columns else None)
-        volume_col = "Volume" if "Volume" in df.columns else None
-        if close_col is None or volume_col is None:
-            return None, "Required columns missing"
-
-        close = df[close_col].dropna()
-        volume = df[volume_col].dropna()
-        # Align index
-        common_idx = close.index.intersection(volume.index)
-        close = close.loc[common_idx]
-        volume = volume.loc[common_idx]
-
-        if len(close) < MA_PERIOD + RSI_PERIOD:
-            return None, "Insufficient data for indicators"
-
-        # Last values
-        last_close = float(close.iloc[-1])
-        # 50-day MA
-        ma50 = float(close.rolling(MA_PERIOD).mean().iloc[-1])
-        # RSI
-        rsi_series = calculate_rsi(close, RSI_PERIOD)
-        last_rsi = float(rsi_series.iloc[-1])
-
-        # Volume Profile on recent data (last LOOKBACK_DAYS bars)
-        recent_close = close.iloc[-LOOKBACK_DAYS:]
-        recent_volume = volume.iloc[-LOOKBACK_DAYS:]
-        vp = calculate_volume_profile(recent_close, recent_volume)
-
-        if vp is None:
-            return None, "Volume Profile calculation failed"
-
-        # Check signals in order
-        signal = check_support_buy(ticker, last_close, ma50, last_rsi, vp)
-        if signal:
-            return signal, None
-
-        signal = check_breakout_buy(ticker, last_close, ma50, last_rsi, vp)
-        if signal:
-            return signal, None
-
-        signal = check_short(ticker, last_close, ma50, last_rsi, vp)
-        if signal:
-            return signal, None
-
-        # No signal: get reason
-        reason = categorize_reason(ticker, last_close, ma50, last_rsi, vp)
-        return None, reason
-
-    except Exception as e:
-        logger.exception(f"Error scanning {ticker}: {e}")
-        return None, str(e)
-
-
-# -------------------------------------------------------------------
-# Telegram output
-# -------------------------------------------------------------------
-def send_telegram(message: str, parse_mode: str = "HTML") -> bool:
+def send_telegram(text, parse_mode="HTML"):
+    """Send a message via Telegram bot. Returns True on success."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials not set, message not sent.")
+        print("⚠️  Telegram credentials missing")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": parse_mode}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True
+    }
     try:
-        resp = requests.post(url, data=data, timeout=15)
-        resp.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        logger.error(f"Telegram send failed: {e}")
+        resp = requests.post(url, data=payload, timeout=15)
+        if resp.status_code == 200:
+            return True
+        else:
+            print(f"❌ Telegram API error {resp.status_code}: {resp.text}")
+            return False
+    except Exception as e:
+        print(f"❌ Telegram send exception: {e}")
         return False
 
-
-def build_signal_message(signal: dict) -> str:
-    """HTML formatted message for a trade signal."""
+def format_signal_message(signal):
+    """Build a single signal message with annotated fields."""
     lines = [
-        f"<b>{signal['action']} {signal['type']} – {signal['ticker']}</b>",
-        f"Entry: ${signal['entry']:.2f}",
-        f"Stop: ${signal['stop']:.2f} ({signal['stop_reason']})",
-        f"Target: ${signal['target']:.2f}",
-        f"Risk/Reward: {signal['rr']:.2f}",
-        f"Rationale: {signal['rationale']}",
+        f"<b>{signal['type']}</b> – {signal['ticker']}",
+        f"Entry: ${signal['entry']:.2f} (current close)",
+        f"Stop:  ${signal['stop']:.2f} (VAL / POC)",
+        f"Target: ${signal['target']:.2f} (VAH)",
+        f"R:R: {signal['rr']} → (target‑entry)/(entry‑stop)",
+        f"RSI: {signal['rsi']} | 50‑MA: ${signal['ma50']:.2f}",
     ]
+    if signal['type'] == 'Support BUY':
+        lines.append("💡 Lower half of VA, above 50‑MA, RSI 40‑60")
+    elif signal['type'] == 'Breakout BUY':
+        lines.append("💡 Above VAH, near LVN, RSI <65, above 50‑MA")
+    elif signal['type'] == 'SELL (Short)':
+        lines.append("💡 Below VAL, near LVN, below 50‑MA, RSI 30‑50")
+    tv_link = f"https://www.tradingview.com/chart/?symbol={signal['ticker']}"
+    lines.append(f"<a href='{tv_link}'>📊 View on TradingView</a>")
     return "\n".join(lines)
 
+def categorize_reason(reason_str):
+    """
+    Convert a composite reason string (comma‑separated) into a short category.
+    Returns a tuple: (category, primary_reason).
+    """
+    if reason_str is None:
+        return "Unknown", ""
+    reasons = [r.strip() for r in reason_str.split(",")]
+    primary = reasons[0] if reasons else ""
+    
+    # Map primary reason to a category
+    if "far from 50-MA" in primary or "insufficient data" in primary:
+        category = "Far from 50‑MA"
+    elif "RSI out of buy range" in primary or "RSI too high" in primary:
+        category = "RSI out of buy range"
+    elif "not in lower half of VA" in primary:
+        category = "Not in lower half of VA"
+    elif "breakout no nearby LVN" in primary:
+        category = "No nearby LVN (breakout)"
+    elif "sell no nearby LVN" in primary:
+        category = "No nearby LVN (sell)"
+    elif "breakout R:R" in primary or "sell R:R" in primary or "risk/reward" in primary:
+        category = "Risk/reward too low"
+    elif "breakout but below 50-MA" in primary or "sell but above 50-MA" in primary:
+        category = "Trend filter (MA) fails"
+    elif "below VAL but RSI" in primary:
+        category = "RSI not in sell range"
+    elif "price not above VAH" in primary:
+        category = "Price not above VAH"
+    else:
+        category = "Other"
+    return category, primary
 
-def build_full_message(signals: List[dict], non_signals: Dict[str, List[str]]) -> str:
-    """Build complete Telegram message with signal details and grouped non-signal tickers."""
+def build_full_message(signals, no_signal_reasons):
+    """Build the entire Telegram message (signals + categorised non‑signal reasons)."""
     parts = []
-    # Signals first
+    
+    # Signals section
     if signals:
-        parts.append("<b>🚦 TRADE SIGNALS FOUND</b>")
-        for s in signals:
-            parts.append(build_signal_message(s))
-            parts.append("")  # blank line
+        header = f"<b>🔍 VP_MA Scan – {len(signals)} signal(s)</b>"
+        parts.append(header)
+        for sig in signals:
+            parts.append(format_signal_message(sig))
+    else:
+        parts.append("<b>🔍 VP_MA Scan – no signals found</b>")
+    
+    # Non‑signal reasons – categorised
+    if no_signal_reasons:
+        # Group tickers by category
+        categories = {}
+        for ticker, reason in no_signal_reasons.items():
+            cat, primary = categorize_reason(reason)
+            if cat not in categories:
+                categories[cat] = []
+            # Store ticker and a short note (the primary reason)
+            categories[cat].append((ticker, primary))
+        
+        # Build categorised lines
+        lines = ["<b>⏳ Stocks without signals:</b>"]
+        for cat, tickers_list in sorted(categories.items()):
+            # Comma‑separated tickers with (reason) if needed
+            ticker_strs = []
+            for t, note in tickers_list:
+                ticker_strs.append(t)
+            line = f"  • <b>{cat}</b>: {', '.join(ticker_strs)}"
+            lines.append(line)
+        
+        # Add a single summary "What to watch" line
+        summary = ""
+        if "Far from 50‑MA" in categories:
+            summary += "📌 Stocks far from 50‑MA → wait for pullback to MA. "
+        if "RSI out of buy range" in categories or "RSI not in sell range" in categories:
+            summary += "📌 RSI out of range → wait for RSI to enter buy/sell zone. "
+        if "No nearby LVN" in categories:
+            summary += "📌 No LVN nearby → need a low volume gap for momentum. "
+        if "Risk/reward too low" in categories:
+            summary += "📌 Risk/reward low → wait for better entry. "
+        if "Not in lower half of VA" in categories:
+            summary += "📌 Price in upper VA → wait for pullback to support. "
+        if "Price not above VAH" in categories:
+            summary += "📌 Price below VAH → breakout not yet confirmed. "
+        if summary:
+            lines.append("")
+            lines.append(f"💡 <i>{summary}</i>")
+        
+        if lines:
+            parts.append("\n".join(lines))
+    
+    return "\n\n".join(parts)
 
-    # Non-signals grouped by reason
-    if non_signals:
-        parts.append("<b>❌ NO SIGNAL – Grouped by Reason</b>")
-        for reason, tickers in non_signals.items():
-            # Provide a "what to watch" suggestion
-            suggestion = ""
-            if "Very far from 50‑MA" in reason:
-                suggestion = "💡 Watch if price approaches 50‑MA."
-            elif "Far from 50‑MA" in reason:
-                suggestion = "💡 Monitor for closer proximity to 50‑MA."
-            elif "Below VA midpoint" in reason:
-                suggestion = "💡 Could become Support BUY if RSI enters 40‑60."
-            elif "Near VAH" in reason:
-                suggestion = "💡 Breakout candidate – wait for LVN gap."
-            elif "Above VAH" in reason:
-                suggestion = "💡 Possible breakout – need LVN confirmation."
-            elif "RSI oversold" in reason:
-                suggestion = "💡 Oversold – may bounce to 50‑MA."
-            elif "RSI overbought" in reason:
-                suggestion = "💡 Overbought – could pull back."
-            elif "LVN gap" in reason:
-                suggestion = "💡 Gap exists – confirm volume before trade."
-            else:
-                suggestion = "💡 Continue monitoring."
+# ─── Main Scan ──────────────────────────────────────────────────
 
-            ticker_list = ", ".join(tickers)
-            parts.append(f"🔹 <b>{reason}</b>: {ticker_list}")
-            parts.append(f"   {suggestion}")
-            parts.append("")
-
-    # Remove trailing empty lines
-    while parts and parts[-1] == "":
-        parts.pop()
-    return "\n".join(parts)
-
-
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
 def main():
-    # Read watchlist
     if not os.path.exists(WATCHLIST_FILE):
-        logger.error(f"Watchlist file {WATCHLIST_FILE} not found.")
+        print(f"❌ Watchlist file '{WATCHLIST_FILE}' not found.")
         sys.exit(1)
     try:
-        df = pd.read_csv(WATCHLIST_FILE)
-        if "Ticker" not in df.columns:
-            logger.error("CSV must contain 'Ticker' column.")
+        watchlist = pd.read_csv(WATCHLIST_FILE)
+        if 'Ticker' not in watchlist.columns:
+            print("❌ CSV must have a 'Ticker' column.")
             sys.exit(1)
-        tickers = df["Ticker"].dropna().unique().tolist()
-        tickers = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
+        tickers = watchlist['Ticker'].dropna().str.strip().tolist()
+        print(f"📋 Loaded {len(tickers)} tickers from {WATCHLIST_FILE}")
     except Exception as e:
-        logger.error(f"Failed to read {WATCHLIST_FILE}: {e}")
+        print(f"❌ Error reading watchlist: {e}")
         sys.exit(1)
 
-    if not tickers:
-        logger.warning("No tickers in watchlist.")
-        return
-
-    logger.info(f"Scanning {len(tickers)} tickers: {', '.join(tickers)}")
-
-    signals = []
-    non_signal_reasons = {}  # reason -> list of tickers
-
-    for ticker in tickers:
-        logger.info(f"Processing {ticker}...")
-        sig, reason = scan_ticker(ticker)
-        if sig:
-            sig["ticker"] = ticker
-            signals.append(sig)
-            logger.info(f"  → SIGNAL: {sig['action']} {sig['type']}")
+    all_signals = []
+    no_signal_reasons = {}
+    total = len(tickers)
+    for idx, ticker in enumerate(tickers, 1):
+        print(f"Scanning {ticker}... ({idx}/{total})")
+        ticker = ticker.upper().strip()
+        df = get_ticker_data(ticker)
+        if df is None or len(df) < 60:
+            print(f"   ⚠️  Insufficient data for {ticker}")
+            no_signal_reasons[ticker] = "insufficient data (<60 days)"
+            continue
+        signals, reason = detect_signals(ticker, df)
+        if signals:
+            all_signals.extend(signals)
+            for s in signals:
+                print(f"   ✅ {s['type']} on {ticker}")
         else:
-            # Group by reason
-            non_signal_reasons.setdefault(reason, []).append(ticker)
-            logger.info(f"  → No signal: {reason}")
+            if reason:
+                no_signal_reasons[ticker] = reason
+                print(f"   ❌ No signal – {reason[:100]}...")
+            else:
+                no_signal_reasons[ticker] = "unknown error"
 
-    # Build and send message
-    message = build_full_message(signals, non_signal_reasons)
-    if not message.strip():
-        message = "<b>No signals and no non‑signal tickers found.</b>"
+    print(f"\nDone. Found {len(all_signals)} signals, {len(no_signal_reasons)} non-signaled.")
 
-    success = send_telegram(message)
-    if success:
-        logger.info("Telegram notification sent.")
+    full_msg = build_full_message(all_signals, no_signal_reasons)
+    
+    # Split into chunks if too long
+    chunk_size = 3800
+    if len(full_msg) <= chunk_size:
+        send_telegram(full_msg)
     else:
-        logger.error("Failed to send Telegram notification.")
-
+        paragraphs = full_msg.split("\n\n")
+        chunk = ""
+        for para in paragraphs:
+            if len(chunk) + len(para) + 2 > chunk_size:
+                send_telegram(chunk)
+                chunk = para
+            else:
+                chunk = (chunk + "\n\n" + para).strip()
+        if chunk:
+            send_telegram(chunk)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        traceback.print_exc()
+        sys.exit(1)
