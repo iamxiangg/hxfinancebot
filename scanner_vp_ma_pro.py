@@ -2,14 +2,12 @@
 """
 VP_MA_Scan – Volume Profile + 50-MA + RSI Scanner
 Triggers: Support BUY, Breakout BUY, SELL
-Sends Telegram notifications via bot.
+Improved Telegram format with annotations for clarity.
 """
 
 import os
 import sys
 import math
-import json
-import traceback
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -100,7 +98,6 @@ def compute_volume_profile(df, lookback=LOOKBACK):
         vol = row['Volume']
         if vol == 0:
             continue
-        # Assign volume to buckets proportionally
         low_idx = int((low - price_min) / bucket_width)
         high_idx = int((high - price_min) / bucket_width)
         for i in range(low_idx, high_idx + 1):
@@ -111,7 +108,6 @@ def compute_volume_profile(df, lookback=LOOKBACK):
     if not buckets:
         return None
 
-    # Sort buckets by price
     sorted_prices = sorted(buckets.keys())
     sorted_volumes = [buckets[p] for p in sorted_prices]
     total_volume = sum(sorted_volumes)
@@ -198,17 +194,16 @@ def detect_signals(ticker, df):
     va_mid = (val + vah) / 2
     lvn_levels = vp['lvn_levels']
 
-    # Guard: missing data
     if pd.isna(ma50) or pd.isna(rsi):
         return signals
 
     # ── Support BUY ──────────────────────────────────────────
     if (close_price >= ma50 * 0.98) and (close_price <= ma50 * 1.02):
-        if val <= close_price <= va_mid:          # lower half of VA
+        if val <= close_price <= va_mid:
             if RSI_BUY_LOW <= rsi <= RSI_BUY_HIGH:
-                stop = max(val, poc)               # stop below VAL or POC
+                stop = max(val, poc)
                 if close_price - stop < 0.01 * close_price:
-                    stop = val * 0.98              # wider fallback
+                    stop = val * 0.98
                 target = vah
                 rr = calculate_risk_reward(close_price, stop, target)
                 if rr >= MIN_RR_RATIO:
@@ -227,12 +222,11 @@ def detect_signals(ticker, df):
 
     # ── Breakout BUY ────────────────────────────────────────
     if (close_price > vah) and (rsi < RSI_BREAKOUT_MAX):
-        # Near a LVN (within 2% of price)
         lvn_near = nearest_lvn(lvn_levels, close_price)
         if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
             if close_price > ma50:
                 stop = vah * 0.98
-                target = close_price * 1.05  # 5% extension
+                target = close_price * 1.05
                 rr = calculate_risk_reward(close_price, stop, target)
                 if rr >= MIN_RR_RATIO:
                     signals.append({
@@ -249,7 +243,7 @@ def detect_signals(ticker, df):
                         'near_lvn': round(lvn_near, 2)
                     })
 
-    # ── SELL signal (short) ─────────────────────────────────
+    # ── SELL signal ─────────────────────────────────────────
     if (close_price < val) and (rsi >= RSI_SELL_LOW) and (rsi <= RSI_SELL_HIGH):
         lvn_near = nearest_lvn(lvn_levels, close_price)
         if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
@@ -298,21 +292,21 @@ def send_telegram(text, parse_mode="HTML"):
         return False
 
 def format_signal_message(signal):
-    """Build a single signal message string."""
+    """Build a single signal message with annotated fields."""
     lines = [
         f"<b>{signal['type']}</b> – {signal['ticker']}",
-        f"Entry: ${signal['entry']:.2f}",
-        f"Stop:  ${signal['stop']:.2f}",
-        f"Target: ${signal['target']:.2f}",
-        f"R:R: {signal['rr']}",
-        f"RSI: {signal['rsi']}",
-        f"50-MA: ${signal['ma50']:.2f}",
-        f"VA: {signal['va_range']}",
-        f"POC: ${signal['poc']:.2f}",
+        f"Entry: ${signal['entry']:.2f} (current close)",
+        f"Stop:  ${signal['stop']:.2f} (VAL / POC)",
+        f"Target: ${signal['target']:.2f} (VAH)",
+        f"R:R: {signal['rr']} → (target‑entry)/(entry‑stop)",
+        f"RSI: {signal['rsi']} | 50‑MA: ${signal['ma50']:.2f}",
     ]
-    if 'near_lvn' in signal:
-        lines.append(f"Near LVN: ${signal['near_lvn']:.2f}")
-    # TradingView chart link
+    if signal['type'] == 'Support BUY':
+        lines.append("💡 Lower half of VA, above 50‑MA, RSI 40‑60")
+    elif signal['type'] == 'Breakout BUY':
+        lines.append("💡 Above VAH, near LVN, RSI <65, above 50‑MA")
+    elif signal['type'] == 'SELL (Short)':
+        lines.append("💡 Below VAL, near LVN, below 50‑MA, RSI 30‑50")
     tv_link = f"https://www.tradingview.com/chart/?symbol={signal['ticker']}"
     lines.append(f"<a href='{tv_link}'>📊 View on TradingView</a>")
     return "\n".join(lines)
@@ -350,27 +344,27 @@ def main():
             for s in signals:
                 print(f"   ✅ {s['type']} on {ticker}")
 
-    # ── Report result ──────────────────────────────────────────
     print(f"\nDone. Found {len(all_signals)} signals.")
 
-    # ── Build Telegram message ─────────────────────────────────
+    # ── Build and send Telegram message ──────────────────────
     if all_signals:
         # Split signals into chunks (Telegram max ~4096 chars)
         chunks = []
         current = []
         current_len = 0
+        sep = "\n\n"
         for sig in all_signals:
             msg = format_signal_message(sig)
             msg_len = len(msg)
-            if current_len + msg_len > 3800:   # leave room for header/footer
-                chunks.append("\n\n".join(current))
+            if current_len + msg_len + len(sep) > 3800:
+                chunks.append(sep.join(current))
                 current = [msg]
                 current_len = msg_len
             else:
                 current.append(msg)
-                current_len += msg_len
+                current_len += msg_len + len(sep)
         if current:
-            chunks.append("\n\n".join(current))
+            chunks.append(sep.join(current))
 
         success = True
         for i, chunk in enumerate(chunks):
