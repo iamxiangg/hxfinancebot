@@ -121,8 +121,7 @@ def compute_vp(df, lookback=300):
     va_high = None
     va_low = None
 
-    # Sort by volume descending to find high volume nodes, but for VA we need sequential middle
-    # Use the standard method: find the POC (max volume), then expand outward until target_vol reached
+    # Find POC (max volume)
     poc_idx = max(range(len(vol_profile)), key=lambda i: vol_profile[i][1])
     poc_price = vol_profile[poc_idx][0]
     poc_volume = vol_profile[poc_idx][1]
@@ -190,21 +189,31 @@ def analyze_ticker(ticker):
     if df.empty:
         return None
 
+    # Fix multi-index columns (yfinance may return MultiIndex even for single ticker)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(0)
+
+    # Ensure all columns are 1-dimensional
+    for col in df.columns:
+        if isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].squeeze()
+
     # Ensure we have enough data
     if len(df) < MA_LENGTH + RSI_LENGTH + 5:
         return None
 
     # Calculate indicators
-    df['SMA50'] = SMAIndicator(close=df['Close'], window=MA_LENGTH).sma_indicator()
-    df['RSI14'] = RSIIndicator(close=df['Close'], window=RSI_LENGTH).rsi()
+    close = df['Close']  # now safe to use as Series
+    df['SMA50'] = SMAIndicator(close=close, window=MA_LENGTH).sma_indicator()
+    df['RSI14'] = RSIIndicator(close=close, window=RSI_LENGTH).rsi()
 
     latest = df.iloc[-1]
-    close = latest['Close']
+    close_latest = latest['Close']
     sma50 = latest['SMA50']
     rsi = latest['RSI14']
 
     # Skip if any indicator is NaN
-    if pd.isna(close) or pd.isna(sma50) or pd.isna(rsi):
+    if pd.isna(close_latest) or pd.isna(sma50) or pd.isna(rsi):
         return None
 
     # Compute Volume Profile
@@ -213,11 +222,11 @@ def analyze_ticker(ticker):
         return None
 
     # Determine conditions
-    above_ma = close > sma50
-    below_ma = close < sma50
-    inside_va = va_low <= close <= va_high
-    above_va = close > va_high
-    below_va = close < va_low
+    above_ma = close_latest > sma50
+    below_ma = close_latest < sma50
+    inside_va = va_low <= close_latest <= va_high
+    above_va = close_latest > va_high
+    below_va = close_latest < va_low
 
     # RSI zones
     rsi_buy_zone = 40 <= rsi <= 60
@@ -226,8 +235,8 @@ def analyze_ticker(ticker):
 
     # LVN condition: current price is in an LVN (or close to one)
     # We'll check if close is within 0.2% of any LVN price
-    tolerance = close * 0.002
-    near_lvn = any(abs(close - lvn) <= tolerance for lvn in lvn_list)
+    tolerance = close_latest * 0.002
+    near_lvn = any(abs(close_latest - lvn) <= tolerance for lvn in lvn_list)
 
     signal = None
     action = None
@@ -240,34 +249,34 @@ def analyze_ticker(ticker):
         action = "BUY"
         note = "Support buy inside Value Area"
         # Target: next HVN above; stop: below VA low or POC
-        target = find_next_hvn_above(close, hvn_list)
+        target = find_next_hvn_above(close_latest, hvn_list)
         if target is None:
             target = round(va_high * 1.02, 2)  # fallback 2% above VAH
         stop = round(va_low * 0.99, 2)
-        if stop >= close * 0.98:
+        if stop >= close_latest * 0.98:
             stop = round(poc_price * 0.99, 2)  # prefer POC as stop if too tight
 
     # --- Breakout BUY ---
     elif above_va and near_lvn and above_ma and rsi_breakout_zone:
         action = "BREAKOUT"
         note = "Breakout above VA High with LVN"
-        target = find_next_hvn_above(close, hvn_list)
+        target = find_next_hvn_above(close_latest, hvn_list)
         if target is None:
-            target = round(close * 1.03, 2)
+            target = round(close_latest * 1.03, 2)
         stop = round(va_high * 0.99, 2)
-        if stop >= close * 0.99:
-            stop = round(close * 0.98, 2)
+        if stop >= close_latest * 0.99:
+            stop = round(close_latest * 0.98, 2)
 
     # --- SELL signal ---
     elif below_va and near_lvn and below_ma and rsi_sell_zone:
         action = "SELL"
         note = "Sell signal: below VA Low + LVN"
         # Target: next HVN below
-        target = find_next_hvn_below(close, hvn_list)
+        target = find_next_hvn_below(close_latest, hvn_list)
         if target is None:
             target = round(va_low * 0.98, 2)
         stop = round(va_low * 1.01, 2)
-        if stop <= close * 1.01:
+        if stop <= close_latest * 1.01:
             stop = round(poc_price * 1.01, 2)
 
     if action is None:
@@ -277,7 +286,7 @@ def analyze_ticker(ticker):
     signal = {
         'ticker': ticker,
         'action': action,
-        'price': round(close, 2),
+        'price': round(close_latest, 2),
         'rsi': round(rsi, 1),
         'va_range': f"VAH {va_high} / VAL {va_low}",
         'poc': poc_price,
@@ -294,27 +303,6 @@ def send_telegram(signal):
         print("Telegram credentials missing. Skipping notification.")
         return
 
-    msg = f"""
-🚀 *{signal['action']} Signal*: {signal['ticker']} @ ${signal['price']}
-
-📊 RSI: {signal['rsi']}
-📐 Value Area: {signal['va_range']}
-📍 Point of Control: ${signal['poc']}
-🎯 Target: ${signal['target']}
-🛑 Stop: ${signal['stop']}
-📝 {signal['note']}
-
-🔗 *Chart*: {signal['chart_url']}
-"""
-    # Escape special characters for Telegram Markdown
-    msg = msg.replace('.', '\\.').replace('-', '\\-').replace('_', '\\_').replace('*', '\\*').replace('`', '\\`')
-    # But keep * for bold – we'll manually handle
-    # Better to use parse_mode='MarkdownV2' and escape properly
-    import re
-    # Revert the escaping for formatting we want
-    msg = msg.replace('\\*', '*').replace('\\_', '_')  # keep bold and italic
-    # Actually Telegram MarkdownV2 requires escaping for _, *, [, ], etc. We'll use HTML parse mode for simplicity.
-    # Let's switch to HTML.
     msg_html = f"""
 <b>{signal['action']} Signal</b>: {signal['ticker']} @ ${signal['price']}<br>
 📊 RSI: {signal['rsi']}<br>
