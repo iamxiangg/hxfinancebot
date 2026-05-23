@@ -302,19 +302,19 @@ def send_telegram(signal):
         print("Telegram credentials missing. Skipping notification.")
         return
 
-    msg_html = f"""
-<b>{signal['action']} Signal</b>: {signal['ticker']} @ ${signal['price']}<br>
-📊 RSI: {signal['rsi']}<br>
-📐 Value Area: {signal['va_range']}<br>
-📍 Point of Control: ${signal['poc']}<br>
-🎯 Target: ${signal['target']}<br>
-🛑 Stop: ${signal['stop']}<br>
-📝 {signal['note']}<br>
-🔗 <a href="{signal['chart_url']}">Chart</a>
-"""
+    msg = (
+        f"<b>{signal['action']} Signal</b>: {signal['ticker']} @ ${signal['price']}\n"
+        f"📊 RSI: {signal['rsi']}\n"
+        f"📐 Value Area: {signal['va_range']}\n"
+        f"📍 Point of Control: ${signal['poc']}\n"
+        f"🎯 Target: ${signal['target']}\n"
+        f"🛑 Stop: ${signal['stop']}\n"
+        f"📝 {signal['note']}\n"
+        f"🔗 <a href=\"{signal['chart_url']}\">Chart</a>"
+    )
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
-        'text': msg_html,
+        'text': msg,
         'parse_mode': 'HTML'
     }
     import requests
