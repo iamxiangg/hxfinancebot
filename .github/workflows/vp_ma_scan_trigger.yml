@@ -8,29 +8,23 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install pandas numpy yfinance ta requests
 
-      - name: Run scanner
+      - name: Run VP_MA Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner_vp_ma_pro.py
-
-      - name: Upload logs (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-log
-          path: /tmp/*.log   # adjust if you add logging
+        run: |
+          python scanner_vp_ma_pro.py
