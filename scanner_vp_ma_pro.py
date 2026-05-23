@@ -12,6 +12,7 @@ import time
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 from ta.trend import SMAIndicator
 from ta.momentum import RSIIndicator
 
@@ -53,9 +54,6 @@ def compute_vp(df, lookback=300):
     """
     Compute Volume Profile using last `lookback` bars.
     Returns (VAH, VAL, POC, VC_HVN, VC_LVN, last_close, last_volume)
-    VAH/VAL are Value Area High/Low.
-    POC is price of maximum volume node.
-    VC_HVN/VC_LVN are lists of High/Low Volume Nodes (prices).
     """
     if len(df) < 50:
         return None, None, None, None, None, None, None
@@ -70,7 +68,6 @@ def compute_vp(df, lookback=300):
     price_max = df_vp['High'].max()
     price_range = price_max - price_min
     if price_range == 0:
-        # All bars same price - not realistic but handle
         return price_min, price_max, price_min, [price_min], [price_min], df['Close'].iloc[-1], df['Volume'].iloc[-1]
 
     current_price = df['Close'].iloc[-1]
@@ -109,8 +106,10 @@ def compute_vp(df, lookback=300):
 
     # Total volume and Value Area
     total_vol = sum(v for _, v in vol_profile)
+    if total_vol == 0:
+        return None, None, None, None, None, None, None
+        
     target_vol = total_vol * VA_PERCENT
-    cum_vol = 0
 
     # Find POC (max volume)
     poc_idx = max(range(len(vol_profile)), key=lambda i: vol_profile[i][1])
@@ -132,21 +131,15 @@ def compute_vp(df, lookback=300):
         else:
             break
 
-    # VA boundaries: from left+1 to right-1
-    if left < 0:
-        va_low = vol_profile[0][0]
-    else:
-        va_low = vol_profile[left+1][0]
-
-    if right >= len(vol_profile):
-        va_high = vol_profile[-1][0]
-    else:
-        va_high = vol_profile[right-1][0]
+    # VA boundaries
+    va_low = vol_profile[0][0] if left < 0 else vol_profile[left+1][0]
+    va_high = vol_profile[-1][0] if right >= len(vol_profile) else vol_profile[right-1][0]
 
     # Identify High Volume Nodes (HVN) – volume > 1.5x average
     avg_volume = total_vol / num_buckets
     hvn_threshold = 1.5 * avg_volume
     hvn_prices = [price for price, vol in vol_profile if vol > hvn_threshold]
+    
     # Identify Low Volume Nodes (LVN) – volume < 0.5x average
     lvn_threshold = 0.5 * avg_volume
     lvn_prices = [price for price, vol in vol_profile if 0 < vol < lvn_threshold]
@@ -155,36 +148,32 @@ def compute_vp(df, lookback=300):
             hvn_prices, lvn_prices, current_price, current_volume)
 
 def find_next_hvn_above(price, hvn_list):
-    """Return the next HVN above the given price (closest higher HVN)."""
     above = [p for p in hvn_list if p > price]
     return min(above) if above else None
 
 def find_next_hvn_below(price, hvn_list):
-    """Return the next HVN below the given price."""
     below = [p for p in hvn_list if p < price]
     return max(below) if below else None
 
 def tradingview_url(ticker):
-    """Generate a TradingView chart link for the ticker (US stock assumed)."""
     return f"{TV_BASE}{ticker.upper()}"
 
 def analyze_ticker(ticker):
-    """
-    Analyze a single ticker and return a signal dict or None.
-    """
+    """Analyze a single ticker and return a signal dict or None."""
     try:
         df = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
     except Exception as e:
         print(f"Error downloading {ticker}: {e}")
         return None
 
+    # Handle case where yf returns an empty dataframe (e.g. invalid/delisted ticker)
     if df.empty:
+        print(f"{ticker}: No data returned from yfinance. Skipping.")
         return None
 
     # -------- Robust column flattening --------
-    # If columns are MultiIndex, flatten to only the last level (e.g., 'Close', 'Open', ...)
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [col[-1] for col in df.columns]   # take the innermost level
+        df.columns = [col[-1] if col[-1] else col[0] for col in df.columns]
 
     # Ensure all columns are 1D Series
     for col in df.columns:
@@ -198,7 +187,6 @@ def analyze_ticker(ticker):
         print(f"{ticker}: Missing columns {missing}. Skipping.")
         return None
 
-    # Ensure we have enough data
     if len(df) < MA_LENGTH + RSI_LENGTH + 5:
         return None
 
@@ -212,7 +200,6 @@ def analyze_ticker(ticker):
     sma50 = latest['SMA50']
     rsi = latest['RSI14']
 
-    # Skip if any indicator is NaN
     if pd.isna(close_latest) or pd.isna(sma50) or pd.isna(rsi):
         return None
 
@@ -233,17 +220,16 @@ def analyze_ticker(ticker):
     rsi_breakout_zone = rsi < 65
     rsi_sell_zone = 30 <= rsi <= 50
 
-    # LVN condition: current price is in an LVN (or close to one)
+    # LVN condition
     tolerance = close_latest * 0.002
     near_lvn = any(abs(close_latest - lvn) <= tolerance for lvn in lvn_list)
 
-    signal = None
     action = None
     target = None
     stop = None
     note = ""
 
-    # --- Support BUY (Score 3) ---
+    # --- Support BUY ---
     if inside_va and above_ma and rsi_buy_zone:
         action = "BUY"
         note = "Support buy inside Value Area"
@@ -277,10 +263,9 @@ def analyze_ticker(ticker):
             stop = round(poc_price * 1.01, 2)
 
     if action is None:
-        return None  # no signal
+        return None
 
-    # Build signal dict
-    signal = {
+    return {
         'ticker': ticker,
         'action': action,
         'price': round(close_latest, 2),
@@ -292,30 +277,30 @@ def analyze_ticker(ticker):
         'note': note,
         'chart_url': tradingview_url(ticker)
     }
-    return signal
 
 def send_telegram(signal):
-    """Send formatted signal via Telegram."""
+    """Send formatted signal via Telegram (using standard line breaks for HTML mode)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials missing. Skipping notification.")
         return
 
-    msg_html = f"""
-<b>{signal['action']} Signal</b>: {signal['ticker']} @ ${signal['price']}<br>
-📊 RSI: {signal['rsi']}<br>
-📐 Value Area: {signal['va_range']}<br>
-📍 Point of Control: ${signal['poc']}<br>
-🎯 Target: ${signal['target']}<br>
-🛑 Stop: ${signal['stop']}<br>
-📝 {signal['note']}<br>
-🔗 <a href="{signal['chart_url']}">Chart</a>
-"""
+    # Native string breaks work perfectly for line breaks in Telegram HTML parse mode
+    msg_html = (
+        f"<b>{signal['action']} Signal</b>: {signal['ticker']} @ ${signal['price']}\n"
+        f"📊 RSI: {signal['rsi']}\n"
+        f"📐 Value Area: {signal['va_range']}\n"
+        f"📍 Point of Control: ${signal['poc']}\n"
+        f"🎯 Target: ${signal['target']}\n"
+        f"🛑 Stop: ${signal['stop']}\n"
+        f"📝 {signal['note']}\n"
+        f"🔗 <a href=\"{signal['chart_url']}\">TradingView Chart</a>"
+    )
+
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
         'text': msg_html,
         'parse_mode': 'HTML'
     }
-    import requests
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json=payload, timeout=10)
@@ -337,14 +322,12 @@ def main():
         if sig:
             signals.append(sig)
             send_telegram(sig)
-        # Rate limit – avoid yfinance ban
         time.sleep(0.5)
 
     if not signals:
         print("No signals found today.")
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             msg = "🔍 VP_MA Scan completed – no setups found."
-            import requests
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg})
 
