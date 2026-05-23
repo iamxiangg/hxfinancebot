@@ -12,7 +12,6 @@ import time
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from ta import add_all_ta_features
 from ta.trend import SMAIndicator
 from ta.momentum import RSIIndicator
 
@@ -80,7 +79,6 @@ def compute_vp(df, lookback=300):
     # Dynamic bucket width
     bucket_width = max(current_price * BUCKET_PERCENT_OF_PRICE, MIN_BUCKET_PRICE)
     num_buckets = int(price_range / bucket_width) + 1
-    # Cap buckets to avoid performance issues (max 500)
     if num_buckets > 500:
         bucket_width = price_range / 500.0
         num_buckets = 500
@@ -90,19 +88,14 @@ def compute_vp(df, lookback=300):
     for i in range(num_buckets):
         low = price_min + i * bucket_width
         high = low + bucket_width
-        buckets[i] = {
-            'low': low,
-            'high': high,
-            'volume': 0,
-            'trades': 0
-        }
+        buckets[i] = {'low': low, 'high': high, 'volume': 0, 'trades': 0}
 
     # Assign volume to buckets
     for _, bar in df_vp.iterrows():
         bar_low = bar['Low']
         bar_high = bar['High']
         bar_vol = bar['Volume']
-        bar_typ = (bar_low + bar_high) / 2.0  # use typical price
+        bar_typ = (bar_low + bar_high) / 2.0
         idx = int((bar_typ - price_min) / bucket_width)
         if 0 <= idx < num_buckets:
             buckets[idx]['volume'] += bar_vol
@@ -118,8 +111,6 @@ def compute_vp(df, lookback=300):
     total_vol = sum(v for _, v in vol_profile)
     target_vol = total_vol * VA_PERCENT
     cum_vol = 0
-    va_high = None
-    va_low = None
 
     # Find POC (max volume)
     poc_idx = max(range(len(vol_profile)), key=lambda i: vol_profile[i][1])
@@ -152,12 +143,13 @@ def compute_vp(df, lookback=300):
     else:
         va_high = vol_profile[right-1][0]
 
-    # Identify High Volume Nodes (HVN) – nodes with volume > 1.5x average
+    # Identify High Volume Nodes (HVN) – volume > 1.5x average
     avg_volume = total_vol / num_buckets
-    threshold = 1.5 * avg_volume
-    hvn_prices = [price for price, vol in vol_profile if vol > threshold]
-    # Identify Low Volume Nodes (LVN) – nodes with volume < 0.5x average
-    lvn_prices = [price for price, vol in vol_profile if vol < 0.5 * avg_volume and vol > 0]
+    hvn_threshold = 1.5 * avg_volume
+    hvn_prices = [price for price, vol in vol_profile if vol > hvn_threshold]
+    # Identify Low Volume Nodes (LVN) – volume < 0.5x average
+    lvn_threshold = 0.5 * avg_volume
+    lvn_prices = [price for price, vol in vol_profile if 0 < vol < lvn_threshold]
 
     return (round(va_high, 2), round(va_low, 2), round(poc_price, 2),
             hvn_prices, lvn_prices, current_price, current_volume)
@@ -189,21 +181,29 @@ def analyze_ticker(ticker):
     if df.empty:
         return None
 
-    # Fix multi-index columns (yfinance may return MultiIndex even for single ticker)
+    # -------- Robust column flattening --------
+    # If columns are MultiIndex, flatten to only the last level (e.g., 'Close', 'Open', ...)
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(0)
+        df.columns = [col[-1] for col in df.columns]   # take the innermost level
 
-    # Ensure all columns are 1-dimensional
+    # Ensure all columns are 1D Series
     for col in df.columns:
         if isinstance(df[col], pd.DataFrame):
             df[col] = df[col].squeeze()
+
+    # Verify that we have the required columns
+    required = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"{ticker}: Missing columns {missing}. Skipping.")
+        return None
 
     # Ensure we have enough data
     if len(df) < MA_LENGTH + RSI_LENGTH + 5:
         return None
 
     # Calculate indicators
-    close = df['Close']  # now safe to use as Series
+    close = df['Close']
     df['SMA50'] = SMAIndicator(close=close, window=MA_LENGTH).sma_indicator()
     df['RSI14'] = RSIIndicator(close=close, window=RSI_LENGTH).rsi()
 
@@ -234,7 +234,6 @@ def analyze_ticker(ticker):
     rsi_sell_zone = 30 <= rsi <= 50
 
     # LVN condition: current price is in an LVN (or close to one)
-    # We'll check if close is within 0.2% of any LVN price
     tolerance = close_latest * 0.002
     near_lvn = any(abs(close_latest - lvn) <= tolerance for lvn in lvn_list)
 
@@ -248,13 +247,12 @@ def analyze_ticker(ticker):
     if inside_va and above_ma and rsi_buy_zone:
         action = "BUY"
         note = "Support buy inside Value Area"
-        # Target: next HVN above; stop: below VA low or POC
         target = find_next_hvn_above(close_latest, hvn_list)
         if target is None:
-            target = round(va_high * 1.02, 2)  # fallback 2% above VAH
+            target = round(va_high * 1.02, 2)
         stop = round(va_low * 0.99, 2)
         if stop >= close_latest * 0.98:
-            stop = round(poc_price * 0.99, 2)  # prefer POC as stop if too tight
+            stop = round(poc_price * 0.99, 2)
 
     # --- Breakout BUY ---
     elif above_va and near_lvn and above_ma and rsi_breakout_zone:
@@ -271,7 +269,6 @@ def analyze_ticker(ticker):
     elif below_va and near_lvn and below_ma and rsi_sell_zone:
         action = "SELL"
         note = "Sell signal: below VA Low + LVN"
-        # Target: next HVN below
         target = find_next_hvn_below(close_latest, hvn_list)
         if target is None:
             target = round(va_low * 0.98, 2)
@@ -345,7 +342,6 @@ def main():
 
     if not signals:
         print("No signals found today.")
-        # Optionally send a "no setups" message
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             msg = "🔍 VP_MA Scan completed – no setups found."
             import requests
