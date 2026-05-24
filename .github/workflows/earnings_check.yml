@@ -1,7 +1,8 @@
 name: Earnings IV Crush Scanner
+
 on:
-  schedule:
-    - cron: '30 19 * * 1-5'  # Mon-Fri 19:30 UTC
+  repository_dispatch:
+    types: [earnings_check]
   workflow_dispatch:
 
 jobs:
