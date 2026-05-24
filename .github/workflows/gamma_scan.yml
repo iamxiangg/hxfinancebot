@@ -1,11 +1,8 @@
 name: Gamma Amplification Scanner
 
 on:
-  schedule:
-    # Mon-Fri: 8:30am ET, 4:00pm ET, 6:30pm ET
-    - cron: '30 12 * * 1-5'
-    - cron: '0 20 * * 1-5'
-    - cron: '30 22 * * 1-5'
+  repository_dispatch:
+    types: [gamma_scan]
   
   workflow_dispatch:
     inputs:
