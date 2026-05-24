@@ -12,13 +12,15 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator
 
 # ─── Configuration ──────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-WATCHLIST_FILE     = "positions.csv"
 LOOKBACK           = 300
 VALUE_AREA_PCT     = 0.70
 MIN_RR_RATIO       = 1.5
@@ -27,6 +29,11 @@ RSI_BUY_HIGH       = 60
 RSI_SELL_LOW       = 30
 RSI_SELL_HIGH      = 50
 RSI_BREAKOUT_MAX   = 65
+
+# Google Sheets Configuration
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+SHEET_NAME = "Xiang Stock Analysis"
+WORKSHEET_NAME = "Stock Summary USD"
 
 # ─── Helper Functions ───────────────────────────────────────────
 
@@ -427,19 +434,32 @@ def build_full_message(signals, no_signal_reasons):
 # ─── Main Scan ──────────────────────────────────────────────────
 
 def main():
-    if not os.path.exists(WATCHLIST_FILE):
-        print(f"❌ Watchlist file '{WATCHLIST_FILE}' not found.")
+    # ── Authenticate to Google Sheets using GitHub Secret ──
+    creds_json = os.getenv('GCP_SERVICE_ACCOUNT_FILE')
+    if not creds_json:
+        print("❌ Environment variable GCP_SERVICE_ACCOUNT_FILE is missing")
         sys.exit(1)
+
     try:
-        watchlist = pd.read_csv(WATCHLIST_FILE)
-        if 'Ticker' not in watchlist.columns:
-            print("❌ CSV must have a 'Ticker' column.")
-            sys.exit(1)
-        tickers = watchlist['Ticker'].dropna().str.strip().tolist()
-        print(f"📋 Loaded {len(tickers)} tickers from {WATCHLIST_FILE}")
+        creds_dict = json.loads(creds_json)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+        client = gspread.authorize(creds)
+        
+        workbook = client.open(SHEET_NAME)
+        sheet = workbook.worksheet(WORKSHEET_NAME)
+        
+        # Pull Column A (assumes Tickers start on row 2, skipping header row 1)
+        col_a = sheet.col_values(1)
+        tickers = [ticker.strip().upper() for ticker in col_a[1:] if ticker.strip()]
+        
+        print(f"📋 Loaded {len(tickers)} tickers from Google Sheet '{SHEET_NAME}'")
     except Exception as e:
-        print(f"❌ Error reading watchlist: {e}")
+        print(f"❌ Google Sheets authentication or reading failed: {e}")
         sys.exit(1)
+        
+    if not tickers:
+        print("⚠️ No tickers found in Google Sheet.")
+        sys.exit(0)
 
     all_signals = []
     no_signal_reasons = {}
