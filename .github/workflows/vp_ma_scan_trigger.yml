@@ -11,22 +11,33 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+
+      # Cache FinBERT Model to avoid 400MB+ download every time
+      - name: Cache Hugging Face Models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-hf-finbert-v1
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install yfinance pandas numpy requests lxml
+          # Added transformers and torch for FinBERT analysis
+          pip install yfinance pandas numpy requests lxml transformers torch
           pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
       - name: Run VP_MA Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python scanner_vp_ma_pro.py
