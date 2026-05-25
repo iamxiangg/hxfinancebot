@@ -53,10 +53,10 @@ logger = logging.getLogger(__name__)
 
 # ─── Google Sheets ──────────────────────────────────────────────────────────────
 def get_service_account_info():
-    env_creds = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    env_creds = os.getenv("GCP_SERVICE_ACCOUNT_FILE")
     if env_creds:
         return json.loads(env_creds)
-    raise ValueError("GCP_SERVICE_ACCOUNT_JSON not set")
+    raise ValueError("GCP_SERVICE_ACCOUNT_FILE not set")
 
 def get_watchlist() -> List[str]:
     try:
