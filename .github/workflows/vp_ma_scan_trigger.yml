@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas numpy yfinance ta requests gspread oauth2client
+          pip install pandas numpy yfinance ta requests gspread oauth2client lxml
 
       - name: Run VP_MA Scanner
         env:
