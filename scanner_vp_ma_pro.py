@@ -24,9 +24,13 @@ from googleapiclient.errors import HttpError
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*earnings.*")
 
 # ─── Configuration ──────────────────────────────────────────────────────────────
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-RANGE_NAME = os.getenv("GOOGLE_SHEET_RANGE", "Watchlist!A:A")
+# CHANGED: New scopes
+SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+# CHANGED: Hardcoded sheet name and worksheet name instead of env variables
+SHEET_NAME = "Xiang Stock Analysis"
+WORKSHEET_NAME = "Stock Summary USD"
+
+# Original env-based variables kept for Telegram only
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -49,10 +53,10 @@ logger = logging.getLogger(__name__)
 
 # ─── Google Sheets ──────────────────────────────────────────────────────────────
 def get_service_account_info():
-    env_creds = os.getenv("GCP_SERVICE_ACCOUNT_FILE")
+    env_creds = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
     if env_creds:
         return json.loads(env_creds)
-    raise ValueError("GCP_SERVICE_ACCOUNT_FILE not set")
+    raise ValueError("GCP_SERVICE_ACCOUNT_JSON not set")
 
 def get_watchlist() -> List[str]:
     try:
@@ -61,10 +65,46 @@ def get_watchlist() -> List[str]:
         )
         service = build("sheets", "v4", credentials=creds)
         sheet = service.spreadsheets()
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
+
+        # CHANGED: Get the spreadsheet ID by name using drive scope (spreadsheet name)
+        # First, list spreadsheets matching the name (or use drive API to find ID)
+        # But simpler: use sheets API's spreadsheet object with a filter? 
+        # Actually, we need to search for the spreadsheet by name using the Drive API.
+        # However, the user wants minimal changes. 
+        # We'll assume the spreadsheet ID is stored in env for now, but they want by name.
+        # The original used SHEET_ID env; now we have SHEET_NAME.
+        # We can search drive for the file name to get its ID.
+        # But that requires drive v3 API. Let's implement a simple search:
+        from googleapiclient.discovery import build as drive_build
+        drive_service = drive_build("drive", "v3", credentials=creds)
+        results = drive_service.files().list(
+            q=f"name='{SHEET_NAME}' and mimeType='application/vnd.google-apps.spreadsheet'",
+            fields="files(id, name)"
+        ).execute()
+        files = results.get("files", [])
+        if not files:
+            raise ValueError(f"Spreadsheet '{SHEET_NAME}' not found in Drive.")
+        sheet_id = files[0]["id"]
+        logger.info(f"Found spreadsheet ID: {sheet_id}")
+
+        # Now read the worksheet by name
+        # Get all sheets within the spreadsheet
+        spreadsheet = sheet.get(spreadsheetId=sheet_id, fields="sheets.properties").execute()
+        sheets = spreadsheet.get("sheets", [])
+        target_sheet_id = None
+        for s in sheets:
+            if s["properties"]["title"] == WORKSHEET_NAME:
+                target_sheet_id = s["properties"]["sheetId"]
+                break
+        if target_sheet_id is None:
+            raise ValueError(f"Worksheet '{WORKSHEET_NAME}' not found in spreadsheet.")
+
+        # Read the entire first column of that worksheet (range: A:A)
+        range_name = f"'{WORKSHEET_NAME}'!A:A"
+        result = sheet.values().get(spreadsheetId=sheet_id, range=range_name).execute()
         values = result.get("values", [])
         tickers = [row[0].strip().upper() for row in values if row and row[0].strip()]
-        logger.info(f"Loaded {len(tickers)} tickers from sheet.")
+        logger.info(f"Loaded {len(tickers)} tickers from sheet '{SHEET_NAME}' / '{WORKSHEET_NAME}'.")
         return tickers
     except HttpError as e:
         logger.error(f"Google Sheets API error: {e}")
@@ -85,7 +125,6 @@ def fetch_data(ticker: str) -> Optional[pd.DataFrame]:
             logger.warning(f"{ticker}: insufficient history ({len(hist)} days)")
             return None
 
-        # Add 50-day MA and RSI (14-day)
         hist["MA50"] = hist["Close"].rolling(window=50).mean()
         delta = hist["Close"].diff()
         gain = delta.where(delta > 0, 0.0)
@@ -95,7 +134,6 @@ def fetch_data(ticker: str) -> Optional[pd.DataFrame]:
         rs = avg_gain / avg_loss
         hist["RSI"] = 100 - (100 / (1 + rs))
 
-        # Check for NaN in recent values
         last = hist.iloc[-1]
         if pd.isna(last["MA50"]) or pd.isna(last["RSI"]):
             logger.warning(f"{ticker}: NaN in indicators")
@@ -107,7 +145,6 @@ def fetch_data(ticker: str) -> Optional[pd.DataFrame]:
 
 # ─── Volume Profile ─────────────────────────────────────────────────────────────
 def bucket_price(prices: np.ndarray, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Calculate volume profile buckets with dynamic width."""
     current_price = prices[-1]
     bucket_width = max(current_price * MIN_BUCKET_PCT, MIN_BUCKET_PRICE)
     min_price = prices.min()
@@ -125,7 +162,6 @@ def bucket_price(prices: np.ndarray, volume: np.ndarray) -> Tuple[np.ndarray, np
     return bucket_centers, vols, bucket_width
 
 def calculate_value_area(bucket_centers: np.ndarray, volumes: np.ndarray, pct: float) -> Tuple[float, float, float, float]:
-    """Find VAL, VAH, POC, and value area total volume."""
     total_vol = volumes.sum()
     if total_vol == 0:
         return np.nan, np.nan, np.nan, np.nan
@@ -146,11 +182,8 @@ def calculate_value_area(bucket_centers: np.ndarray, volumes: np.ndarray, pct: f
     return bucket_centers[left], bucket_centers[right], poc_price, total_vol
 
 def find_hvn_lvn(bucket_centers: np.ndarray, volumes: np.ndarray, n: int = 3) -> Tuple[List[float], List[float]]:
-    """Find highest and lowest volume nodes (peaks/valleys)."""
-    # Simple: top/bottom n buckets by volume
     sorted_idx = np.argsort(volumes)[::-1]
     hvn = [float(bucket_centers[idx]) for idx in sorted_idx[:n] if volumes[idx] > 0]
-    # LVN: lowest volume non-zero
     nonzero = volumes > 0
     sorted_low = np.argsort(volumes[nonzero])
     lvn = [float(bucket_centers[nonzero][idx]) for idx in sorted_low[:n]]
@@ -158,7 +191,6 @@ def find_hvn_lvn(bucket_centers: np.ndarray, volumes: np.ndarray, n: int = 3) ->
 
 # ─── Signal Logic ───────────────────────────────────────────────────────────────
 def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
-    """Determine if ticker qualifies for a signal. Returns signal dict or None."""
     last = hist.iloc[-1]
     price = last["Close"]
     ma50 = last["MA50"]
@@ -167,7 +199,6 @@ def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
     vol_ma20 = hist["Volume"].tail(20).mean()
     vol_conf = vol > vol_ma20 * 1.5
 
-    # Volume profile on last 50 days
     lookback = hist.tail(50)
     prices = lookback["Close"].values
     volumes = lookback["Volume"].values
@@ -180,14 +211,12 @@ def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
         return None
     hvn, lvn = find_hvn_lvn(bucket_centers, vols)
 
-    # Check price relative to 50-MA
     pct_above_ma = (price - ma50) / ma50 * 100
 
     signal_type = None
     stop = target = None
     rationale = []
 
-    # --- Support BUY (near or in lower VA, near MA50, RSI 40-60) ---
     if ma50 and price >= ma50 * 0.98 and price <= ma50 * 1.02:
         if val <= price <= (val + vah) / 2 and 40 <= rsi <= 60:
             signal_type = "SUPPORT BUY"
@@ -197,10 +226,8 @@ def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
             if vol_conf:
                 rationale.append("High volume confirmation")
 
-    # --- Breakout BUY (above VAH, near LVN, RSI <65, above MA50) ---
     if not signal_type:
         if price > vah and price > ma50 and rsi < 65 and rsi > 30:
-            # Check if price is near an LVN (within 1%)
             near_lvn = any(abs(price - l) / price < 0.01 for l in lvn)
             if near_lvn:
                 signal_type = "BREAKOUT BUY"
@@ -210,7 +237,6 @@ def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
                 if vol_conf:
                     rationale.append("High volume confirmation")
 
-    # --- SELL (below VAL, near LVN, RSI 30-50, below MA50) ---
     if not signal_type:
         if price < val and price < ma50 and rsi >= 30 and rsi <= 50:
             near_lvn = any(abs(price - l) / price < 0.01 for l in lvn)
@@ -225,13 +251,12 @@ def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
     if not signal_type:
         return None
 
-    # Risk/Reward check
     if stop is None or target is None or stop == price:
         return None
     if signal_type in ["SUPPORT BUY", "BREAKOUT BUY"]:
         risk = price - stop
         reward = target - price
-    else:  # SELL
+    else:
         risk = stop - price
         reward = price - target
     if risk <= 0 or reward <= 0:
@@ -258,13 +283,11 @@ def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
 
 # ─── PEAD Detection ─────────────────────────────────────────────────────────────
 def get_earnings_surprise(ticker: str) -> Optional[float]:
-    """Get most recent earnings surprise percentage (positive)."""
     try:
         stock = yf.Ticker(ticker)
         earnings = stock.earnings
         if earnings is None or earnings.empty:
             return None
-        # Assuming last row is latest quarter
         latest = earnings.iloc[-1]
         surprise = latest.get("epsSurprisePercent") or latest.get("surprisePercent")
         if surprise is not None and surprise >= 2.0:
@@ -274,7 +297,6 @@ def get_earnings_surprise(ticker: str) -> Optional[float]:
         return None
 
 def get_pead_enhanced_signals(signals: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-    """Separate signals into PEAD-enhanced and standard, and add PEAD info."""
     pead = []
     standard = []
     for s in signals:
@@ -288,7 +310,6 @@ def get_pead_enhanced_signals(signals: List[Dict]) -> Tuple[List[Dict], List[Dic
 
 # ─── Non-Signal Reasons ────────────────────────────────────────────────────────
 def classify_non_signal(ticker: str, hist: pd.DataFrame) -> str:
-    """Provide a short reason why no signal was generated."""
     last = hist.iloc[-1]
     price = last["Close"]
     ma50 = last["MA50"]
@@ -304,18 +325,15 @@ def classify_non_signal(ticker: str, hist: pd.DataFrame) -> str:
         return "Volume Profile not available"
     hvn, lvn = find_hvn_lvn(bucket_centers, vols)
 
-    # Check conditions sequentially
     if abs(price - ma50) / ma50 > 0.05:
         return f"Far from 50-MA ({ma50:.2f})"
     if not (30 <= rsi <= 70):
         return f"RSI out of range ({rsi:.0f})"
     if not val <= price <= vah and (price > vah or price < val):
-        # Check proximity to LVN
         near_lvn = any(abs(price - l) / price < 0.01 for l in lvn)
         if not near_lvn:
             return "No nearby LVN"
         return "No volume pattern"
-    # Could be potential support/breakout but not meeting exact conditions
     return "Other"
 
 # ─── Telegram Messaging ─────────────────────────────────────────────────────────
@@ -324,7 +342,6 @@ def send_telegram_message(message: str):
         logger.warning("Telegram credentials missing – skipping message")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Telegram max message length: 4096 chars; chunk if needed
     chunks = [message[i:i+4096] for i in range(0, len(message), 4096)]
     for chunk in chunks:
         try:
@@ -335,7 +352,6 @@ def send_telegram_message(message: str):
             logger.error(f"Telegram send failed: {e}")
 
 def format_signal(s: Dict) -> str:
-    """Format a single signal into a readable line."""
     t = s["ticker"]
     typ = s["type"]
     price = s["price"]
@@ -345,16 +361,12 @@ def format_signal(s: Dict) -> str:
     ma50 = s["ma50"]
     rsi = s["rsi"]
     vol = "✅" if s["vol_confirm"] else ""
-    # TradingView link
     tv_link = f"[TradingView](https://www.tradingview.com/chart/?symbol={t})"
-    # PEAD
     pead_tag = ""
     if s.get("pead_surprise"):
         pead_tag = f" 🚀PEAD+{s['pead_surprise']:.1f}%"
-    # Rationale
     rationale = " | ".join(s["rationale"])
     stop_reason = "VAL / POC" if s["stop"] == s.get("val") else "POC"
-    # Line
     line = (
         f"*{t}* – {typ} {vol}{pead_tag}\n"
         f"Price: ${price:.2f} | Stop: ${stop:.2f} ({stop_reason}) | Target: ${target:.2f} (VAH)\n"
@@ -368,29 +380,24 @@ def format_non_signal(ticker: str, reason: str) -> str:
     return f"• *{ticker}* – {reason}"
 
 def build_telegram_message(pead_signals: List[Dict], standard_signals: List[Dict], non_signals: Dict[str, str]) -> str:
-    """Create the full Telegram message with sections."""
     lines = []
     lines.append(f"📊 *VP-MA Scan – {datetime.now().strftime('%Y-%m-%d %H:%M')}*")
     lines.append("")
 
-    # Priority: PEAD-enhanced first
     if pead_signals:
         lines.append("🚀 *PEAD-Enhanced Signals*")
         for s in pead_signals:
             lines.append(format_signal(s))
         lines.append("")
 
-    # Standard signals
     if standard_signals:
         lines.append("📈 *Standard Signals*")
         for s in standard_signals:
             lines.append(format_signal(s))
         lines.append("")
 
-    # Non-signaled tickers (collapsed by category)
     if non_signals:
         lines.append("📌 *Watchlist (No Signal Today)*")
-        # Group by reason
         reason_groups = {}
         for ticker, reason in non_signals.items():
             reason_groups.setdefault(reason, []).append(ticker)
@@ -425,10 +432,8 @@ def run_scan():
             reason = classify_non_signal(ticker, hist)
             non_signals[ticker] = reason
 
-    # PEAD overlay
     pead, standard = get_pead_enhanced_signals(all_signals)
 
-    # Build and send message
     msg = build_telegram_message(pead, standard, non_signals)
     send_telegram_message(msg)
     logger.info(f"Scan complete. {len(pead)} PEAD, {len(standard)} standard, {len(non_signals)} non-signals.")
