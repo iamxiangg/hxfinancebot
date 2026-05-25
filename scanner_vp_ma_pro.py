@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-VP_MA_Scan – Volume Profile + 50-MA + RSI Scanner
-Sends concise Telegram message: signals + categorised non‑signal reasons.
+VP_MA_Scan – Volume Profile + 50‑MA + RSI Scanner
+Now with:
+- Volume confirmation (>1.5x 20‑day average)
+- PEAD overlay (post‑earnings drift)
+- Priority: PEAD signals displayed first
+- Categorised non‑signal reasons
 """
 
 import os
@@ -29,6 +33,9 @@ RSI_BUY_HIGH       = 60
 RSI_SELL_LOW       = 30
 RSI_SELL_HIGH      = 50
 RSI_BREAKOUT_MAX   = 65
+VOLUME_MULTIPLIER  = 1.5  # threshold for volume confirmation
+PEAD_LOOKBACK_DAYS = 20   # days after earnings to consider
+PEAD_SURPRISE_MIN  = 2.0  # minimum absolute surprise % to tag
 
 # Google Sheets Configuration
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -44,7 +51,7 @@ def flatten_multiindex(df):
     return df
 
 def get_ticker_data(ticker):
-    """Download OHLCV data using yfinance."""
+    """Download OHLCV data using yfinance. (yfinance API: https://ranaroussi.github.io/yfinance/)"""
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="6mo", interval="1d")
@@ -149,10 +156,11 @@ def compute_volume_profile(df, lookback=LOOKBACK):
     }
 
 def compute_indicators(df):
-    """Add 50-MA and RSI (14) to dataframe."""
+    """Add 50-MA, RSI (14), and 20-day volume MA."""
     df = df.copy()
     df['MA50'] = SMAIndicator(close=df['Close'], window=50).sma_indicator()
     df['RSI']  = RSIIndicator(close=df['Close'], window=14).rsi()
+    df['Volume_MA20'] = df['Volume'].rolling(20).mean()
     return df
 
 def calculate_risk_reward(entry, stop, target):
@@ -169,14 +177,47 @@ def nearest_lvn(lvn_list, price):
         return None
     return min(lvn_list, key=lambda x: abs(x - price))
 
+def get_earnings_surprise(ticker):
+    """
+    Fetch the most recent earnings surprise for a ticker using yfinance.
+    Returns (surprise_pct, days_ago) or (None, None) if not available.
+    API doc: https://ranaroussi.github.io/yfinance/reference.html#yfinance.Ticker.earnings_dates
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        earnings = stock.earnings_dates
+        if earnings is None or earnings.empty:
+            return None, None
+        # Take last row (most recent earnings)
+        last = earnings.iloc[-1]
+        # Check required columns (depends on yfinance version)
+        eps_actual = last.get('EPS Actual') or last.get('eps_actual')
+        eps_estimate = last.get('EPS Estimate') or last.get('eps_estimate')
+        if eps_actual is None or eps_estimate is None or eps_estimate == 0:
+            return None, None
+        # Date of earnings (index might be Timestamp or string)
+        earn_date = last.name
+        if hasattr(earn_date, 'to_pydatetime'):
+            earn_date = earn_date.to_pydatetime()
+        days_since = (pd.Timestamp.now() - pd.Timestamp(earn_date)).days
+        if days_since < 0 or days_since > PEAD_LOOKBACK_DAYS:
+            return None, None
+        surprise_pct = (eps_actual - eps_estimate) / abs(eps_estimate) * 100
+        return surprise_pct, days_since
+    except Exception:
+        return None, None
+
 # ─── Signal Detection ───────────────────────────────────────────
 
-def detect_signals(ticker, df):
-    """Check for Support BUY, Breakout BUY, SELL signals."""
+def detect_signals(ticker, df, earnings_surprise=None):
+    """
+    Check for Support BUY, Breakout BUY, SELL signals.
+    Returns (signals_list, reason_string) and attaches pead_tag/vol_confirmed.
+    """
     signals = []
     vp = compute_volume_profile(df)
     if vp is None:
-        return signals, None   # No VP data
+        return signals, "no VP data"
 
     df_indicators = compute_indicators(df)
     last = df_indicators.iloc[-1]
@@ -191,12 +232,18 @@ def detect_signals(ticker, df):
     lvn_levels = vp['lvn_levels']
 
     if pd.isna(ma50) or pd.isna(rsi):
-        return signals, None
+        return signals, "insufficient indicator data"
+
+    # Volume confirmation
+    vol = last['Volume']
+    vol_ma20 = last['Volume_MA20']
+    vol_confirmed = (vol_ma20 > 0) and (vol > vol_ma20 * VOLUME_MULTIPLIER)
 
     # Collect reasons for no signal
     reasons = []
 
     # ── Support BUY ──────────────────────────────────────────
+    support_buy_ok = False
     if (close_price >= ma50 * 0.98) and (close_price <= ma50 * 1.02):
         if val <= close_price <= va_mid:
             if RSI_BUY_LOW <= rsi <= RSI_BUY_HIGH:
@@ -206,7 +253,8 @@ def detect_signals(ticker, df):
                 target = vah
                 rr = calculate_risk_reward(close_price, stop, target)
                 if rr >= MIN_RR_RATIO:
-                    signals.append({
+                    support_buy_ok = True
+                    sig = {
                         'type': 'Support BUY',
                         'ticker': ticker,
                         'entry': close_price,
@@ -216,11 +264,21 @@ def detect_signals(ticker, df):
                         'rsi': round(rsi, 1),
                         'ma50': round(ma50, 2),
                         'va_range': f"${round(val,2)}–${round(vah,2)}",
-                        'poc': round(poc, 2)
-                    })
+                        'poc': round(poc, 2),
+                        'vol_confirmed': vol_confirmed,
+                        'pead_tag': None
+                    }
+                    # Attach PEAD if available
+                    if earnings_surprise and earnings_surprise[0] is not None:
+                        surp, days = earnings_surprise
+                        if surp > PEAD_SURPRISE_MIN:
+                            sig['pead_tag'] = f"🏷️ PEAD +{surp:.1f}% ({days}d ago)"
+                        elif surp < -PEAD_SURPRISE_MIN:
+                            sig['pead_tag'] = f"🏷️ PEAD {surp:.1f}% ({days}d ago)"
+                    signals.append(sig)
                     return signals, None
                 else:
-                    reasons.append("risk/reward below 1.5")
+                    reasons.append(f"risk/reward below {MIN_RR_RATIO}")
             else:
                 reasons.append(f"RSI out of buy range ({rsi:.1f})")
         else:
@@ -237,7 +295,7 @@ def detect_signals(ticker, df):
                 target = close_price * 1.05
                 rr = calculate_risk_reward(close_price, stop, target)
                 if rr >= MIN_RR_RATIO:
-                    signals.append({
+                    sig = {
                         'type': 'Breakout BUY',
                         'ticker': ticker,
                         'entry': close_price,
@@ -248,8 +306,17 @@ def detect_signals(ticker, df):
                         'ma50': round(ma50, 2),
                         'va_range': f"${round(val,2)}–${round(vah,2)}",
                         'poc': round(poc, 2),
-                        'near_lvn': round(lvn_near, 2)
-                    })
+                        'near_lvn': round(lvn_near, 2),
+                        'vol_confirmed': vol_confirmed,
+                        'pead_tag': None
+                    }
+                    if earnings_surprise and earnings_surprise[0] is not None:
+                        surp, days = earnings_surprise
+                        if surp > PEAD_SURPRISE_MIN:
+                            sig['pead_tag'] = f"🏷️ PEAD +{surp:.1f}% ({days}d ago)"
+                        elif surp < -PEAD_SURPRISE_MIN:
+                            sig['pead_tag'] = f"🏷️ PEAD {surp:.1f}% ({days}d ago)"
+                    signals.append(sig)
                     return signals, None
                 else:
                     reasons.append("breakout R:R < 1.5")
@@ -269,7 +336,7 @@ def detect_signals(ticker, df):
                 target = close_price * 0.95
                 rr = calculate_risk_reward(close_price, stop, target)
                 if rr >= MIN_RR_RATIO:
-                    signals.append({
+                    sig = {
                         'type': 'SELL (Short)',
                         'ticker': ticker,
                         'entry': close_price,
@@ -279,8 +346,17 @@ def detect_signals(ticker, df):
                         'rsi': round(rsi, 1),
                         'ma50': round(ma50, 2),
                         'va_range': f"${round(val,2)}–${round(vah,2)}",
-                        'poc': round(poc, 2)
-                    })
+                        'poc': round(poc, 2),
+                        'vol_confirmed': vol_confirmed,
+                        'pead_tag': None
+                    }
+                    if earnings_surprise and earnings_surprise[0] is not None:
+                        surp, days = earnings_surprise
+                        if surp < -PEAD_SURPRISE_MIN:
+                            sig['pead_tag'] = f"🏷️ PEAD {surp:.1f}% ({days}d ago)"
+                        elif surp > PEAD_SURPRISE_MIN:
+                            sig['pead_tag'] = f"🏷️ PEAD +{surp:.1f}% ({days}d ago)"
+                    signals.append(sig)
                     return signals, None
                 else:
                     reasons.append("sell R:R < 1.5")
@@ -299,7 +375,9 @@ def detect_signals(ticker, df):
 # ─── Telegram Notification ──────────────────────────────────────
 
 def send_telegram(text, parse_mode="HTML"):
-    """Send a message via Telegram bot. Returns True on success."""
+    """Send a message via Telegram bot. Returns True on success.
+       Telegram Bot API: https://core.telegram.org/bots/api#sendmessage
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️  Telegram credentials missing")
         return False
@@ -322,7 +400,7 @@ def send_telegram(text, parse_mode="HTML"):
         return False
 
 def format_signal_message(signal):
-    """Build a single signal message with annotated fields."""
+    """Build a single signal message with annotated fields and optional PEAD/volume tags."""
     lines = [
         f"<b>{signal['type']}</b> – {signal['ticker']}",
         f"Entry: ${signal['entry']:.2f} (current close)",
@@ -331,6 +409,13 @@ def format_signal_message(signal):
         f"R:R: {signal['rr']} → (target‑entry)/(entry‑stop)",
         f"RSI: {signal['rsi']} | 50‑MA: ${signal['ma50']:.2f}",
     ]
+    # Add volume confirmation tag
+    if signal.get('vol_confirmed'):
+        lines.append("📊 High volume (>{:.0f}x 20‑MA)".format(VOLUME_MULTIPLIER))
+    # Add PEAD tag (if present)
+    if signal.get('pead_tag'):
+        lines.append(signal['pead_tag'])
+    # Type-specific insight
     if signal['type'] == 'Support BUY':
         lines.append("💡 Lower half of VA, above 50‑MA, RSI 40‑60")
     elif signal['type'] == 'Breakout BUY':
@@ -342,17 +427,12 @@ def format_signal_message(signal):
     return "\n".join(lines)
 
 def categorize_reason(reason_str):
-    """
-    Convert a composite reason string (comma‑separated) into a short category.
-    Returns a tuple: (category, primary_reason).
-    """
+    """Same as before – map composite reason to category."""
     if reason_str is None:
         return "Unknown", ""
     reasons = [r.strip() for r in reason_str.split(",")]
     primary = reasons[0] if reasons else ""
-    
-    # Map primary reason to a category
-    if "far from 50-MA" in primary or "insufficient data" in primary:
+    if "far from 50-MA" in primary:
         category = "Far from 50‑MA"
     elif "RSI out of buy range" in primary or "RSI too high" in primary:
         category = "RSI out of buy range"
@@ -375,40 +455,48 @@ def categorize_reason(reason_str):
     return category, primary
 
 def build_full_message(signals, no_signal_reasons):
-    """Build the entire Telegram message (signals + categorised non‑signal reasons)."""
+    """
+    Build the entire Telegram message.
+    Signals are split into PEAD-enhanced and standard, sorted PEAD first.
+    """
     parts = []
-    
-    # Signals section
+
+    # Split signals into PEAD and non-PEAD
+    pead_signals = [s for s in signals if s.get('pead_tag')]
+    standard_signals = [s for s in signals if not s.get('pead_tag')]
+
     if signals:
-        header = f"<b>🔍 VP_MA Scan – {len(signals)} signal(s)</b>"
-        parts.append(header)
-        for sig in signals:
-            parts.append(format_signal_message(sig))
+        # PEAD signals header
+        if pead_signals:
+            header = f"<b>🏆 VP_MA Scan – {len(pead_signals)} PEAD‑Enhanced signal(s)</b>"
+            parts.append(header)
+            for sig in pead_signals:
+                parts.append(format_signal_message(sig))
+            # Add blank line to separate groups
+            parts.append("")
+
+        # Standard signals
+        if standard_signals:
+            header = f"<b>📊 VP_MA Scan – {len(standard_signals)} standard signal(s)</b>"
+            parts.append(header)
+            for sig in standard_signals:
+                parts.append(format_signal_message(sig))
     else:
-        parts.append("<b>🔍 VP_MA Scan – no signals found</b>")
-    
-    # Non‑signal reasons – categorised
+        parts.append("<b>📊 VP_MA Scan – no signals found</b>")
+
+    # Non-signal reasons – categorised
     if no_signal_reasons:
-        # Group tickers by category
         categories = {}
         for ticker, reason in no_signal_reasons.items():
             cat, primary = categorize_reason(reason)
-            if cat not in categories:
-                categories[cat] = []
-            # Store ticker and a short note (the primary reason)
-            categories[cat].append((ticker, primary))
-        
-        # Build categorised lines
+            categories.setdefault(cat, []).append(ticker)
+
         lines = ["<b>⏳ Stocks without signals:</b>"]
         for cat, tickers_list in sorted(categories.items()):
-            # Comma‑separated tickers with (reason) if needed
-            ticker_strs = []
-            for t, note in tickers_list:
-                ticker_strs.append(t)
-            line = f"  • <b>{cat}</b>: {', '.join(ticker_strs)}"
+            line = f"  • <b>{cat}</b>: {', '.join(tickers_list)}"
             lines.append(line)
-        
-        # Add a single summary "What to watch" line
+
+        # Summary
         summary = ""
         if "Far from 50‑MA" in categories:
             summary += "📌 Stocks far from 50‑MA → wait for pullback to MA. "
@@ -425,16 +513,15 @@ def build_full_message(signals, no_signal_reasons):
         if summary:
             lines.append("")
             lines.append(f"💡 <i>{summary}</i>")
-        
-        if lines:
-            parts.append("\n".join(lines))
-    
-    return "\n\n".join(parts)
+
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts).strip()
 
 # ─── Main Scan ──────────────────────────────────────────────────
 
 def main():
-    # ── Authenticate to Google Sheets using GitHub Secret ──
+    # ── Authenticate to Google Sheets ──
     creds_json = os.getenv('GCP_SERVICE_ACCOUNT_FILE')
     if not creds_json:
         print("❌ Environment variable GCP_SERVICE_ACCOUNT_FILE is missing")
@@ -444,22 +531,31 @@ def main():
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
         client = gspread.authorize(creds)
-        
+
         workbook = client.open(SHEET_NAME)
         sheet = workbook.worksheet(WORKSHEET_NAME)
-        
-        # Pull Column A (assumes Tickers start on row 2, skipping header row 1)
+
         col_a = sheet.col_values(1)
         tickers = [ticker.strip().upper() for ticker in col_a[1:] if ticker.strip()]
-        
         print(f"📋 Loaded {len(tickers)} tickers from Google Sheet '{SHEET_NAME}'")
     except Exception as e:
         print(f"❌ Google Sheets authentication or reading failed: {e}")
         sys.exit(1)
-        
+
     if not tickers:
         print("⚠️ No tickers found in Google Sheet.")
         sys.exit(0)
+
+    # ── Pre‑fetch earnings surprises (to avoid repeated yfinance calls) ──
+    print("Fetching earnings surprises...")
+    earnings_data = {}
+    for ticker in tickers:
+        surp, days = get_earnings_surprise(ticker)
+        earnings_data[ticker] = (surp, days) if surp is not None else None
+        if surp is not None:
+            print(f"   {ticker}: surprise {surp:+.1f}% ({days}d ago)")
+        else:
+            print(f"   {ticker}: no earnings data")
 
     all_signals = []
     no_signal_reasons = {}
@@ -472,7 +568,7 @@ def main():
             print(f"   ⚠️  Insufficient data for {ticker}")
             no_signal_reasons[ticker] = "insufficient data (<60 days)"
             continue
-        signals, reason = detect_signals(ticker, df)
+        signals, reason = detect_signals(ticker, df, earnings_data.get(ticker))
         if signals:
             all_signals.extend(signals)
             for s in signals:
@@ -487,7 +583,7 @@ def main():
     print(f"\nDone. Found {len(all_signals)} signals, {len(no_signal_reasons)} non-signaled.")
 
     full_msg = build_full_message(all_signals, no_signal_reasons)
-    
+
     # Split into chunks if too long
     chunk_size = 3800
     if len(full_msg) <= chunk_size:
