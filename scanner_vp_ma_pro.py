@@ -1,577 +1,438 @@
 #!/usr/bin/env python3
 """
-VP_MA_Scan – Volume Profile + 50‑MA + RSI Scanner
-+ Volume confirmation, PEAD overlay, priority layering.
-Debug mode shows earnings data for every ticker.
+VP_MA_Scan – Automated stock scanner using Volume Profile, 50-day MA, and RSI momentum.
+Sends Telegram alerts with PEAD-enhanced signals.
 """
 
 import os
 import sys
-import math
-import traceback
+import json
+import warnings
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
+
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import requests
-import json
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator
+import yfinance as yf
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# ─── Configuration ──────────────────────────────────────────────
-DEBUG_EARNINGS = True   # Set to False after confirming earnings data works
+# Suppress yfinance deprecation warning for earnings
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*earnings.*")
 
+# ─── Configuration ──────────────────────────────────────────────────────────────
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+RANGE_NAME = os.getenv("GOOGLE_SHEET_RANGE", "Watchlist!A:A")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-LOOKBACK           = 300
-VALUE_AREA_PCT     = 0.70
-MIN_RR_RATIO       = 1.5
-RSI_BUY_LOW        = 40
-RSI_BUY_HIGH       = 60
-RSI_SELL_LOW       = 30
-RSI_SELL_HIGH      = 50
-RSI_BREAKOUT_MAX   = 65
-VOLUME_MULTIPLIER  = 1.5
-PEAD_LOOKBACK_DAYS = 20
-PEAD_SURPRISE_MIN  = 2.0
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-SHEET_NAME = "Xiang Stock Analysis"
-WORKSHEET_NAME = "Stock Summary USD"
+# Volume profile defaults
+VA_PERCENT = 0.70
+BUCKET_MAX = 500
+MIN_BUCKET_PRICE = 0.01
+MIN_BUCKET_PCT = 0.001
 
-# ─── Helper Functions ───────────────────────────────────────────
+# Risk/reward
+MIN_RR = 1.5
 
-def flatten_multiindex(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join(col).strip() for col in df.columns.values]
-    return df
+# RSI thresholds
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
 
-def get_ticker_data(ticker):
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ─── Google Sheets ──────────────────────────────────────────────────────────────
+def get_service_account_info():
+    env_creds = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    if env_creds:
+        return json.loads(env_creds)
+    raise ValueError("GCP_SERVICE_ACCOUNT_JSON not set")
+
+def get_watchlist() -> List[str]:
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            get_service_account_info(), scopes=SCOPES
+        )
+        service = build("sheets", "v4", credentials=creds)
+        sheet = service.spreadsheets()
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
+        values = result.get("values", [])
+        tickers = [row[0].strip().upper() for row in values if row and row[0].strip()]
+        logger.info(f"Loaded {len(tickers)} tickers from sheet.")
+        return tickers
+    except HttpError as e:
+        logger.error(f"Google Sheets API error: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Error reading sheet: {e}")
+        return []
+
+# ─── Data Fetching ──────────────────────────────────────────────────────────────
+def fetch_data(ticker: str) -> Optional[pd.DataFrame]:
     try:
         stock = yf.Ticker(ticker)
-        df = stock.history(period="6mo", interval="1d")
-        if df.empty:
+        hist = stock.history(period="1y")
+        if hist.empty or hist["Volume"].sum() == 0:
+            logger.warning(f"{ticker}: no volume data")
             return None
-        df = flatten_multiindex(df)
-        rename_map = {}
-        for col in df.columns:
-            lower = col.lower()
-            if 'close' in lower: rename_map[col] = 'Close'
-            elif 'high' in lower: rename_map[col] = 'High'
-            elif 'low' in lower: rename_map[col] = 'Low'
-            elif 'volume' in lower: rename_map[col] = 'Volume'
-        df.rename(columns=rename_map, inplace=True)
-        required = ['Close', 'High', 'Low', 'Volume']
-        if not all(c in df.columns for c in required):
+        if len(hist) < 200:
+            logger.warning(f"{ticker}: insufficient history ({len(hist)} days)")
             return None
-        return df
+
+        # Add 50-day MA and RSI (14-day)
+        hist["MA50"] = hist["Close"].rolling(window=50).mean()
+        delta = hist["Close"].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta.where(delta < 0, 0.0))
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        hist["RSI"] = 100 - (100 / (1 + rs))
+
+        # Check for NaN in recent values
+        last = hist.iloc[-1]
+        if pd.isna(last["MA50"]) or pd.isna(last["RSI"]):
+            logger.warning(f"{ticker}: NaN in indicators")
+            return None
+        return hist
+    except Exception as e:
+        logger.error(f"{ticker}: fetch error – {e}")
+        return None
+
+# ─── Volume Profile ─────────────────────────────────────────────────────────────
+def bucket_price(prices: np.ndarray, volume: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Calculate volume profile buckets with dynamic width."""
+    current_price = prices[-1]
+    bucket_width = max(current_price * MIN_BUCKET_PCT, MIN_BUCKET_PRICE)
+    min_price = prices.min()
+    max_price = prices.max()
+    n_buckets = min(int((max_price - min_price) / bucket_width) + 1, BUCKET_MAX)
+    if n_buckets < 2:
+        bucket_width = max((max_price - min_price) / 2, MIN_BUCKET_PRICE)
+        n_buckets = 2
+    bucket_edges = np.linspace(min_price, max_price, n_buckets + 1)
+    bucket_centers = (bucket_edges[:-1] + bucket_edges[1:]) / 2
+    vols = np.zeros(n_buckets)
+    indices = np.digitize(prices, bucket_edges) - 1
+    indices = np.clip(indices, 0, n_buckets - 1)
+    np.add.at(vols, indices, volume)
+    return bucket_centers, vols, bucket_width
+
+def calculate_value_area(bucket_centers: np.ndarray, volumes: np.ndarray, pct: float) -> Tuple[float, float, float, float]:
+    """Find VAL, VAH, POC, and value area total volume."""
+    total_vol = volumes.sum()
+    if total_vol == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    target_vol = total_vol * pct
+    poc_idx = np.argmax(volumes)
+    poc_price = bucket_centers[poc_idx]
+    left = right = poc_idx
+    sum_vol = volumes[poc_idx]
+    while sum_vol < target_vol and (left > 0 or right < len(volumes) - 1):
+        if left > 0 and (right == len(volumes) - 1 or volumes[left - 1] >= volumes[right + 1]):
+            left -= 1
+            sum_vol += volumes[left]
+        elif right < len(volumes) - 1:
+            right += 1
+            sum_vol += volumes[right]
+        else:
+            break
+    return bucket_centers[left], bucket_centers[right], poc_price, total_vol
+
+def find_hvn_lvn(bucket_centers: np.ndarray, volumes: np.ndarray, n: int = 3) -> Tuple[List[float], List[float]]:
+    """Find highest and lowest volume nodes (peaks/valleys)."""
+    # Simple: top/bottom n buckets by volume
+    sorted_idx = np.argsort(volumes)[::-1]
+    hvn = [float(bucket_centers[idx]) for idx in sorted_idx[:n] if volumes[idx] > 0]
+    # LVN: lowest volume non-zero
+    nonzero = volumes > 0
+    sorted_low = np.argsort(volumes[nonzero])
+    lvn = [float(bucket_centers[nonzero][idx]) for idx in sorted_low[:n]]
+    return hvn, lvn
+
+# ─── Signal Logic ───────────────────────────────────────────────────────────────
+def check_signal(ticker: str, hist: pd.DataFrame) -> Optional[Dict]:
+    """Determine if ticker qualifies for a signal. Returns signal dict or None."""
+    last = hist.iloc[-1]
+    price = last["Close"]
+    ma50 = last["MA50"]
+    rsi = last["RSI"]
+    vol = last["Volume"]
+    vol_ma20 = hist["Volume"].tail(20).mean()
+    vol_conf = vol > vol_ma20 * 1.5
+
+    # Volume profile on last 50 days
+    lookback = hist.tail(50)
+    prices = lookback["Close"].values
+    volumes = lookback["Volume"].values
+    if len(prices) < 20:
+        return None
+
+    bucket_centers, vols, bw = bucket_price(prices, volumes)
+    val, vah, poc, _ = calculate_value_area(bucket_centers, vols, VA_PERCENT)
+    if np.isnan(val) or np.isnan(vah):
+        return None
+    hvn, lvn = find_hvn_lvn(bucket_centers, vols)
+
+    # Check price relative to 50-MA
+    pct_above_ma = (price - ma50) / ma50 * 100
+
+    signal_type = None
+    stop = target = None
+    rationale = []
+
+    # --- Support BUY (near or in lower VA, near MA50, RSI 40-60) ---
+    if ma50 and price >= ma50 * 0.98 and price <= ma50 * 1.02:
+        if val <= price <= (val + vah) / 2 and 40 <= rsi <= 60:
+            signal_type = "SUPPORT BUY"
+            stop = val if val > 0 else price * 0.97
+            target = vah if vah > 0 else price * 1.05
+            rationale = ["Price in lower Value Area", "Near 50-MA", "RSI neutral (40-60)"]
+            if vol_conf:
+                rationale.append("High volume confirmation")
+
+    # --- Breakout BUY (above VAH, near LVN, RSI <65, above MA50) ---
+    if not signal_type:
+        if price > vah and price > ma50 and rsi < 65 and rsi > 30:
+            # Check if price is near an LVN (within 1%)
+            near_lvn = any(abs(price - l) / price < 0.01 for l in lvn)
+            if near_lvn:
+                signal_type = "BREAKOUT BUY"
+                stop = poc if poc > 0 else ma50 * 0.98
+                target = price + (price - stop) * 2
+                rationale = ["Above VAH (breakout)", f"Near LVN ({min(lvn):.2f})", f"RSI {rsi:.0f} (<65)"]
+                if vol_conf:
+                    rationale.append("High volume confirmation")
+
+    # --- SELL (below VAL, near LVN, RSI 30-50, below MA50) ---
+    if not signal_type:
+        if price < val and price < ma50 and rsi >= 30 and rsi <= 50:
+            near_lvn = any(abs(price - l) / price < 0.01 for l in lvn)
+            if near_lvn:
+                signal_type = "SELL"
+                stop = vah if vah > 0 else ma50 * 1.02
+                target = price - (stop - price) * 2
+                rationale = ["Below VAL (breakdown)", f"Near LVN ({min(lvn):.2f})", f"RSI {rsi:.0f} (30-50)"]
+                if vol_conf:
+                    rationale.append("High volume confirmation")
+
+    if not signal_type:
+        return None
+
+    # Risk/Reward check
+    if stop is None or target is None or stop == price:
+        return None
+    if signal_type in ["SUPPORT BUY", "BREAKOUT BUY"]:
+        risk = price - stop
+        reward = target - price
+    else:  # SELL
+        risk = stop - price
+        reward = price - target
+    if risk <= 0 or reward <= 0:
+        return None
+    rr = reward / risk
+    if rr < MIN_RR:
+        return None
+
+    return {
+        "ticker": ticker,
+        "type": signal_type,
+        "price": price,
+        "stop": stop,
+        "target": target,
+        "rr": round(rr, 2),
+        "ma50": ma50,
+        "rsi": round(rsi, 1),
+        "vol_confirm": vol_conf,
+        "val": val,
+        "vah": vah,
+        "poc": poc,
+        "rationale": rationale,
+    }
+
+# ─── PEAD Detection ─────────────────────────────────────────────────────────────
+def get_earnings_surprise(ticker: str) -> Optional[float]:
+    """Get most recent earnings surprise percentage (positive)."""
+    try:
+        stock = yf.Ticker(ticker)
+        earnings = stock.earnings
+        if earnings is None or earnings.empty:
+            return None
+        # Assuming last row is latest quarter
+        latest = earnings.iloc[-1]
+        surprise = latest.get("epsSurprisePercent") or latest.get("surprisePercent")
+        if surprise is not None and surprise >= 2.0:
+            return float(surprise)
+        return None
     except Exception:
         return None
 
-def compute_volume_profile(df, lookback=LOOKBACK):
-    if len(df) < lookback:
-        lookback = len(df)
-    recent = df.tail(lookback).copy()
-    price_min = recent['Low'].min()
-    price_max = recent['High'].max()
-    price_range = price_max - price_min
-    if price_range == 0:
-        return None
-    avg_price = recent['Close'].mean()
-    bucket_width = max(avg_price * 0.001, 0.01)
-    num_buckets = int(price_range / bucket_width)
-    if num_buckets > 500:
-        bucket_width = price_range / 500
-        num_buckets = 500
-    elif num_buckets < 10:
-        bucket_width = price_range / 10
-        num_buckets = 10
-    buckets = {}
-    for _, row in recent.iterrows():
-        low = row['Low']
-        high = row['High']
-        vol = row['Volume']
-        if vol == 0:
-            continue
-        low_idx = int((low - price_min) / bucket_width)
-        high_idx = int((high - price_min) / bucket_width)
-        for i in range(low_idx, high_idx + 1):
-            price_level = price_min + i * bucket_width
-            price_level = round(price_level, 2)
-            buckets[price_level] = buckets.get(price_level, 0) + vol / (high_idx - low_idx + 1)
-    if not buckets:
-        return None
-    sorted_prices = sorted(buckets.keys())
-    sorted_volumes = [buckets[p] for p in sorted_prices]
-    total_volume = sum(sorted_volumes)
-    poc_price = max(buckets, key=buckets.get)
-    target_volume = total_volume * VALUE_AREA_PCT
-    poc_idx = sorted_prices.index(poc_price)
-    cum_vol = 0
-    left_idx = poc_idx
-    right_idx = poc_idx
-    while cum_vol < target_volume and (left_idx > 0 or right_idx < len(sorted_prices)-1):
-        if left_idx > 0 and (right_idx == len(sorted_prices)-1 or 
-                             sorted_volumes[left_idx-1] >= sorted_volumes[right_idx+1]):
-            left_idx -= 1
-            cum_vol += sorted_volumes[left_idx]
-        elif right_idx < len(sorted_prices)-1:
-            right_idx += 1
-            cum_vol += sorted_volumes[right_idx]
+def get_pead_enhanced_signals(signals: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Separate signals into PEAD-enhanced and standard, and add PEAD info."""
+    pead = []
+    standard = []
+    for s in signals:
+        surprise = get_earnings_surprise(s["ticker"])
+        s["pead_surprise"] = surprise
+        if surprise:
+            pead.append(s)
         else:
-            break
-    val = sorted_prices[left_idx]
-    vah = sorted_prices[right_idx]
-    volume_threshold_high = np.percentile(sorted_volumes, 80)
-    volume_threshold_low  = np.percentile(sorted_volumes, 20)
-    hvn_levels = [p for p, v in zip(sorted_prices, sorted_volumes) if v >= volume_threshold_high]
-    lvn_levels = [p for p, v in zip(sorted_prices, sorted_volumes) if v <= volume_threshold_low]
-    return {
-        'value_area_low': val,
-        'value_area_high': vah,
-        'poc': poc_price,
-        'hvn_levels': hvn_levels,
-        'lvn_levels': lvn_levels,
-        'bucket_width': bucket_width,
-        'buckets': buckets
-    }
+            standard.append(s)
+    return pead, standard
 
-def compute_indicators(df):
-    df = df.copy()
-    df['MA50'] = SMAIndicator(close=df['Close'], window=50).sma_indicator()
-    df['RSI']  = RSIIndicator(close=df['Close'], window=14).rsi()
-    df['Volume_MA20'] = df['Volume'].rolling(20).mean()
-    return df
+# ─── Non-Signal Reasons ────────────────────────────────────────────────────────
+def classify_non_signal(ticker: str, hist: pd.DataFrame) -> str:
+    """Provide a short reason why no signal was generated."""
+    last = hist.iloc[-1]
+    price = last["Close"]
+    ma50 = last["MA50"]
+    rsi = last["RSI"]
+    lookback = hist.tail(50)
+    prices = lookback["Close"].values
+    volumes = lookback["Volume"].values
+    if len(prices) < 20:
+        return "Insufficient data"
+    bucket_centers, vols, _ = bucket_price(prices, volumes)
+    val, vah, poc, _ = calculate_value_area(bucket_centers, vols, VA_PERCENT)
+    if np.isnan(val) or np.isnan(vah):
+        return "Volume Profile not available"
+    hvn, lvn = find_hvn_lvn(bucket_centers, vols)
 
-def calculate_risk_reward(entry, stop, target):
-    risk  = abs(entry - stop)
-    reward = abs(target - entry)
-    if risk == 0:
-        return 0
-    return reward / risk
+    # Check conditions sequentially
+    if abs(price - ma50) / ma50 > 0.05:
+        return f"Far from 50-MA ({ma50:.2f})"
+    if not (30 <= rsi <= 70):
+        return f"RSI out of range ({rsi:.0f})"
+    if not val <= price <= vah and (price > vah or price < val):
+        # Check proximity to LVN
+        near_lvn = any(abs(price - l) / price < 0.01 for l in lvn)
+        if not near_lvn:
+            return "No nearby LVN"
+        return "No volume pattern"
+    # Could be potential support/breakout but not meeting exact conditions
+    return "Other"
 
-def nearest_lvn(lvn_list, price):
-    if not lvn_list:
-        return None
-    return min(lvn_list, key=lambda x: abs(x - price))
-
-# ─── Earnings Data (Corrected) ──────────────────────────────────
-
-def get_earnings_surprise(ticker):
-    """
-    Fetch the most recent earnings surprise using yfinance.
-    Tries stock.earnings first, then stock.earnings_dates as fallback.
-    Returns (surprise_pct, days_ago) or (None, None).
-    """
-    try:
-        stock = yf.Ticker(ticker)
-        # Primary: stock.earnings (most reliable)
-        earnings = stock.earnings
-        if earnings is not None and not earnings.empty:
-            last = earnings.iloc[-1]
-            # Common column names: 'EPS Actual' / 'eps_actual', 'EPS Estimate' / 'eps_estimate'
-            eps_actual = last.get('EPS Actual') or last.get('eps_actual')
-            eps_estimate = last.get('EPS Estimate') or last.get('eps_estimate')
-            if eps_actual is not None and eps_estimate is not None and eps_estimate != 0:
-                earn_date = last.name
-                if hasattr(earn_date, 'to_pydatetime'):
-                    earn_date = earn_date.to_pydatetime()
-                days_since = (pd.Timestamp.now() - pd.Timestamp(earn_date)).days
-                if 0 <= days_since <= PEAD_LOOKBACK_DAYS:
-                    surprise_pct = (eps_actual - eps_estimate) / abs(eps_estimate) * 100
-                    if DEBUG_EARNINGS:
-                        print(f"   [DEBUG] {ticker}: surprise {surprise_pct:.1f}% ({days_since}d ago) [from earnings]")
-                    return surprise_pct, days_since
-                elif DEBUG_EARNINGS:
-                    print(f"   [DEBUG] {ticker}: earnings found but {days_since}d ago (outside {PEAD_LOOKBACK_DAYS}d window)")
-            elif DEBUG_EARNINGS:
-                print(f"   [DEBUG] {ticker}: earnings table exists but cannot extract EPS actual/estimate")
-        # Fallback: stock.earnings_dates
-        earnings_dates = stock.earnings_dates
-        if earnings_dates is not None and not earnings_dates.empty:
-            last = earnings_dates.iloc[-1]
-            eps_actual = last.get('EPS Actual') or last.get('eps_actual')
-            eps_estimate = last.get('EPS Estimate') or last.get('eps_estimate')
-            if eps_actual is not None and eps_estimate is not None and eps_estimate != 0:
-                earn_date = last.name
-                if hasattr(earn_date, 'to_pydatetime'):
-                    earn_date = earn_date.to_pydatetime()
-                days_since = (pd.Timestamp.now() - pd.Timestamp(earn_date)).days
-                if 0 <= days_since <= PEAD_LOOKBACK_DAYS:
-                    surprise_pct = (eps_actual - eps_estimate) / abs(eps_estimate) * 100
-                    if DEBUG_EARNINGS:
-                        print(f"   [DEBUG] {ticker}: surprise {surprise_pct:.1f}% ({days_since}d ago) [from earnings_dates]")
-                    return surprise_pct, days_since
-                elif DEBUG_EARNINGS:
-                    print(f"   [DEBUG] {ticker}: earnings_dates found but {days_since}d ago (outside window)")
-            elif DEBUG_EARNINGS:
-                print(f"   [DEBUG] {ticker}: earnings_dates exists but cannot extract EPS actual/estimate")
-        else:
-            if DEBUG_EARNINGS:
-                print(f"   [DEBUG] {ticker}: no earnings data available (both attributes empty/None)")
-        return None, None
-    except Exception as e:
-        if DEBUG_EARNINGS:
-            print(f"   [DEBUG] {ticker}: exception -> {e}")
-        return None, None
-
-# ─── Signal Detection ───────────────────────────────────────────
-
-def detect_signals(ticker, df, earnings_surprise=None):
-    signals = []
-    vp = compute_volume_profile(df)
-    if vp is None:
-        return signals, "no VP data"
-
-    df_indicators = compute_indicators(df)
-    last = df_indicators.iloc[-1]
-    close_price = last['Close']
-    ma50 = last['MA50']
-    rsi  = last['RSI']
-    val  = vp['value_area_low']
-    vah  = vp['value_area_high']
-    poc  = vp['poc']
-    va_mid = (val + vah) / 2
-    lvn_levels = vp['lvn_levels']
-
-    if pd.isna(ma50) or pd.isna(rsi):
-        return signals, "insufficient indicator data"
-
-    vol = last['Volume']
-    vol_ma20 = last['Volume_MA20']
-    vol_confirmed = (vol_ma20 > 0) and (vol > vol_ma20 * VOLUME_MULTIPLIER)
-
-    reasons = []
-
-    # ── Support BUY ──────────────────────────────────────────
-    if (close_price >= ma50 * 0.98) and (close_price <= ma50 * 1.02):
-        if val <= close_price <= va_mid:
-            if RSI_BUY_LOW <= rsi <= RSI_BUY_HIGH:
-                stop = max(val, poc)
-                if close_price - stop < 0.01 * close_price:
-                    stop = val * 0.98
-                target = vah
-                rr = calculate_risk_reward(close_price, stop, target)
-                if rr >= MIN_RR_RATIO:
-                    sig = {
-                        'type': 'Support BUY',
-                        'ticker': ticker,
-                        'entry': close_price,
-                        'stop': stop,
-                        'target': target,
-                        'rr': round(rr, 2),
-                        'rsi': round(rsi, 1),
-                        'ma50': round(ma50, 2),
-                        'va_range': f"${round(val,2)}–${round(vah,2)}",
-                        'poc': round(poc, 2),
-                        'vol_confirmed': vol_confirmed,
-                        'pead_tag': None
-                    }
-                    if earnings_surprise and earnings_surprise[0] is not None:
-                        surp, days = earnings_surprise
-                        if surp > PEAD_SURPRISE_MIN:
-                            sig['pead_tag'] = f"🏷️ PEAD +{surp:.1f}% ({days}d ago)"
-                        elif surp < -PEAD_SURPRISE_MIN:
-                            sig['pead_tag'] = f"🏷️ PEAD {surp:.1f}% ({days}d ago)"
-                    signals.append(sig)
-                    return signals, None
-                else:
-                    reasons.append(f"risk/reward below {MIN_RR_RATIO}")
-            else:
-                reasons.append(f"RSI out of buy range ({rsi:.1f})")
-        else:
-            reasons.append("price not in lower half of VA")
-    else:
-        reasons.append(f"far from 50-MA ({abs(close_price-ma50)/ma50*100:.1f}%)")
-
-    # ── Breakout BUY ─────────────────────────────────────────
-    if not signals and (close_price > vah) and (rsi < RSI_BREAKOUT_MAX):
-        lvn_near = nearest_lvn(lvn_levels, close_price)
-        if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
-            if close_price > ma50:
-                stop = vah * 0.98
-                target = close_price * 1.05
-                rr = calculate_risk_reward(close_price, stop, target)
-                if rr >= MIN_RR_RATIO:
-                    sig = {
-                        'type': 'Breakout BUY',
-                        'ticker': ticker,
-                        'entry': close_price,
-                        'stop': stop,
-                        'target': target,
-                        'rr': round(rr, 2),
-                        'rsi': round(rsi, 1),
-                        'ma50': round(ma50, 2),
-                        'va_range': f"${round(val,2)}–${round(vah,2)}",
-                        'poc': round(poc, 2),
-                        'near_lvn': round(lvn_near, 2),
-                        'vol_confirmed': vol_confirmed,
-                        'pead_tag': None
-                    }
-                    if earnings_surprise and earnings_surprise[0] is not None:
-                        surp, days = earnings_surprise
-                        if surp > PEAD_SURPRISE_MIN:
-                            sig['pead_tag'] = f"🏷️ PEAD +{surp:.1f}% ({days}d ago)"
-                        elif surp < -PEAD_SURPRISE_MIN:
-                            sig['pead_tag'] = f"🏷️ PEAD {surp:.1f}% ({days}d ago)"
-                    signals.append(sig)
-                    return signals, None
-                else:
-                    reasons.append("breakout R:R < 1.5")
-            else:
-                reasons.append("breakout but below 50-MA")
-        else:
-            reasons.append("breakout no nearby LVN")
-    elif not signals:
-        reasons.append(f"price not above VAH or RSI too high ({rsi:.1f})")
-
-    # ── SELL signal ──────────────────────────────────────────
-    if not signals and (close_price < val) and (rsi >= RSI_SELL_LOW) and (rsi <= RSI_SELL_HIGH):
-        lvn_near = nearest_lvn(lvn_levels, close_price)
-        if lvn_near and abs(close_price - lvn_near) / close_price <= 0.02:
-            if close_price < ma50:
-                stop = val * 1.02
-                target = close_price * 0.95
-                rr = calculate_risk_reward(close_price, stop, target)
-                if rr >= MIN_RR_RATIO:
-                    sig = {
-                        'type': 'SELL (Short)',
-                        'ticker': ticker,
-                        'entry': close_price,
-                        'stop': stop,
-                        'target': target,
-                        'rr': round(rr, 2),
-                        'rsi': round(rsi, 1),
-                        'ma50': round(ma50, 2),
-                        'va_range': f"${round(val,2)}–${round(vah,2)}",
-                        'poc': round(poc, 2),
-                        'vol_confirmed': vol_confirmed,
-                        'pead_tag': None
-                    }
-                    if earnings_surprise and earnings_surprise[0] is not None:
-                        surp, days = earnings_surprise
-                        if surp < -PEAD_SURPRISE_MIN:
-                            sig['pead_tag'] = f"🏷️ PEAD {surp:.1f}% ({days}d ago)"
-                        elif surp > PEAD_SURPRISE_MIN:
-                            sig['pead_tag'] = f"🏷️ PEAD +{surp:.1f}% ({days}d ago)"
-                    signals.append(sig)
-                    return signals, None
-                else:
-                    reasons.append("sell R:R < 1.5")
-            else:
-                reasons.append("sell but above 50-MA")
-        else:
-            reasons.append("sell no nearby LVN")
-    else:
-        if close_price < val:
-            reasons.append("below VAL but RSI not in sell range")
-
-    if not reasons:
-        reasons.append("unknown reason")
-    return signals, ", ".join(reasons)
-
-# ─── Telegram ───────────────────────────────────────────────────
-
-def send_telegram(text, parse_mode="HTML"):
+# ─── Telegram Messaging ─────────────────────────────────────────────────────────
+def send_telegram_message(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️  Telegram credentials missing")
-        return False
+        logger.warning("Telegram credentials missing – skipping message")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True
-    }
-    try:
-        resp = requests.post(url, data=payload, timeout=15)
-        if resp.status_code == 200:
-            return True
-        else:
-            print(f"❌ Telegram API error {resp.status_code}: {resp.text}")
-            return False
-    except Exception as e:
-        print(f"❌ Telegram send exception: {e}")
-        return False
+    # Telegram max message length: 4096 chars; chunk if needed
+    chunks = [message[i:i+4096] for i in range(0, len(message), 4096)]
+    for chunk in chunks:
+        try:
+            resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"})
+            resp.raise_for_status()
+            logger.info(f"Telegram message sent ({len(chunk)} chars)")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Telegram send failed: {e}")
 
-def format_signal_message(signal):
-    lines = [
-        f"<b>{signal['type']}</b> – {signal['ticker']}",
-        f"Entry: ${signal['entry']:.2f} (current close)",
-        f"Stop:  ${signal['stop']:.2f} (VAL / POC)",
-        f"Target: ${signal['target']:.2f} (VAH)",
-        f"R:R: {signal['rr']} → (target‑entry)/(entry‑stop)",
-        f"RSI: {signal['rsi']} | 50‑MA: ${signal['ma50']:.2f}",
-    ]
-    if signal.get('vol_confirmed'):
-        lines.append("📊 High volume (>%.1fx 20‑MA)" % VOLUME_MULTIPLIER)
-    if signal.get('pead_tag'):
-        lines.append(signal['pead_tag'])
-    if signal['type'] == 'Support BUY':
-        lines.append("💡 Lower half of VA, above 50‑MA, RSI 40‑60")
-    elif signal['type'] == 'Breakout BUY':
-        lines.append("💡 Above VAH, near LVN, RSI <65, above 50‑MA")
-    elif signal['type'] == 'SELL (Short)':
-        lines.append("💡 Below VAL, near LVN, below 50‑MA, RSI 30‑50")
-    tv_link = f"https://www.tradingview.com/chart/?symbol={signal['ticker']}"
-    lines.append(f"<a href='{tv_link}'>📊 View on TradingView</a>")
+def format_signal(s: Dict) -> str:
+    """Format a single signal into a readable line."""
+    t = s["ticker"]
+    typ = s["type"]
+    price = s["price"]
+    stop = s["stop"]
+    target = s["target"]
+    rr = s["rr"]
+    ma50 = s["ma50"]
+    rsi = s["rsi"]
+    vol = "✅" if s["vol_confirm"] else ""
+    # TradingView link
+    tv_link = f"[TradingView](https://www.tradingview.com/chart/?symbol={t})"
+    # PEAD
+    pead_tag = ""
+    if s.get("pead_surprise"):
+        pead_tag = f" 🚀PEAD+{s['pead_surprise']:.1f}%"
+    # Rationale
+    rationale = " | ".join(s["rationale"])
+    stop_reason = "VAL / POC" if s["stop"] == s.get("val") else "POC"
+    # Line
+    line = (
+        f"*{t}* – {typ} {vol}{pead_tag}\n"
+        f"Price: ${price:.2f} | Stop: ${stop:.2f} ({stop_reason}) | Target: ${target:.2f} (VAH)\n"
+        f"RR: {rr} | MA50: ${ma50:.2f} | RSI: {rsi}\n"
+        f"💡 {rationale}\n"
+        f"{tv_link}\n"
+    )
+    return line
+
+def format_non_signal(ticker: str, reason: str) -> str:
+    return f"• *{ticker}* – {reason}"
+
+def build_telegram_message(pead_signals: List[Dict], standard_signals: List[Dict], non_signals: Dict[str, str]) -> str:
+    """Create the full Telegram message with sections."""
+    lines = []
+    lines.append(f"📊 *VP-MA Scan – {datetime.now().strftime('%Y-%m-%d %H:%M')}*")
+    lines.append("")
+
+    # Priority: PEAD-enhanced first
+    if pead_signals:
+        lines.append("🚀 *PEAD-Enhanced Signals*")
+        for s in pead_signals:
+            lines.append(format_signal(s))
+        lines.append("")
+
+    # Standard signals
+    if standard_signals:
+        lines.append("📈 *Standard Signals*")
+        for s in standard_signals:
+            lines.append(format_signal(s))
+        lines.append("")
+
+    # Non-signaled tickers (collapsed by category)
+    if non_signals:
+        lines.append("📌 *Watchlist (No Signal Today)*")
+        # Group by reason
+        reason_groups = {}
+        for ticker, reason in non_signals.items():
+            reason_groups.setdefault(reason, []).append(ticker)
+        for reason, tickers in reason_groups.items():
+            ticker_list = ", ".join(tickers)
+            lines.append(f"*{reason}*: {ticker_list}")
+        lines.append("")
+
     return "\n".join(lines)
 
-def categorize_reason(reason_str):
-    if reason_str is None:
-        return "Unknown", ""
-    reasons = [r.strip() for r in reason_str.split(",")]
-    primary = reasons[0] if reasons else ""
-    if "far from 50-MA" in primary:
-        category = "Far from 50‑MA"
-    elif "RSI out of buy range" in primary or "RSI too high" in primary:
-        category = "RSI out of buy range"
-    elif "not in lower half of VA" in primary:
-        category = "Not in lower half of VA"
-    elif "breakout no nearby LVN" in primary:
-        category = "No nearby LVN (breakout)"
-    elif "sell no nearby LVN" in primary:
-        category = "No nearby LVN (sell)"
-    elif "breakout R:R" in primary or "sell R:R" in primary or "risk/reward" in primary:
-        category = "Risk/reward too low"
-    elif "breakout but below 50-MA" in primary or "sell but above 50-MA" in primary:
-        category = "Trend filter (MA) fails"
-    elif "below VAL but RSI" in primary:
-        category = "RSI not in sell range"
-    elif "price not above VAH" in primary:
-        category = "Price not above VAH"
-    else:
-        category = "Other"
-    return category, primary
-
-def build_full_message(signals, no_signal_reasons):
-    parts = []
-    pead_signals = [s for s in signals if s.get('pead_tag')]
-    standard_signals = [s for s in signals if not s.get('pead_tag')]
-    if signals:
-        if pead_signals:
-            header = f"<b>🏆 VP_MA Scan – {len(pead_signals)} PEAD‑Enhanced signal(s)</b>"
-            parts.append(header)
-            for sig in pead_signals:
-                parts.append(format_signal_message(sig))
-            parts.append("")
-        if standard_signals:
-            header = f"<b>📊 VP_MA Scan – {len(standard_signals)} standard signal(s)</b>"
-            parts.append(header)
-            for sig in standard_signals:
-                parts.append(format_signal_message(sig))
-    else:
-        parts.append("<b>📊 VP_MA Scan – no signals found</b>")
-
-    if no_signal_reasons:
-        categories = {}
-        for ticker, reason in no_signal_reasons.items():
-            cat, primary = categorize_reason(reason)
-            categories.setdefault(cat, []).append(ticker)
-        lines = ["<b>⏳ Stocks without signals:</b>"]
-        for cat, tickers_list in sorted(categories.items()):
-            line = f"  • <b>{cat}</b>: {', '.join(tickers_list)}"
-            lines.append(line)
-        summary = ""
-        if "Far from 50‑MA" in categories:
-            summary += "📌 Stocks far from 50‑MA → wait for pullback to MA. "
-        if "RSI out of buy range" in categories or "RSI not in sell range" in categories:
-            summary += "📌 RSI out of range → wait for RSI to enter buy/sell zone. "
-        if "No nearby LVN" in categories:
-            summary += "📌 No LVN nearby → need a low volume gap for momentum. "
-        if "Risk/reward too low" in categories:
-            summary += "📌 Risk/reward low → wait for better entry. "
-        if "Not in lower half of VA" in categories:
-            summary += "📌 Price in upper VA → wait for pullback to support. "
-        if "Price not above VAH" in categories:
-            summary += "📌 Price below VAH → breakout not yet confirmed. "
-        if summary:
-            lines.append("")
-            lines.append(f"💡 <i>{summary}</i>")
-        parts.append("\n".join(lines))
-
-    return "\n\n".join(parts).strip()
-
-# ─── Main ───────────────────────────────────────────────────────
-
-def main():
-    creds_json = os.getenv('GCP_SERVICE_ACCOUNT_FILE')
-    if not creds_json:
-        print("❌ Environment variable GCP_SERVICE_ACCOUNT_FILE is missing")
-        sys.exit(1)
-    try:
-        creds_dict = json.loads(creds_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-        client = gspread.authorize(creds)
-        workbook = client.open(SHEET_NAME)
-        sheet = workbook.worksheet(WORKSHEET_NAME)
-        col_a = sheet.col_values(1)
-        tickers = [ticker.strip().upper() for ticker in col_a[1:] if ticker.strip()]
-        print(f"📋 Loaded {len(tickers)} tickers from Google Sheet '{SHEET_NAME}'")
-    except Exception as e:
-        print(f"❌ Google Sheets authentication or reading failed: {e}")
-        sys.exit(1)
+# ─── Main Scan ──────────────────────────────────────────────────────────────────
+def run_scan():
+    logger.info("Starting VP-MA Scan...")
+    tickers = get_watchlist()
     if not tickers:
-        print("⚠️ No tickers found in Google Sheet.")
-        sys.exit(0)
-
-    # ── Pre‑fetch earnings (with debug output) ───────────────
-    print("Fetching earnings surprises (debug mode ON)...")
-    earnings_data = {}
-    for ticker in tickers:
-        surp, days = get_earnings_surprise(ticker)
-        earnings_data[ticker] = (surp, days) if surp is not None else None
-        if surp is not None:
-            print(f"   {ticker}: surprise {surp:+.1f}% ({days}d ago)")
-        else:
-            print(f"   {ticker}: no valid surprise")
+        logger.error("No tickers loaded. Exiting.")
+        return
 
     all_signals = []
-    no_signal_reasons = {}
-    total = len(tickers)
-    for idx, ticker in enumerate(tickers, 1):
-        print(f"Scanning {ticker}... ({idx}/{total})")
-        ticker = ticker.upper().strip()
-        df = get_ticker_data(ticker)
-        if df is None or len(df) < 60:
-            print(f"   ⚠️  Insufficient data for {ticker}")
-            no_signal_reasons[ticker] = "insufficient data (<60 days)"
+    non_signals = {}
+
+    for ticker in tickers:
+        logger.info(f"Processing {ticker}...")
+        hist = fetch_data(ticker)
+        if hist is None:
+            non_signals[ticker] = "Data fetch failed"
             continue
-        signals, reason = detect_signals(ticker, df, earnings_data.get(ticker))
-        if signals:
-            all_signals.extend(signals)
-            for s in signals:
-                print(f"   ✅ {s['type']} on {ticker}")
+        sig = check_signal(ticker, hist)
+        if sig:
+            all_signals.append(sig)
         else:
-            if reason:
-                no_signal_reasons[ticker] = reason
-                print(f"   ❌ No signal – {reason[:100]}...")
-            else:
-                no_signal_reasons[ticker] = "unknown error"
+            reason = classify_non_signal(ticker, hist)
+            non_signals[ticker] = reason
 
-    print(f"\nDone. Found {len(all_signals)} signals, {len(no_signal_reasons)} non-signaled.")
+    # PEAD overlay
+    pead, standard = get_pead_enhanced_signals(all_signals)
 
-    full_msg = build_full_message(all_signals, no_signal_reasons)
-    chunk_size = 3800
-    if len(full_msg) <= chunk_size:
-        send_telegram(full_msg)
-    else:
-        paragraphs = full_msg.split("\n\n")
-        chunk = ""
-        for para in paragraphs:
-            if len(chunk) + len(para) + 2 > chunk_size:
-                send_telegram(chunk)
-                chunk = para
-            else:
-                chunk = (chunk + "\n\n" + para).strip()
-        if chunk:
-            send_telegram(chunk)
+    # Build and send message
+    msg = build_telegram_message(pead, standard, non_signals)
+    send_telegram_message(msg)
+    logger.info(f"Scan complete. {len(pead)} PEAD, {len(standard)} standard, {len(non_signals)} non-signals.")
 
+# ─── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+    run_scan()
