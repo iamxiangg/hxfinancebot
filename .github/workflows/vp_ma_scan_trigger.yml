@@ -24,18 +24,17 @@ jobs:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-hf-finbert-v1
 
-      - name: Install
+      - name: Install Dependencies
         run: |
           pip install --upgrade pip
           pip install yfinance pandas numpy requests lxml transformers
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      - name: Run
+      - name: Run VP_MA Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scanner_vp_ma_pro.py
