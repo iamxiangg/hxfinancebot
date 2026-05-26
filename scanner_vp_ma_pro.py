@@ -7,18 +7,19 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
-import google.auth
 from google.oauth2.service_account import Credentials
 import googleapiclient.discovery
 
 class UnifiedPositioningScanner:
     def __init__(self):
-        print("🚀 Initializing Quant Scanner & FinBERT Model...")
-        # Load NLP Brain
+        print("🚀 Initializing Quant Scanner...")
+        # NLP Setup
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
         
-        # Sector Benchmarks
+        # Configuration
+        self.SHEET_NAME = "Xiang Stock Analysis"
+        self.WORKSHEET_NAME = "Stock Summary USD"
         self.SECTOR_MAP = {
             'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
             'Consumer Cyclical': 'XLY', 'Communication Services': 'XLC', 'Industrials': 'XLI',
@@ -26,34 +27,39 @@ class UnifiedPositioningScanner:
             'Utilities': 'XLU', 'Basic Materials': 'XLB'
         }
         
-        # Env Variables
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        self._cached_sheet_id = None 
 
-    def get_google_sheets_client(self):
-        """Authenticates using raw JSON string (Old BTD Method)."""
+    def get_service(self, api_name, version):
         creds_json = os.getenv("GCP_SERVICE_ACCOUNT_FILE")
         if not creds_json:
             raise ValueError("Secret GCP_SERVICE_ACCOUNT_FILE is missing")
-        
-        try:
-            creds_dict = json.loads(creds_json)
-            # Standard V4 Sheets Scope
-            scopes = ['https://www.googleapis.com/auth/spreadsheets']
-            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-            return googleapiclient.discovery.build('sheets', 'v4', credentials=creds)
-        except Exception as e:
-            print(f"❌ Auth Failed: {e}")
-            raise
+        creds_dict = json.loads(creds_json)
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive.metadata.readonly'
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return googleapiclient.discovery.build(api_name, version, credentials=creds)
+
+    def find_sheet_id_by_name(self):
+        if self._cached_sheet_id: return self._cached_sheet_id
+        drive_service = self.get_service('drive', 'v3')
+        query = f"name = '{self.SHEET_NAME}' and mimeType = 'application/vnd.google-apps.spreadsheet'"
+        results = drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+        items = results.get('files', [])
+        if not items:
+            raise Exception(f"Spreadsheet '{self.SHEET_NAME}' not found. Check Service Account permissions.")
+        self._cached_sheet_id = items[0]['id']
+        return self._cached_sheet_id
 
     def fetch_tickers_from_sheet(self):
-        """Reads Column A from Sheet1"""
         try:
-            service = self.get_google_sheets_client()
-            result = service.spreadsheets().values().get(
-                spreadsheetId=self.sheet_id, range="Sheet1!A2:A"
-            ).execute()
+            sheet_id = self.find_sheet_id_by_name()
+            service = self.get_service('sheets', 'v4')
+            range_name = f"'{self.WORKSHEET_NAME}'!A2:A" # Column A contains Tickers
+            result = service.spreadsheets().values().get(spreadsheetId=sheet_id, range=range_name).execute()
             values = result.get('values', [])
             return [row[0].strip().upper() for row in values if row and row[0]]
         except Exception as e:
@@ -61,26 +67,28 @@ class UnifiedPositioningScanner:
             return []
 
     def write_scores_to_sheet(self, ticker, score, alpha):
-        """Updates Col B (Score), C (Alpha), D (Date)"""
+        """Updates AL (Score), AM (Alpha), AN (Date)"""
         try:
-            service = self.get_google_sheets_client()
-            result = service.spreadsheets().values().get(
-                spreadsheetId=self.sheet_id, range="Sheet1!A1:A"
-            ).execute()
+            sheet_id = self.find_sheet_id_by_name()
+            service = self.get_service('sheets', 'v4')
+            range_name = f"'{self.WORKSHEET_NAME}'!A:A"
+            result = service.spreadsheets().values().get(spreadsheetId=sheet_id, range=range_name).execute()
             rows = result.get('values', [])
             
             row_idx = next((i+1 for i, r in enumerate(rows) if r and r[0].strip().upper() == ticker), None)
-            if not row_idx: return
-
-            current_date = datetime.now().strftime("%Y-%m-%d")
-            values = [[round(score, 1), f"{alpha:+.2%}", current_date]]
-            service.spreadsheets().values().update(
-                spreadsheetId=self.sheet_id, 
-                range=f"Sheet1!B{row_idx}:D{row_idx}", 
-                valueInputOption="USER_ENTERED", 
-                body={'values': values}
-            ).execute()
-            print(f"✅ Saved {ticker} to row {row_idx}")
+            
+            if row_idx:
+                current_date = datetime.now().strftime("%Y-%m-%d")
+                values = [[round(score, 1), f"{alpha:+.2%}", current_date]]
+                # Mapping: AL=Col 38, AM=Col 39, AN=Col 40
+                target_range = f"'{self.WORKSHEET_NAME}'!AL{row_idx}:AN{row_idx}"
+                service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id, 
+                    range=target_range, 
+                    valueInputOption="USER_ENTERED", 
+                    body={'values': values}
+                ).execute()
+                print(f"💾 {ticker} metrics saved to row {row_idx} (AL:AN)")
         except Exception as e:
             print(f"❌ Save error for {ticker}: {e}")
 
@@ -122,6 +130,7 @@ class UnifiedPositioningScanner:
         tickers = self.fetch_tickers_from_sheet()
         for ticker in tickers:
             try:
+                print(f"🔍 Processing {ticker}...")
                 stock = yf.Ticker(ticker)
                 sector_etf = self.SECTOR_MAP.get(stock.info.get('sector'), 'SPY')
                 data = yf.download([ticker, sector_etf], period="1y", interval="1d", progress=False)['Adj Close']
