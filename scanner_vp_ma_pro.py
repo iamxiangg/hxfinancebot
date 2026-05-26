@@ -1,7 +1,7 @@
 import os
 import json
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -14,12 +14,12 @@ import googleapiclient.discovery
 
 class UnifiedPositioningScanner:
     def __init__(self):
-        # 1. Initialize Transformers for FinBERT Sentiment
         print("Initializing FinBERT Brain...")
+        # 1. Initialize Transformers for FinBERT Sentiment
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
         
-        # 2. Industry Standard SPDR Sector ETF Maps (Long-Term Base Benchmarks)
+        # 2. Industry Standard SPDR Sector ETF Maps (Long-Term Benchmarks)
         self.SECTOR_MAP = {
             'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
             'Consumer Cyclical': 'XLY', 'Communication Services': 'XLC', 'Industrials': 'XLI',
@@ -30,7 +30,7 @@ class UnifiedPositioningScanner:
         # 3. Environment Secrets Setup
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self.sheet_id = os.getenv("GOOGLE_SHEET_ID") # Set this in your GitHub Secrets
+        self.sheet_id = os.getenv("GOOGLE_SHEET_ID")
 
     def get_google_sheets_client(self):
         """Decodes the Base64 GCP Key string and authenticates Google Sheets API"""
@@ -38,7 +38,6 @@ class UnifiedPositioningScanner:
         if not encoded_json:
             raise ValueError("GCP Credentials missing from Environment Secrets.")
         
-        # Decode and load dictionary configuration
         decoded_json = base64.b64decode(encoded_json).decode('utf-8')
         creds_dict = json.loads(decoded_json)
         
@@ -57,7 +56,47 @@ class UnifiedPositioningScanner:
             return [row[0].strip() for row in values if row and row[0]]
         except Exception as e:
             print(f"Error accessing Google Sheet: {e}")
-            return ["NVDA", "AAPL", "MSFT"] # Fallback hardcoded defaults if testing
+            return [] # Returns an empty list safely if unauthorized
+
+    def write_scores_to_sheet(self, ticker_symbol, score, alpha):
+        """Finds the ticker row in Google Sheets and writes the calculated quant metrics"""
+        try:
+            service = self.get_google_sheets_client()
+            
+            # Fetch all current tickers in Column A to find the exact matching row index
+            result = service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id, range="Sheet1!A1:A"
+            ).execute()
+            rows = result.get('values', [])
+            
+            row_index = None
+            for idx, row in enumerate(rows):
+                if row and row[0].strip() == ticker_symbol:
+                    row_index = idx + 1  # Google Sheets is 1-indexed
+                    break
+            
+            if row_index is None:
+                print(f"⚠️ Could not find {ticker_symbol} in Google Sheet to update metrics.")
+                return
+
+            # Prepare payload: Score (Col B), Alpha % (Col C), Today's Date (Col D)
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            values = [[round(score, 1), f"{alpha:+.2%}", current_date]]
+            body = {'values': values}
+            
+            # Target range dynamically based on found row index (B{row}:D{row})
+            target_range = f"Sheet1!B{row_index}:D{row_index}"
+            
+            service.spreadsheets().values().update(
+                spreadsheetId=self.sheet_id, 
+                range=target_range, 
+                valueInputOption="USER_ENTERED", 
+                body=body
+            ).execute()
+            print(f"💾 Successfully saved {ticker_symbol} metrics to Sheet row {row_index}.")
+            
+        except Exception as e:
+            print(f"❌ Failed to write metrics to Google Sheet for {ticker_symbol}: {e}")
 
     def get_finbert_sentiment(self, headlines):
         """Runs batched inference across top news headers, extracting core bias"""
@@ -68,9 +107,9 @@ class UnifiedPositioningScanner:
             outputs = self.model(**inputs)
         predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
         
-        # Weight structure: Positive Alpha minus Negative Weight
+        # Weight structure: Positive score minus Negative score
         score = predictions[:, 0].mean().item() - predictions[:, 1].mean().item()
-        return (score + 1) / 2 # Normalized to standard 0.0 - 1.0 bounding scale
+        return (score + 1) / 2 # Normalized to standard 0.0 - 1.0 scale
 
     def calculate_volume_profile(self, df_slice):
         """Extracts point-of-control (POC) and value area markers out of input data"""
@@ -92,7 +131,6 @@ class UnifiedPositioningScanner:
         """Calculates earnings surprise performance and the explicit days elapsed"""
         try:
             calendar = stock_obj.get_calendar()
-            # Safety check: yfinance calendar dictionary structural verification
             if not calendar or 'Earnings Date' not in calendar:
                 return 0.0, 999
             
@@ -102,7 +140,6 @@ class UnifiedPositioningScanner:
                 
             days_spent = (datetime.now().date() - last_earnings).days
             
-            # Extract basic historical performance tracking metrics for evaluation
             earnings_history = stock_obj.get_earnings_history()
             surprise = 0.0
             if not earnings_history.empty and 'Surprise(%)' in earnings_history.columns:
@@ -110,13 +147,15 @@ class UnifiedPositioningScanner:
                 
             return float(surprise), int(days_spent)
         except:
-            return 0.0, 999 # Treat missing parameters neutrally
+            return 0.0, 999
 
     def send_telegram_alert(self, text):
         """Dispatches automated notifications directly to your custom Telegram instance"""
-        if not self.telegram_token or Lich := not self.telegram_chat_id:
+        # FIX: Corrected SyntaxError by separating boolean states entirely
+        if not self.telegram_token or not self.telegram_chat_id:
             print(text)
             return
+            
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         payload = {"chat_id": self.telegram_chat_id, "text": text, "parse_mode": "Markdown"}
         try:
@@ -127,6 +166,10 @@ class UnifiedPositioningScanner:
     def scan_pipeline(self):
         """Main orchestrator for evaluation pipelines"""
         tickers = self.fetch_tickers_from_sheet()
+        if not tickers:
+            print("No tickers found to scan. Exiting.")
+            return
+            
         print(f"Loaded {len(tickers)} assets for structural analysis...")
         
         for ticker in tickers:
@@ -150,16 +193,16 @@ class UnifiedPositioningScanner:
                 ma200 = float(prices[ticker].rolling(200).mean().iloc[-1])
                 regime_bullish = price > ma50 > ma200
                 
-                # 2. Sector Alpha Check (6-Month Rolling Return Variance)
+                # 2. Sector Alpha Check (6-Month Return vs Sector ETF)
                 stock_6m_ret = (prices[ticker].iloc[-1] / prices[ticker].iloc[-126]) - 1
                 sector_6m_ret = (prices[sector_etf].iloc[-1] / prices[sector_etf].iloc[-126]) - 1
                 alpha_score = stock_6m_ret - sector_6m_ret
                 
-                # 3. Dynamic Volume Profile Mapping Structs
+                # 3. Structural Volume Profiles
                 poc_252, _, _ = self.calculate_volume_profile(hist_ticker)
                 poc_65, val_65, vah_65 = self.calculate_volume_profile(hist_ticker.tail(65))
                 
-                # 4. Fundamental PEAD Window Profiling
+                # 4. Fundamental PEAD Profiling
                 surprise, days_since_earnings = self.get_pead_metrics(stock)
                 
                 # 5. Natural Language Processing (NLP Insight Scoring via FinBERT)
@@ -168,19 +211,22 @@ class UnifiedPositioningScanner:
                 
                 # --- FACTOR MATRIX SCORING ENGINE ---
                 score = 0.0
-                if alpha_score > 0:       score += 3.0  # Heavy weight on core leadership variance
-                if regime_bullish:        score += 3.0  # Heavy structural trend alignment
-                if price > vah_65:        score += 2.0  # Momentum inside active trading quarter
-                if sentiment > 0.65:      score += 2.0  # Positive narrative validation
+                if alpha_score > 0:       score += 3.0  
+                if regime_bullish:        score += 3.0  
+                if price > vah_65:        score += 2.0  
+                if sentiment > 0.65:      score += 2.0  
                 
-                # PEAD Window Optimization: Decay score if past optimal 45-day cycle
+                # PEAD Window Decay/Bonus Logic
                 pead_active = (0 < days_since_earnings <= 45) and (surprise >= 2.0)
                 if pead_active:
-                    score = min(score + 1.0, 10.0) # Bonus for ongoing structural fuel drift
+                    score = min(score + 1.0, 10.0) 
                 elif days_since_earnings > 60:
-                    score = max(score - 1.0, 0.0)  # Moderate decay penalty if trigger state is stale
+                    score = max(score - 1.0, 0.0)  
 
-                # --- DISPATCH TRADING ALERTS ---
+                # --- ALWAYS WRITE RESULTS TO GOOGLE SHEET ---
+                self.write_scores_to_sheet(ticker, score, alpha_score)
+
+                # --- DISPATCH TELEGRAM ALERT IF CONVICTION MEETS THRESHOLD ---
                 if score >= 7.5:
                     alert_msg = (
                         f"💎 *LONG-TERM ALPHA: {ticker}*\n"
@@ -195,7 +241,7 @@ class UnifiedPositioningScanner:
                     self.send_telegram_alert(alert_msg)
                     
             except Exception as e:
-                print(f"Skipping evaluation lifecycle loop execution pass for {ticker}: {e}")
+                print(f"Skipping evaluation loop execution for {ticker}: {e}")
 
 if __name__ == "__main__":
     scanner = UnifiedPositioningScanner()
