@@ -83,7 +83,7 @@ class NeoQuantScannerPro:
         with torch.no_grad():
             outputs = self.model(**inputs)
         probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        return probs[:, 0].mean().item() # Positive class probability
+        return probs[:, 0].mean().item()
 
     def get_pead_metrics(self, stock_obj):
         try:
@@ -117,7 +117,7 @@ class NeoQuantScannerPro:
     def run(self):
         self.init_sheet_mapping()
         tickers = list(self._ticker_row_map.keys())
-        all_updates, t1, t2, t3 = {}, [], [], []
+        all_updates, t1, t2, t3, neutral = {}, [], [], [], []
 
         for ticker in tickers:
             if ticker in ["TICKER", "SYMBOL"]: continue
@@ -126,27 +126,24 @@ class NeoQuantScannerPro:
                 stock = yf.Ticker(ticker)
                 sector_etf = self.SECTOR_MAP.get(stock.info.get('sector'), 'SPY')
                 
-                # Fetch Data (MultiIndex Handling)
                 data = yf.download([ticker, sector_etf], period="1y", auto_adjust=True, progress=False)
                 if data.empty: continue
                 
-                # Align series for Alpha
                 lvl = 1 if data.columns.nlevels > 1 else 0
                 t_prices = data['Close'][ticker].dropna() if lvl else data['Close'].dropna()
                 s_prices = data['Close'][sector_etf].dropna() if lvl else data['Close'].dropna()
                 
-                combined = pd.concat([t_prices, s_prices], axis=1).dropna()
+                combined = pd.concat([t_prices, s_prices], axis=1, sort=True).dropna()
                 if len(combined) < 20: continue
 
-                # Quant Metrics
                 px, m50, m200 = t_prices.iloc[-1], t_prices.rolling(50).mean().iloc[-1], t_prices.rolling(200).mean().iloc[-1]
                 bull = (px > m50 > m200) if not pd.isna(m200) else False
-                alpha = (combined.iloc[-1,0]/combined.iloc[-126 if len(combined)>126 else 0,0]) - \
-                        (combined.iloc[-1,1]/combined.iloc[-126 if len(combined)>126 else 0,1])
+                
+                lookback = min(126, len(combined)-1)
+                alpha = (combined.iloc[-1,0]/combined.iloc[-lookback,0]) - (combined.iloc[-1,1]/combined.iloc[-lookback,1])
 
                 poc, vah = self.calculate_vp_nuanced(stock.history(period="1y").tail(65))
                 
-                # Sentiment (Resilient Keys)
                 news = stock.news[:5] if stock.news else []
                 headlines = [n.get('title') or n.get('headline') or n.get('content',{}).get('title') for n in news]
                 sent = self.get_sentiment([h for h in headlines if h])
@@ -157,35 +154,49 @@ class NeoQuantScannerPro:
                 if 0 < days <= 45 and surp >= 2: score = min(score + 1, 10)
                 elif days > 60: score = max(score - 1, 0)
 
-                # Store Results
                 all_updates[ticker] = [round(score, 1), f"{alpha:+.2%}", datetime.now().strftime("%Y-%m-%d")]
-                item = {"ticker": ticker, "score": score, "alpha": alpha, "floor": poc, "sent": sent}
+                
+                item = {
+                    "ticker": ticker, 
+                    "score": score, 
+                    "alpha": alpha, 
+                    "px": px, 
+                    "vah": vah, 
+                    "floor": poc, 
+                    "sent": sent,
+                    "target": px * 1.20 # Placeholder: standard +20% system profit target
+                }
                 
                 if score >= 7.5: t1.append(item)
                 elif 6.0 <= score < 7.5: t2.append(item)
-                elif score <= 1.0: t3.append(item)
+                elif 0.1 <= score < 6.0: neutral.append(item)
+                else: t3.append(item)
 
                 time.sleep(0.5) 
             except Exception as e:
                 logging.error(f"Error {ticker}: {e}")
 
         self.batch_write_results(all_updates)
-        self.send_report(t1, t2, t3)
+        self.send_report(t1, t2, neutral, t3)
 
-    def send_report(self, t1, t2, t3):
+    def send_report(self, t1, t2, neutral, t3):
         msg = f"<b>🚀 NEO QUANT PRO REPORT - {datetime.now().strftime('%Y-%m-%d')}</b>\n\n"
         
-        msg += "<b>🔥 TIER 1: ACTIONABLE BUYS (Sync High)</b>\n"
+        msg += "<b>🔥 TIER 1: ACTIONABLE BUYS (In Play)</b>\n"
         if not t1: msg += "<i>No high-conviction setups</i>\n"
         for i in t1:
-            msg += f"• <b>{i['ticker']}</b> (Score: {i['score']:.1f})\n"
-            msg += f"  Alpha: {i['alpha']:+.1%} | Floor: ${i['floor']:.2f} | Sent: {i['sent']:.2f}\n"
+            msg += f"• <b>{i['ticker']}</b> | Price: <b>${i['px']:.2f}</b> | 🛡️ <b>Stop: ${i['floor']:.2f}</b> | 🎯 <b>Target: ${i['target']:.2f}</b>\n"
 
-        msg += "\n<b>👀 TIER 2: HIGH-ALPHA WATCH</b>\n"
-        for i in t2: msg += f"• {i['ticker']} ({i['score']:.1f}) | Alpha: {i['alpha']:+.1%}\n"
+        msg += "\n<b>👀 TIER 2: HIGH-ALPHA WATCH (Set Alerts)</b>\n"
+        if not t2: msg += "<i>Empty</i>\n"
+        for i in t2:
+            msg += f"• <b>{i['ticker']}</b> ({i['score']:.1f}) | Price: ${i['px']:.2f} | 🚀 <b>Trigger: &gt;${i['vah']:.2f}</b>\n"
 
-        msg += "\n<b>⚠️ TIER 3: TRAPS & LAGGARDS</b>\n"
-        for i in t3: msg += f"• {i['ticker']} ({i['score']:.1f}) - Avoid\n"
+        msg += "\n<b>💤 NEUTRAL / ⚠️ TRAPS</b>\n"
+        no_trade = [i['ticker'] for i in neutral[:5]] + [i['ticker'] for i in t3[:5]]
+        msg += f"• " + " | ".join(no_trade) + "\n"
+        
+        msg += "\n<i>💡 Strategy: Tier 1 = Manage Risk. Tier 2 = Wait for Breakout Trigger.</i>"
 
         self.send_telegram(msg)
 
