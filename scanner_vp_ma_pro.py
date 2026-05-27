@@ -12,12 +12,12 @@ import torch
 from google.oauth2.service_account import Credentials
 import googleapiclient.discovery
 
-# Setup Logging to monitor CI/CD execution pipeline
+# Setup Logging to monitor execution pipeline
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class NeoQuantScannerPro:
     def __init__(self):
-        logging.info("🚀 Initializing Final Neo Quant Scanner Pro...")
+        logging.info("🚀 Initializing Final Neo Quant Scanner Pro with Breakout Memory...")
         # NLP Engine Initialization (FinBERT Transformer model)
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
@@ -142,7 +142,6 @@ class NeoQuantScannerPro:
                 t_prices = data['Close'][ticker].dropna() if lvl else data['Close'].dropna()
                 s_prices = data['Close'][sector_etf].dropna() if lvl else data['Close'].dropna()
                 
-                # Mitigate deprecated Pandas sorting mechanics (Pandas 4 specification warning patch)
                 combined = pd.concat([t_prices, s_prices], axis=1, sort=True).dropna()
                 if len(combined) < 20: continue
 
@@ -152,8 +151,14 @@ class NeoQuantScannerPro:
                 m200 = t_prices.rolling(200).mean().iloc[-1]
                 bull = (px > m50 > m200) if not pd.isna(m200) else False
                 
-                # The Trigger Patch: Calculate local rolling resistance to form an actionable breakout ceiling
-                resistance_20d = float(hist_1y['High'].tail(20).max())
+                # --- MEMORY-MAPPED BREAKOUT CALCULATION ---
+                # 1. Establish clean historical resistance prior to the active 3-day window
+                historical_base = hist_1y['High'].iloc[-23:-3]
+                resistance_20d = float(historical_base.max()) if not historical_base.empty else px
+                
+                # 2. Check if a breakout state occurred at any point within the last 3 sessions
+                recent_closes = hist_1y['Close'].tail(3)
+                broke_out_recently = any(close > resistance_20d for close in recent_closes)
                 
                 # Relative Performance Generation (Alpha vs Sector Engine)
                 lookback = min(126, len(combined)-1)
@@ -167,18 +172,32 @@ class NeoQuantScannerPro:
                 headlines = [n.get('title') or n.get('headline') or n.get('content',{}).get('title') for n in news]
                 sent = self.get_sentiment([h for h in headlines if h])
 
-                # Unified Scoring Matrix Engine Configuration
+                # Base Scoring Matrix Engine Configuration
                 score = (3.0 if alpha > 0 else 0) + (3.0 if bull else 0) + (2.0 if px > vah else 0) + (2.0 if sent > 0.60 else 0)
                 surp, days = self.get_pead_metrics(stock)
                 if 0 < days <= 45 and surp >= 2: score = min(score + 1, 10)
                 elif days > 60: score = max(score - 1, 0)
 
+                # 3. Dynamic Breakout Memory Bonus Assignment
+                is_breaking_out = False
+                if not np.isnan(resistance_20d):
+                    if px > resistance_20d:
+                        score = min(score + 1.0, 10.0)
+                        is_breaking_out = True
+                    elif broke_out_recently and px > (poc * 1.02):
+                        # Retains the breakout status bonus if pulling back or flagging above the volume floor
+                        score = min(score + 1.0, 10.0)
+                        is_breaking_out = True
+
                 # Queue Google Spreadsheet Synchronization Payloads
                 all_updates[ticker] = [round(score, 1), f"{alpha:+.2%}", datetime.now().strftime("%Y-%m-%d")]
                 
-                # Dynamic Structural Evaluation Logic
-                # If price is extended greater than 5% past the institutional accumulation shelf, label as Extended.
-                if px > (poc * 1.05):
+                # Dynamic Operational Status Assignment
+                if is_breaking_out and px >= resistance_20d:
+                    status = "🔥 BREAKOUT ACTIVE (Day 1 Entry Signal)"
+                elif is_breaking_out and px < resistance_20d:
+                    status = "🚀 MOMENTUM HOLD (Broke Out Recently / Holding Gains)"
+                elif px > (poc * 1.05):
                     status = "EXTENDED (Wait for Pullback / Tight Flag)"
                 else:
                     status = "COILING (Watch Breakout Target)"
@@ -189,7 +208,7 @@ class NeoQuantScannerPro:
                     "target": px * 1.20  # Standard risk-ratio benchmark target mapping
                 }
                 
-                # Tier Threshold Segregation
+                # Tier Threshold Segregation (Now dynamically promoted via the memory score bonus)
                 if score >= 7.5: t1.append(item)
                 elif 6.0 <= score < 7.5: t2.append(item)
                 elif 0.1 <= score < 6.0: neutral.append(item)
@@ -204,7 +223,7 @@ class NeoQuantScannerPro:
         self.batch_write_results(all_updates)
         self.send_report(t1, t2, neutral, t3)
 
-    # --- REPORT CONSTRUTION & DELIVERY ---
+    # --- REPORT CONSTRUCTION & DELIVERY ---
     def send_report(self, t1, t2, neutral, t3):
         msg = f"<b>🚀 NEO QUANT PRO REPORT - {datetime.now().strftime('%Y-%m-%d')}</b>\n\n"
         
@@ -212,6 +231,8 @@ class NeoQuantScannerPro:
         msg += "<b>🔥 TIER 1: ACTIONABLE BUYS (In Play)</b>\n"
         if not t1: msg += "<i>No high-conviction setups discovered</i>\n"
         for i in t1:
+            # Handles different status scenarios for Tier 1 items
+            status_tag = "Breakout Confirmed" if "BREAKOUT" in i['status'] or "MOMENTUM" in i['status'] else "Trend Confirmed"
             msg += f"• <b>{i['ticker']}</b> | Price: <b>${i['px']:.2f}</b> | 🛡️ Support (PoC): ${i['poc']:.2f} | 🎯 Target: ${i['target']:.2f}\n"
 
         # TIER 2 OUTBOUND STRUCTURAL RENDERING
