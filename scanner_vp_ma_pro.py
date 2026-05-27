@@ -2,7 +2,6 @@ import os
 import json
 import time
 import requests
-import re
 import logging
 from datetime import datetime
 import yfinance as yf
@@ -13,17 +12,17 @@ import torch
 from google.oauth2.service_account import Credentials
 import googleapiclient.discovery
 
-# Setup Logging
+# Setup Logging to monitor CI/CD execution pipeline
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class NeoQuantScannerPro:
     def __init__(self):
         logging.info("🚀 Initializing Final Neo Quant Scanner Pro...")
-        # NLP Initialization
+        # NLP Engine Initialization (FinBERT Transformer model)
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
         
-        # Configuration
+        # Configuration & Environment Matrix
         self.SHEET_NAME = "Xiang Stock Analysis"
         self.WORKSHEET_NAME = "Stock Summary USD"
         self.SECTOR_MAP = {
@@ -46,12 +45,12 @@ class NeoQuantScannerPro:
         return googleapiclient.discovery.build(api_name, version, credentials=creds)
 
     def init_sheet_mapping(self):
-        """Builds a map of Ticker -> Row Index at startup."""
+        """Builds a flat index map of Ticker -> Spreadsheet Row Index at execution startup."""
         try:
             drive_service = self.get_service('drive', 'v3')
             query = f"name = '{self.SHEET_NAME}' and mimeType = 'application/vnd.google-apps.spreadsheet'"
             results = drive_service.files().list(q=query, fields='files(id)').execute()
-            if not results.get('files'): raise Exception("Spreadsheet not found.")
+            if not results.get('files'): raise Exception("Spreadsheet file targets not found.")
             self._sheet_id = results['files'][0]['id']
 
             service = self.get_service('sheets', 'v4')
@@ -61,10 +60,11 @@ class NeoQuantScannerPro:
             for i, row in enumerate(rows):
                 if row: self._ticker_row_map[row[0].strip().upper()] = i + 1
         except Exception as e:
-            logging.error(f"Failed to map sheet: {e}")
+            logging.error(f"Failed to cleanly build Google Sheet row index map: {e}")
             raise
 
     def batch_write_results(self, update_data):
+        """Pushes computed metrics to Google Sheets using a single batch payload."""
         if not update_data: return
         try:
             service = self.get_service('sheets', 'v4')
@@ -73,11 +73,11 @@ class NeoQuantScannerPro:
             body = {'valueInputOption': 'USER_ENTERED', 'data': data}
             service.spreadsheets().values().batchUpdate(spreadsheetId=self._sheet_id, body=body).execute()
         except Exception as e:
-            logging.error(f"Batch write failed: {e}")
+            logging.error(f"Batch payload database write failed: {e}")
 
-    # --- QUANT & NLP LOGIC ---
+    # --- QUANT & NLP ENGINE LOGIC ---
     def get_sentiment(self, headlines):
-        """Uses Positive Class Probability (Index 0) for cleaner bullish signal."""
+        """Calculates positive probability distribution scores over aggregated public news items."""
         if not headlines: return 0.5
         inputs = self.tokenizer(headlines, padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
@@ -86,6 +86,7 @@ class NeoQuantScannerPro:
         return probs[:, 0].mean().item()
 
     def get_pead_metrics(self, stock_obj):
+        """Calculates Post-Earnings Announcement Drift window and surprises."""
         try:
             cal = stock_obj.get_calendar()
             e_date = pd.to_datetime(cal['Earnings Date'][0])
@@ -96,7 +97,7 @@ class NeoQuantScannerPro:
         except: return 0.0, 999
 
     def calculate_vp_nuanced(self, df):
-        """Returns PoC and Value Area High (VAH) for breakout detection."""
+        """Calculates Point of Control (PoC) and Value Area High (VAH) over volume distributions."""
         if df.empty: return 0, 0
         bins = pd.cut(df['Close'], bins=30)
         vol_prof = df.groupby(bins, observed=False)['Volume'].sum()
@@ -106,14 +107,18 @@ class NeoQuantScannerPro:
         
         poc = vol_prof.idxmax().mid
         vah = va.index.max().right if not va.empty else poc
-        return poc, vah
+        return float(poc), float(vah)
 
     def send_telegram(self, html_text):
+        """Transmits fully structured HTML alerts directly into your Telegram channel."""
         if not self.telegram_token: return
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        requests.post(url, json={"chat_id": self.telegram_chat_id, "text": html_text, "parse_mode": "HTML"}, timeout=10)
+        try:
+            requests.post(url, json={"chat_id": self.telegram_chat_id, "text": html_text, "parse_mode": "HTML"}, timeout=10)
+        except Exception as e:
+            logging.error(f"Telegram broadcast gateway connection timed out: {e}")
 
-    # --- CORE RUNNER ---
+    # --- MAIN SCANNER DISPATCH ROUTINE ---
     def run(self):
         self.init_sheet_mapping()
         tickers = list(self._ticker_row_map.keys())
@@ -126,6 +131,10 @@ class NeoQuantScannerPro:
                 stock = yf.Ticker(ticker)
                 sector_etf = self.SECTOR_MAP.get(stock.info.get('sector'), 'SPY')
                 
+                # Structural Price Horizon Data
+                hist_1y = stock.history(period="1y")
+                if hist_1y.empty: continue
+                
                 data = yf.download([ticker, sector_etf], period="1y", auto_adjust=True, progress=False)
                 if data.empty: continue
                 
@@ -133,70 +142,95 @@ class NeoQuantScannerPro:
                 t_prices = data['Close'][ticker].dropna() if lvl else data['Close'].dropna()
                 s_prices = data['Close'][sector_etf].dropna() if lvl else data['Close'].dropna()
                 
+                # Mitigate deprecated Pandas sorting mechanics (Pandas 4 specification warning patch)
                 combined = pd.concat([t_prices, s_prices], axis=1, sort=True).dropna()
                 if len(combined) < 20: continue
 
-                px, m50, m200 = t_prices.iloc[-1], t_prices.rolling(50).mean().iloc[-1], t_prices.rolling(200).mean().iloc[-1]
+                # Core Technical Aggregates
+                px = float(t_prices.iloc[-1])
+                m50 = t_prices.rolling(50).mean().iloc[-1]
+                m200 = t_prices.rolling(200).mean().iloc[-1]
                 bull = (px > m50 > m200) if not pd.isna(m200) else False
                 
+                # The Trigger Patch: Calculate local rolling resistance to form an actionable breakout ceiling
+                resistance_20d = float(hist_1y['High'].tail(20).max())
+                
+                # Relative Performance Generation (Alpha vs Sector Engine)
                 lookback = min(126, len(combined)-1)
                 alpha = (combined.iloc[-1,0]/combined.iloc[-lookback,0]) - (combined.iloc[-1,1]/combined.iloc[-lookback,1])
 
-                poc, vah = self.calculate_vp_nuanced(stock.history(period="1y").tail(65))
+                # Institutional Volume Profile Profile Generation (65 Trading Days)
+                poc, vah = self.calculate_vp_nuanced(hist_1y.tail(65))
                 
+                # Natural Language News Ingest Framework
                 news = stock.news[:5] if stock.news else []
                 headlines = [n.get('title') or n.get('headline') or n.get('content',{}).get('title') for n in news]
                 sent = self.get_sentiment([h for h in headlines if h])
 
-                # Scoring Engine
+                # Unified Scoring Matrix Engine Configuration
                 score = (3.0 if alpha > 0 else 0) + (3.0 if bull else 0) + (2.0 if px > vah else 0) + (2.0 if sent > 0.60 else 0)
                 surp, days = self.get_pead_metrics(stock)
                 if 0 < days <= 45 and surp >= 2: score = min(score + 1, 10)
                 elif days > 60: score = max(score - 1, 0)
 
+                # Queue Google Spreadsheet Synchronization Payloads
                 all_updates[ticker] = [round(score, 1), f"{alpha:+.2%}", datetime.now().strftime("%Y-%m-%d")]
                 
+                # Dynamic Structural Evaluation Logic
+                # If price is extended greater than 5% past the institutional accumulation shelf, label as Extended.
+                if px > (poc * 1.05):
+                    status = "EXTENDED (Wait for Pullback / Tight Flag)"
+                else:
+                    status = "COILING (Watch Breakout Target)"
+
                 item = {
-                    "ticker": ticker, 
-                    "score": score, 
-                    "alpha": alpha, 
-                    "px": px, 
-                    "vah": vah, 
-                    "floor": poc, 
-                    "sent": sent,
-                    "target": px * 1.20 # Placeholder: standard +20% system profit target
+                    "ticker": ticker, "score": score, "alpha": alpha, 
+                    "px": px, "poc": poc, "resistance": resistance_20d, "status": status,
+                    "target": px * 1.20  # Standard risk-ratio benchmark target mapping
                 }
                 
+                # Tier Threshold Segregation
                 if score >= 7.5: t1.append(item)
                 elif 6.0 <= score < 7.5: t2.append(item)
                 elif 0.1 <= score < 6.0: neutral.append(item)
                 else: t3.append(item)
 
+                # Rate limiter to safely navigate high-throughput pipeline restrictions
                 time.sleep(0.5) 
             except Exception as e:
-                logging.error(f"Error {ticker}: {e}")
+                logging.error(f"Processing error context on tracker asset allocation {ticker}: {e}")
 
+        # Final Execution Outputs
         self.batch_write_results(all_updates)
         self.send_report(t1, t2, neutral, t3)
 
+    # --- REPORT CONSTRUTION & DELIVERY ---
     def send_report(self, t1, t2, neutral, t3):
         msg = f"<b>🚀 NEO QUANT PRO REPORT - {datetime.now().strftime('%Y-%m-%d')}</b>\n\n"
         
+        # TIER 1 OUTBOUND RENDERING
         msg += "<b>🔥 TIER 1: ACTIONABLE BUYS (In Play)</b>\n"
-        if not t1: msg += "<i>No high-conviction setups</i>\n"
+        if not t1: msg += "<i>No high-conviction setups discovered</i>\n"
         for i in t1:
-            msg += f"• <b>{i['ticker']}</b> | Price: <b>${i['px']:.2f}</b> | 🛡️ <b>Stop: ${i['floor']:.2f}</b> | 🎯 <b>Target: ${i['target']:.2f}</b>\n"
+            msg += f"• <b>{i['ticker']}</b> | Price: <b>${i['px']:.2f}</b> | 🛡️ Support (PoC): ${i['poc']:.2f} | 🎯 Target: ${i['target']:.2f}\n"
 
-        msg += "\n<b>👀 TIER 2: HIGH-ALPHA WATCH (Set Alerts)</b>\n"
+        # TIER 2 OUTBOUND STRUCTURAL RENDERING
+        msg += "\n<b>👀 TIER 2: HIGH-ALPHA WATCH (Tactical Setups)</b>\n"
         if not t2: msg += "<i>Empty</i>\n"
         for i in t2:
-            msg += f"• <b>{i['ticker']}</b> ({i['score']:.1f}) | Price: ${i['px']:.2f} | 🚀 <b>Trigger: &gt;${i['vah']:.2f}</b>\n"
+            msg += f"• <b>{i['ticker']}</b> ({i['score']:.1f}) | Price: ${i['px']:.2f}\n"
+            msg += f"  🛡️ Support (PoC): ${i['poc']:.2f} | 🚀 Breakout Target: &gt;${i['resistance']:.2f}\n"
+            msg += f"  📊 Status: <i>{i['status']}</i>\n\n"
 
-        msg += "\n<b>💤 NEUTRAL / ⚠️ TRAPS</b>\n"
-        no_trade = [i['ticker'] for i in neutral[:5]] + [i['ticker'] for i in t3[:5]]
-        msg += f"• " + " | ".join(no_trade) + "\n"
-        
-        msg += "\n<i>💡 Strategy: Tier 1 = Manage Risk. Tier 2 = Wait for Breakout Trigger.</i>"
+        # COMPACT NO-TRADE LOGGING OVER NEUTRAL AND TRAP BUCKETS
+        msg += "<b>💤 NEUTRAL / ⚠️ TRAPS (No-Allocation Zone)</b>\n"
+        no_trade = [i['ticker'] for i in neutral[:8]] + [i['ticker'] for i in t3[:8]]
+        if no_trade:
+            msg += f"• " + " | ".join(no_trade) + "\n"
+        else:
+            msg += "<i>Empty</i>\n"
+            
+        msg += "\n<i>💡 Strategy Architecture: Tier 1 = Manage Implemented Trade Risk. Tier 2 = Place Pending Alert Targets on Breakout.</i>"
 
         self.send_telegram(msg)
 
