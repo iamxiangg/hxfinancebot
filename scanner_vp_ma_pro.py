@@ -5,6 +5,7 @@ import random
 import requests
 import logging
 import threading
+import html
 from datetime import datetime
 import yfinance as yf
 import pandas as pd
@@ -13,7 +14,7 @@ from google.oauth2.service_account import Credentials
 import googleapiclient.discovery
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── NLP IMPORTS ──
+# ── MACHINE LEARNING NLP DEPENDENCY CHECK ──
 try:
     from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
     HAS_TRANSFORMERS = True
@@ -24,234 +25,309 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class NeoQuantScannerPro:
     def __init__(self):
-        logging.info("🚀 Deploying Hardened Production Neo Quant Scanner Pro (v4.5 - Anti-Bot Safeguards)...")
+        logging.info("🚀 Deploying Hardened Production Neo Quant Scanner Pro (v4.5-RC1)...")
         
         self.SHEET_NAME = "Xiang Stock Analysis"
         self.WORKSHEET_NAME = "Stock Summary USD"
+        self.CACHE_FILE = "vp_cache.json"
+        
         self.SECTOR_MAP = {
             'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
             'Consumer Cyclical': 'XLY', 'Communication Services': 'XLC', 'Industrials': 'XLI',
             'Consumer Defensive': 'XLP', 'Energy': 'XLE', 'Real Estate': 'XLRE',
             'Utilities': 'XLU', 'Basic Materials': 'XLB'
         }
+        
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self._sheet_id = None
         self._ticker_row_map = {}
         self._nlp_lock = threading.Lock()
 
-        # ── HARDENED NETWORK SESSION CONFIGURATION ──
+        # ── CONFIGURABLE ENGINE THROUGHPUT TUNING ──
+        self.MAX_WORKERS = 6
+        self.THROTTLE_MIN = 0.1
+        self.THROTTLE_MAX = 0.4
+
+        # Load Local Volume Profile Caching
+        self.vp_cache = {}
+        if os.path.exists(self.CACHE_FILE):
+            try:
+                with open(self.CACHE_FILE, 'r') as f:
+                    self.vp_cache = json.load(f)
+                logging.info(f"💾 Loaded cached volume profiles for {len(self.vp_cache)} assets.")
+            except Exception as e:
+                logging.warning(f"⚠️ Cache read error, resetting profile register: {e}")
+
+        # Hardened Network Frame
         self.custom_session = requests.Session()
         self.custom_session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive"
         })
 
-        # ── INITIALIZE FINBERT ──
         if HAS_TRANSFORMERS:
             try:
                 logging.info("🧠 Initializing FinBERT Sentiment Architecture...")
                 tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
                 model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
                 self.nlp_engine = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
+                logging.info("✅ FinBERT Core Loaded Successfully.")
             except Exception as e:
-                logging.error(f"FinBERT initialization failed: {e}")
+                logging.error(f"❌ FinBERT initialization failed: {e}")
                 self.nlp_engine = None
         else:
+            logging.warning("⚠️ Transformers not detected. Running NLP-disabled baseline mode.")
             self.nlp_engine = None
 
-    # ───────────────────────────────────────────────
-    # GOOGLE SHEETS PERSISTENCE
-    # ───────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # PRODUCTION CORE INTERFACES & PRE-FLIGHT
+    # ─────────────────────────────────────────────────────────────────────────
+    def pre_flight_validation(self):
+        """Rule G: Enforces absolute validation constraints before launching scan cycles."""
+        missing = []
+        if not os.getenv("GCP_SERVICE_ACCOUNT_FILE"): missing.append("GCP_SERVICE_ACCOUNT_FILE")
+        if not self.telegram_token: missing.append("TELEGRAM_BOT_TOKEN")
+        if not self.telegram_chat_id: missing.append("TELEGRAM_CHAT_ID")
+        if missing:
+            raise SystemExit(f"🚨 CRITICAL BOOT ERROR: Missing environment configurations: {', '.join(missing)}")
+        logging.info("🎯 Pre-Flight Core Checks Passed. Initiating connection protocols.")
+
     def get_service(self, api_name, version):
         creds_json = os.getenv("GCP_SERVICE_ACCOUNT_FILE")
         creds_dict = json.loads(creds_json)
         creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/spreadsheets',
-                    'https://www.googleapis.com/auth/drive.metadata.readonly']
+            creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.metadata.readonly']
         )
         return googleapiclient.discovery.build(api_name, version, credentials=creds)
 
     def init_sheet_mapping(self):
+        """Rule D: Discovers grid row structures with runtime testing pipeline overrides."""
+        test_tickers = os.getenv("TEST_TICKERS")
+        if test_tickers:
+            logging.info(f"🧪 TEST MODE ENABLED: Filtering scan solely for: {test_tickers}")
+            for i, t in enumerate(test_tickers.split(','), start=2):
+                self._ticker_row_map[t.strip().upper().replace('.', '-')] = i
+            return
+
         try:
             drive_service = self.get_service('drive', 'v3')
             query = f"name = '{self.SHEET_NAME}' and mimeType = 'application/vnd.google-apps.spreadsheet'"
             results = drive_service.files().list(q=query, fields='files(id)').execute()
             if not results.get('files'):
-                raise Exception("Spreadsheet file targets not found.")
+                raise Exception(f"Google Sheet named '{self.SHEET_NAME}' was not located.")
             self._sheet_id = results['files'][0]['id']
 
             service = self.get_service('sheets', 'v4')
             result = service.spreadsheets().values().get(
-                spreadsheetId=self._sheet_id,
-                range=f"'{self.WORKSHEET_NAME}'!A:A"
+                spreadsheetId=self._sheet_id, range=f"'{self.WORKSHEET_NAME}'!A:A"
             ).execute()
             rows = result.get('values', [])
             for i, row in enumerate(rows):
                 if row and row[0]:
                     clean_ticker = row[0].strip().upper().replace('.', '-')
-                    self._ticker_row_map[clean_ticker] = i + 1
+                    if clean_ticker not in ["TICKER", "SYMBOL"]:
+                        self._ticker_row_map[clean_ticker] = i + 1
+            logging.info(f"📋 Mapped {len(self._ticker_row_map)} live tickers directly from sheet definitions.")
         except Exception as e:
-            logging.error(f"Failed to build sheet row map: {e}")
+            logging.error(f"❌ Failed initializing sheet layout architecture: {e}")
             raise
 
     def batch_write_results(self, update_data):
-        if not update_data:
-            return
+        if not update_data or not self._sheet_id: return
         try:
             service = self.get_service('sheets', 'v4')
             data = [
-                {
-                    'range': f"'{self.WORKSHEET_NAME}'!AL{self._ticker_row_map[t]}:AN{self._ticker_row_map[t]}",
-                    'values': [v]
-                }
+                {'range': f"'{self.WORKSHEET_NAME}'!AL{self._ticker_row_map[t]}:AN{self._ticker_row_map[t]}", 'values': [v]}
                 for t, v in update_data.items() if t in self._ticker_row_map
             ]
             for i in range(0, len(data), 100):
-                chunk = data[i:i+100]
-                body = {'valueInputOption': 'USER_ENTERED', 'data': chunk}
-                service.spreadsheets().values().batchUpdate(
-                    spreadsheetId=self._sheet_id, body=body
-                ).execute()
+                body = {'valueInputOption': 'USER_ENTERED', 'data': data[i:i+100]}
+                service.spreadsheets().values().batchUpdate(spreadsheetId=self._sheet_id, body=body).execute()
         except Exception as e:
-            logging.error(f"Batch write failed: {e}")
+            logging.error(f"❌ Batch optimization matrix sync failure: {e}")
 
-    # ───────────────────────────────────────────────
-    # PEAD METRICS (Short-Circuit Safe)
-    # ───────────────────────────────────────────────
-    def get_pead_metrics(self, stock_obj):
+    # ─────────────────────────────────────────────────────────────────────────
+    # REFACTORED CORE TECHNICAL & SEMANTIC DATA PIPELINES
+    # ─────────────────────────────────────────────────────────────────────────
+    def calculate_vp_nuanced(self, clean_tk, df):
+        """Rule 1 & E: Static price profile engine containing automated cache optimization mechanics."""
+        if df.empty or len(df) < 15: return 0.0, 0.0
+        
+        # Check Execution Cache Constraints first to bypass duplicate math processing loops
+        today_str = str(datetime.now().date())
+        if clean_tk in self.vp_cache and self.vp_cache[clean_tk].get("date") == today_str:
+            return float(self.vp_cache[clean_tk]["poc"]), float(self.vp_cache[clean_tk]["vah"])
+
         try:
-            earnings_df = stock_obj.get_earnings_dates(limit=4)
+            p_min, p_max = df['Close'].min(), df['Close'].max()
+            price_range = p_max - p_min
+            if price_range == 0: return float(p_min), float(p_min)
+
+            round_base = 2.0 if p_max > 500 else (0.50 if p_max > 50 else 0.10)
+            
+            # Rule 1 Fallback Extension: Protect low range asset shelf visibility boundaries
+            min_shelves = 8
+            while (price_range / round_base) < min_shelves:
+                round_base /= 2.0
+
+            df_copy = df.copy()
+            df_copy['PriceShelf'] = (df_copy['Close'] / round_base).round() * round_base
+            vol_prof = df_copy.groupby('PriceShelf', observed=False)['Volume'].sum()
+            
+            if vol_prof.empty: return float(df['Close'].iloc[-1]), float(df['Close'].iloc[-1])
+            
+            poc = float(vol_prof.idxmax())
+            sorted_shelves = vol_prof.sort_values(ascending=False)
+            total_vol, cum_vol, val_area = sorted_shelves.sum(), 0.0, []
+
+            if total_vol == 0: return poc, poc
+
+            for shelf, vol in sorted_shelves.items():
+                cum_vol += vol
+                val_area.append(shelf)
+                if cum_vol / total_vol >= 0.70: break
+
+            vah = float(max(val_area)) if val_area else poc
+            
+            # Commit newly mapped structures to local file dictionary memory registers
+            self.vp_cache[clean_tk] = {"poc": poc, "vah": vah, "date": today_str}
+            return poc, vah
+        except Exception as e:
+            logging.debug(f"Volume profile parsing error fallback on {clean_tk}: {e}")
+            return float(df['Close'].iloc[-1]), float(df['Close'].iloc[-1])
+
+    def get_pead_metrics(self, stock_obj, t_prices, t_highs, t_lows):
+        """Rule 2 & 9: Timezone localized vector search with automated retries and explicit structure parsing."""
+        try:
+            if not t_prices.index.is_monotonic_increasing:
+                t_prices = t_prices.sort_index()
+                t_highs = t_highs.sort_index()
+                t_lows = t_lows.sort_index()
+
+            earnings_df = None
+            for _ in range(2):
+                try:
+                    earnings_df = stock_obj.get_earnings_dates(limit=4)
+                    if earnings_df is not None and not earnings_df.empty and not isinstance(earnings_df, list):
+                        break
+                except Exception:
+                    time.sleep(0.3)
+
             if earnings_df is None or earnings_df.empty or isinstance(earnings_df, list):
-                return 0.0, 999
+                return 0.0, 999, {}
 
-            past = earnings_df[earnings_df.index <= pd.Timestamp.now()]
-            if past.empty:
-                return 0.0, 999
+            if earnings_df.index.tz is not None:
+                earnings_df.index = earnings_df.index.tz_localize(None)
+            
+            t_prices_naive = t_prices.index.tz_localize(None) if t_prices.index.tz is not None else t_prices.index
+            now_naive = pd.Timestamp.now().tz_localize(None)
+            
+            past_earnings = earnings_df[earnings_df.index <= now_naive]
+            if past_earnings.empty: return 0.0, 999, {}
 
-            past_sorted = past.sort_index()
-            most_recent_date = past_sorted.index[-1]
-            days = (datetime.now().date() - most_recent_date.date()).days
+            past_sorted = past_earnings.sort_index()
+            earn_dt = past_sorted.index[-1]
+            days_since_earnings = (now_naive.date() - earn_dt.date()).days
 
-            surp_col = [c for c in past_sorted.columns if 'Surprise' in c]
-            if surp_col:
-                surp_series = past_sorted[surp_col[0]].dropna()
-                if not surp_series.empty:
-                    surp = float(surp_series.iloc[-1])
-                    return surp, days
-            return 0.0, days
-        except Exception:
-            return 0.0, 999
+            past_sorted.columns = [str(c).strip().lower() for c in past_sorted.columns]
+            surp_col = [c for c in past_sorted.columns if 'surprise' in c]
+            if not surp_col: return 0.0, days_since_earnings, {}
 
-    # ───────────────────────────────────────────────
-    # FINBERT (Short-Circuit Safe)
-    # ───────────────────────────────────────────────
+            raw_surprise = past_sorted[surp_col[0]].dropna()
+            if raw_surprise.empty: return 0.0, days_since_earnings, {}
+            surprise_margin = float(raw_surprise.iloc[-1])
+
+            # Vector Search for Absolute Proximity Positioning Alignment
+            price_dates = np.array([dt.to_pydatetime() for dt in t_prices_naive])
+            time_deltas = np.abs(price_dates - earn_dt.to_pydatetime())
+            earn_bar_pos = int(np.argmin(time_deltas))
+            earn_idx_offset = earn_bar_pos - len(t_prices)
+
+            if abs(earn_idx_offset) <= len(t_prices):
+                e_close, e_high, e_low = float(t_prices.iloc[earn_idx_offset]), float(t_highs.iloc[earn_idx_offset]), float(t_lows.iloc[earn_idx_offset])
+                day_range = e_high - e_low
+                close_position = (e_close - e_low) / day_range if day_range != 0 else 0.5
+            else:
+                close_position = 0.5
+
+            return surprise_margin, days_since_earnings, {
+                "earn_idx_offset": earn_idx_offset, "close_position": close_position, "bars_since_earnings": max(1, -earn_idx_offset)
+            }
+        except Exception as e:
+            logging.debug(f"PEAD data processing matrix error deflection: {e}")
+            return 0.0, 999, {}
+
     def get_finbert_sentiment(self, stock_obj):
-        if not self.nlp_engine:
-            return 0.0, "BERT Inactive"
+        """Rule 3: Live news tracker running parsing fallbacks to shield engine visibility metrics."""
+        if not self.nlp_engine: return 0.0, "BERT Inactive"
+        titles = []
         try:
             news_items = stock_obj.news
-            if not news_items or isinstance(news_items, float):
-                return 0.0, "Neutral (No News)"
+            if isinstance(news_items, list) and news_items:
+                for item in news_items[:6]:
+                    if isinstance(item, dict) and 'title' in item:
+                        titles.append(str(item['title']))
+        except Exception:
+            pass
 
-            titles = [item['title'] for item in news_items[:6] if isinstance(item, dict) and 'title' in item]
-            if not titles:
-                return 0.0, "Neutral (Blank Titles)"
+        # Rule 3 Fallback Extension: Query RSS pipelines if primary corporate data maps are empty
+        if not titles:
+            try:
+                ticker = stock_obj.ticker
+                rss_url = f"https://news.google.com/rss/search?q={ticker}+stock+when:5d&hl=en-US&gl=US&ceid=US:en"
+                response = self.custom_session.get(rss_url, timeout=4)
+                if response.status_code == 200:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(response.content)
+                    titles = [item.find('title').text for item in root.findall('.//item')[:5] if item.find('title') is not None]
+            except Exception:
+                pass
 
-            with self._nlp_lock:
-                predictions = self.nlp_engine(titles)
+        if not titles: return 0.0, "💤 Neutral Sentiment"
 
-            net_sentiment_score = 0.0
-            pos_count, neg_count = 0, 0
-
+        try:
+            with self._nlp_lock: predictions = self.nlp_engine(titles)
+            net_score, pos_count, neg_count = 0.0, 0, 0
             for p in predictions:
-                label = p['label'].upper()
-                score = p['score']
-                if 'POS' in label:
-                    net_sentiment_score += score
-                    pos_count += 1
-                elif 'NEG' in label:
-                    net_sentiment_score -= score
-                    neg_count += 1
-
-            avg_score = net_sentiment_score / len(titles)
-            if avg_score > 0.15:
-                status_str = f"🚀 Bullish NLP ({pos_count}/{len(titles)} Pos)"
-            elif avg_score < -0.15:
-                status_str = f"⚠️ Bearish NLP ({neg_count}/{len(titles)} Neg)"
-            else:
-                status_str = "💤 Neutral Sentiment"
-
+                label, score = p['label'].upper(), p['score']
+                if 'POS' in label: net_score += score; pos_count += 1
+                elif 'NEG' in label: net_score -= score; neg_count += 1
+            
+            avg_score = net_score / len(titles)
+            if avg_score > 0.15: status_str = f"🚀 Bullish Sentiment ({pos_count}/{len(titles)} High)"
+            elif avg_score < -0.15: status_str = f"⚠️ Bearish Pressure ({neg_count}/{len(titles)} Disp)"
+            else: status_str = "💤 Neutral Sentiment"
             return float(avg_score), status_str
         except Exception:
-            return 0.0, "Inference Bypassed"
+            return 0.0, "Inference Deflected"
 
-    def calculate_vp_nuanced(self, df):
-        if df.empty or len(df) < 15:
-            return 0, 0
-        n_bins = min(30, max(8, int(np.sqrt(len(df)) * 1.5)))
-        bins = pd.cut(df['Close'], bins=n_bins)
-        vol_prof = df.groupby(bins, observed=False)['Volume'].sum()
-        sorted_vol = vol_prof.sort_values(ascending=False)
-        cum_vol = sorted_vol.cumsum() / sorted_vol.sum()
-        va = sorted_vol[cum_vol <= 0.70]
-        poc = vol_prof.idxmax().mid
-        vah = va.index.max().right if not va.empty else poc
-        return float(poc), float(vah)
-
-    def send_telegram_chunked(self, html_text):
-        if not self.telegram_token:
-            return
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        if len(html_text) <= 4000:
-            try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": html_text, "parse_mode": "HTML"}, timeout=10)
-            except Exception: pass
-            return
-        lines = html_text.split('\n')
-        current_chunk = ""
-        for line in lines:
-            if len(current_chunk) + len(line) + 1 > 4000:
-                try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": current_chunk, "parse_mode": "HTML"}, timeout=10)
-                except Exception: pass
-                current_chunk = line + '\n'
-            else:
-                current_chunk += line + '\n'
-        if current_chunk:
-            try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": current_chunk, "parse_mode": "HTML"}, timeout=10)
-            except Exception: pass
-
-    # ───────────────────────────────────────────────
-    # PER-TICKER CONVEYOR (ANTI-BOT HARDENED)
-    # ───────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # REFACTORED WORKER ROUTINE MATRIX
+    # ─────────────────────────────────────────────────────────────────────────
     def process_ticker(self, ticker):
+        """Rule C & 🔴 Signature Correction: Complete validation workflow containing structural logging loops."""
         clean_tk = ticker.replace('.', '-')
-        
-        # Anti-Bot Strategy 1: Staggered thread execution to break concurrent scraping patterns
-        time.sleep(random.uniform(0.5, 2.5))
+        time.sleep(random.uniform(self.THROTTLE_MIN, self.THROTTLE_MAX))
         
         try:
-            # Explicitly inject browser proxy headers into yfinance execution instance
             stock = yf.Ticker(clean_tk, session=self.custom_session)
-            
-            # Anti-Bot Strategy 2: Absolute NoneType Short-Circuit Protection Matrix
             try:
                 info = stock.info
                 if info is None or not isinstance(info, dict):
-                    logging.warning(f"⚠️ Yahoo blocked info lookup for {clean_tk}. Skipping.")
+                    logging.debug(f"Skipping {clean_tk}: yfinance returned an empty profile payload.")
                     return None
                 sector = info.get('sector', 'Technology')
-            except Exception:
-                logging.warning(f"⚠️ Yahoo returned a 401 response for {clean_tk}. Short-circuiting.")
+            except Exception as e:
+                logging.debug(f"Skipping {clean_tk} info fetch failure: {e}")
                 return None
 
             sector_etf = self.SECTOR_MAP.get(sector, 'SPY')
-
-            # Anti-Bot Strategy 3: Download via the hardened session layout
             data = yf.download([clean_tk, sector_etf], period="1y", auto_adjust=True, progress=False, session=self.custom_session)
             if data is None or data.empty or 'Close' not in data:
+                logging.debug(f"Skipping {clean_tk}: historical raw data query empty.")
                 return None
 
             lvl = data.columns.nlevels > 1
@@ -261,43 +337,40 @@ class NeoQuantScannerPro:
                 t_lows = data['Low'][clean_tk].dropna() if lvl else data['Low'].dropna()
                 t_vols = data['Volume'][clean_tk].dropna() if lvl else data['Volume'].dropna()
                 s_prices = data['Close'][sector_etf].dropna() if lvl else data['Close'].dropna()
-            except KeyError:
+            except KeyError as ke:
+                logging.debug(f"Skipping {clean_tk} due to dataframe columns key mismatch: {ke}")
                 return None
 
             if len(t_prices) < 25: return None
             px = float(t_prices.iloc[-1])
             if px <= 0: return None
             
-            m10 = t_prices.rolling(10).mean().iloc[-1]
             m20 = t_prices.rolling(20).mean().iloc[-1]
             m50 = t_prices.rolling(50).mean().iloc[-1]
             m200 = t_prices.rolling(200).mean().iloc[-1] if len(t_prices) >= 200 else None
             bull_regime = (px > m50 > m200) if m200 is not None else (px > m50)
 
+            # Extract 6-Month Relative Alpha
             lookback = min(126, len(t_prices)-1)
-            asset_ret = (t_prices.iloc[-1] / t_prices.iloc[-lookback]) - 1
-            sector_ret = (s_prices.iloc[-1] / s_prices.iloc[-lookback]) - 1
-            alpha = asset_ret - sector_ret
+            alpha = (t_prices.iloc[-1] / t_prices.iloc[-lookback]) - (s_prices.iloc[-1] / s_prices.iloc[-lookback])
 
+            # Rule 3 Correction: Handle macro split adjustments across comprehensive history windows
             adjusted_vols = t_vols.copy()
             try:
                 splits = stock.splits
                 if splits is not None and not splits.empty and not isinstance(splits, list):
-                    horizon_start = t_prices.index[-65]
-                    active_splits = splits[splits.index >= horizon_start]
-                    for split_date, ratio in active_splits.items():
-                        if ratio > 0:
-                            adjusted_vols.loc[adjusted_vols.index < split_date] *= ratio
+                    for split_date, ratio in splits.items():
+                        if ratio > 0: adjusted_vols.loc[adjusted_vols.index < split_date] *= ratio
             except Exception:
                 pass
 
-            vol_df = pd.DataFrame({'Close': t_prices, 'Volume': adjusted_vols}).tail(65)
-            poc, vah = self.calculate_vp_nuanced(vol_df)
-
-            surp, days = self.get_pead_metrics(stock)
+            poc, vah = self.calculate_vp_nuanced(clean_tk, pd.DataFrame({'Close': t_prices, 'Volume': adjusted_vols}).tail(65))
+            
+            # Correct Call Signature Implementation Layer mapping structured variable tracking dicts
+            surp, days, struct_meta = self.get_pead_metrics(stock, t_prices, t_highs, t_lows)
             nlp_score, nlp_desc = self.get_finbert_sentiment(stock)
 
-            base_score = 0.0
+            score = 0.0
             is_pead_active = False
             status = "COILING (Standard Technical Setup)"
             exit_logic_note = "Standard 20% Technical Target Frame"
@@ -305,82 +378,55 @@ class NeoQuantScannerPro:
             historical_base = t_highs.iloc[-25:-2]
             resistance_20d = float(historical_base.max()) if not historical_base.empty else px
 
-            if surp >= 15.0 and 0 <= days <= 90:
+            # PEAD ALLOCATION MATRIX
+            if surp >= 15.0 and 0 <= days <= 90 and struct_meta:
                 is_pead_active = True
-                
                 if days < 5:
-                    score = 0.1
-                    status = "⛔ PEAD PENALTY BOX (Evaluating Follow-Through & Washouts)"
+                    score = 1.0
+                    status = "⛔ PEAD PENALTY BOX (Evaluating Post-Earnings Action)"
                 else:
-                    earnings_df = stock.get_earnings_dates(limit=4)
-                    if earnings_df is not None and not earnings_df.empty and not isinstance(earnings_df, list):
-                        past_earnings = earnings_df[earnings_df.index <= pd.Timestamp.now()]
-                        if not past_earnings.empty:
-                            earn_dt = past_earnings.sort_index().index[-1]
-                            earn_bar_pos = abs(t_prices.index - earn_dt).argmin()
-                            earn_idx = int(earn_bar_pos - len(t_prices))
-                        else: earn_idx = max(-len(t_prices), -int(days))
-                    else: earn_idx = max(-len(t_prices), -int(days))
-
-                    if abs(earn_idx) <= len(t_prices):
-                        e_close = t_prices.iloc[earn_idx]
-                        e_high = t_highs.iloc[earn_idx]
-                        e_low = t_lows.iloc[earn_idx]
-                        earn_day_range = e_high - e_low
-                        close_pos = (e_close - e_low) / earn_day_range if earn_day_range != 0 else 0.5
-                    else: close_pos = 0.5
+                    earn_idx = struct_meta["earn_idx_offset"]
+                    close_pos = struct_meta["close_position"]
+                    bars_since_earnings = struct_meta["bars_since_earnings"]
 
                     if close_pos < 0.40:
                         score = 0.0
-                        status = "⚠️ PEAD DISTRIBUTION (Weak Earnings Day Close Position)"
+                        status = "⚠️ PEAD DISTRIBUTION (Weak Earnings Day Close)"
                     else:
-                        bars_since_earnings = -earn_idx
-                        if bars_since_earnings <= 0: bars_since_earnings = 1
-
                         post_earnings_history = t_highs.tail(bars_since_earnings)
                         pe_max_high = float(post_earnings_history.max()) if not post_earnings_history.empty else px
                         correction_depth = (pe_max_high - px) / pe_max_high if pe_max_high > 0 else 0
                         
-                        depth_bonus = 0.0
-                        depth_valid = False
-                        if correction_depth <= 0.10:
-                            depth_bonus = 1.5   
-                            depth_valid = True
-                        elif 0.10 < correction_depth <= 0.25:
-                            depth_bonus = 0.5   
-                            depth_valid = True
+                        depth_bonus = 1.5 if correction_depth <= 0.10 else (0.5 if correction_depth <= 0.25 else -99)
                         
                         closes_series = t_prices.tail(bars_since_earnings)
                         ma20_series = t_prices.rolling(20).mean().tail(bars_since_earnings)
                         ma20_violations = (closes_series < ma20_series).sum() if not ma20_series.empty else 0
-                        respects_ma_floor = (ma20_violations <= 3) and (px > m50)
                         
-                        recent_vol_avg = adjusted_vols.tail(4).mean()
-                        baseline_vol_avg = adjusted_vols.tail(50).mean()
-                        volume_dried = recent_vol_avg < baseline_vol_avg
+                        respects_ma_floor = (ma20_violations <= 3) and (px > m50)
+                        volume_dried = adjusted_vols.tail(4).mean() < adjusted_vols.tail(50).mean()
                         respects_poc = px >= (poc * 0.97)
 
-                        if depth_valid and respects_ma_floor and volume_dried and respects_poc:
-                            alpha_modifier = min(2.0, max(0.0, alpha * 10)) 
+                        if depth_bonus >= 0 and respects_ma_floor and volume_dried and respects_poc:
+                            alpha_mod = min(2.0, max(0.0, alpha * 10)) 
                             time_decay = 1.0 if days <= 45 else 0.6
-                            nlp_modifier = 0.5 if nlp_score > 0.25 else (-1.5 if nlp_score < -0.25 else 0.0)
+                            nlp_mod = 0.5 if nlp_score > 0.25 else (-1.5 if nlp_score < -0.25 else 0.0)
 
-                            base_score = (7.0 + depth_bonus + alpha_modifier + nlp_modifier) * time_decay
-                            score = min(base_score, 10.0)
-                            exit_logic_note = f"🎯 1/2 Trim Target: ${px * 1.10:.2f} | 🛡️ Stop: 20-DMA (${m20:.2f})"
-
-                            if px >= resistance_20d: status = f"🔥 PEAD BREAKOUT | {nlp_desc}"
-                            else: status = f"⏳ PEAD FLAG COILING | {nlp_desc}"
+                            score = min((7.0 + depth_bonus + alpha_mod + nlp_mod) * time_decay, 10.0)
+                            exit_logic_note = f"🎯 Trim: ${px * 1.10:.2f} | 🛡️ Stop: 20-DMA (${m20:.2f})"
+                            status = f"🔥 PEAD BREAKOUT | {nlp_desc}" if px >= resistance_20d else f"⏳ PEAD FLAG COILING | {nlp_desc}"
                         else:
                             score = 2.0
                             status = f"⚠️ PEAD STRUCTURE DEGRADED | {nlp_desc}"
             
+            # Rule A Fallback Implementation Matrix: Clamping system scores tightly
             if not is_pead_active:
                 alpha_score = 3.0 if alpha > 0.05 else (1.5 if alpha > 0 else 0)
                 regime_score = 3.0 if bull_regime else 0
                 profile_score = 2.0 if px > vah else 0
-                nlp_modifier = 0.5 if nlp_score > 0.3 else 0.0
-                score = alpha_score + regime_score + profile_score + nlp_modifier
+                nlp_mod = 0.5 if nlp_score > 0.3 else 0.0
+                
+                score = min(alpha_score + regime_score + profile_score + nlp_mod, 8.5)
                 
                 if px >= resistance_20d: status = f"🔥 TECHNICAL BREAKOUT ACTIVE | {nlp_desc}"
                 elif px > (poc * 1.05): status = "EXTENDED (Wait for Pullback)"
@@ -391,56 +437,87 @@ class NeoQuantScannerPro:
                 "px": px, "poc": poc, "resistance": resistance_20d, "status": status, "exits": exit_logic_note
             }
         except Exception as e:
-            logging.error(f"Execution failed for ticker {ticker}: {e}")
+            logging.error(f"❌ Structural core exception for {ticker} runtime track: {e}")
             return None
 
-    # ───────────────────────────────────────────────
-    # ENTRANCE & PIPELINE EXECUTION
-    # ───────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # ENGINE RUNTIME ENTRANCE LAYER
+    # ─────────────────────────────────────────────────────────────────────────
     def run(self):
+        self.pre_flight_validation()
         self.init_sheet_mapping()
-        tickers = [t for t in self._ticker_row_map.keys() if t not in ["TICKER", "SYMBOL"]]
-        all_updates, t1, t2, t3, neutral = {}, [], [], [], []
+        tickers = list(self._ticker_row_map.keys())
+        all_updates, t1, t2, neutral, t3 = {}, [], [], [], []
 
-        # Anti-Bot Strategy 4: Dropping concurrent workers from 10 down to 3 to reduce the request velocity signature
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        logging.info(f"⏳ Spawning high-throughput worker routines across {len(tickers)} targets...")
+
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             futures = {executor.submit(self.process_ticker, tk): tk for tk in tickers}
             for future in as_completed(futures):
                 res = future.result()
-                if res is None:
-                    continue
+                if res is None: continue
                 ticker = res["ticker"]
                 score = res["score"]
                 all_updates[ticker] = [score, res["alpha_str"], datetime.now().strftime("%Y-%m-%d")]
 
-                if score >= 8.0: t1.append(res)
-                elif 6.5 <= score < 8.0: t2.append(res)
-                elif 1.0 <= score < 6.5: neutral.append(res)
+                if score >= 8.5: t1.append(res)
+                elif 6.5 <= score < 8.5: t2.append(res)
+                elif 2.5 <= score < 6.5: neutral.append(res)
                 else: t3.append(res)
 
         self.batch_write_results(all_updates)
+        
+        # Save Consolidated Local Profile Memory Caching States down cleanly
+        try:
+            with open(self.CACHE_FILE, 'w') as f: json.dump(self.vp_cache, f)
+            logging.info("💾 Cached profiles committed safely to disk memory.")
+        except Exception as e:
+            logging.error(f"Failed to cache profile structures down to disk storage registers: {e}")
+
         self.send_report(t1, t2, neutral, t3)
 
     def send_report(self, t1, t2, neutral, t3):
-        msg = f"<b>🚀 NEO QUANT DUO ENGINE REPORT - {datetime.now().strftime('%Y-%m-%d')}</b>\n\n"
-        msg += "<b>🔥 TIER 1: ACTIONABLE BUYS (In Play / Breakouts + FinBERT Verified)</b>\n"
-        if not t1: msg += "<i>No dual-conviction setups discovered today.</i>\n"
+        """Rule B: Universal absolute HTML character escaping framework across all metrics fields."""
+        msg = f"<b>🚀 NEO QUANT ENGINE SUMMARY REPORT - {datetime.now().strftime('%Y-%m-%d')}</b>\n\n"
+        
+        msg += "<b>🔥 TIER 1: CONVICTION SELECTION (PEAD Validated Breakouts)</b>\n"
+        if not t1: msg += "<i>No high-conviction PEAD setups matching your strategy criteria today.</i>\n"
         for i in t1:
-            msg += f"• <b>{i['ticker']}</b> (Score: <b>{i['score']:.1f}</b>) | Price: <b>${i['px']:.2f}</b>\n"
-            msg += f"  📊 Status: <i>{i['status']}</i>\n"
-            msg += f"  🚧 Exit Protocol: <i>{i['exits']}</i>\n\n"
+            msg += f"• <b>{html.escape(str(i['ticker']))}</b> (Score: <b>{html.escape(str(i['score']))}</b>) | Spot: <b>${i['px']:.2f}</b>\n"
+            msg += f"  📊 Condition: <i>{html.escape(str(i['status']))}</i>\n"
+            msg += f"  🚧 Risk Anchoring: <i>{html.escape(str(i['exits']))}</i>\n\n"
 
-        msg += "\n<b>👀 TIER 2: HIGH-ALPHA WATCH (Coiling / Technical Monitoring)</b>\n"
-        if not t2: msg += "<i>No pending setups.</i>\n"
+        msg += "\n<b>👀 TIER 2: TECHNICAL WATCH (Coiling Patterns / Trend Breakouts)</b>\n"
+        if not t2: msg += "<i>No auxiliary setups spotted.</i>\n"
         for i in t2:
-            msg += f"• <b>{i['ticker']}</b> (Score: {i['score']:.1f}) | Price: ${i['px']:.2f}\n"
-            msg += f"  📊 Status: <i>{i['status']}</i>\n\n"
+            msg += f"• <b>{html.escape(str(i['ticker']))}</b> (Score: {html.escape(str(i['score']))}) | Spot: ${i['px']:.2f}\n"
+            msg += f"  📊 Condition: <i>{html.escape(str(i['status']))}</i>\n\n"
 
-        msg += "\n<b>💤 NEUTRAL / ⚠️ TRAPS (No-Allocation Zone)</b>\n"
-        no_trade = [i['ticker'] for i in neutral[:12]] + [i['ticker'] for i in t3[:12]]
+        msg += "\n<b>💤 NO-ALLOCATION TRAP ZONE (Failed Setups or Distribution)</b>\n"
+        no_trade = [html.escape(str(i['ticker'])) for i in neutral[:15]] + [html.escape(str(i['ticker'])) for i in t3[:15]]
         msg += (f"• " + " | ".join(no_trade) + "\n") if no_trade else "<i>Empty</i>\n"
 
         self.send_telegram_chunked(msg)
+        logging.info("📢 Safe structural text-escaped report dispatched successfully.")
+
+    def send_telegram_chunked(self, html_text):
+        if not self.telegram_token: return
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        if len(html_text) <= 4000:
+            try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": html_text, "parse_mode": "HTML"}, timeout=10)
+            except Exception: pass
+            return
+        lines = html_text.split('\n')
+        curr = ""
+        for line in lines:
+            if len(curr) + len(line) + 1 > 4000:
+                try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": curr, "parse_mode": "HTML"}, timeout=10)
+                except Exception: pass
+                curr = line + '\n'
+            else: curr += line + '\n'
+        if curr:
+            try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": curr, "parse_mode": "HTML"}, timeout=10)
+            except Exception: pass
 
 if __name__ == "__main__":
     NeoQuantScannerPro().run()
