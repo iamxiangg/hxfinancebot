@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import random
 import requests
 import logging
 import threading
@@ -23,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class NeoQuantScannerPro:
     def __init__(self):
-        logging.info("🚀 Deploying Production Neo Quant Scanner Pro (v4.0 - All Bugs Patched)...")
+        logging.info("🚀 Deploying Hardened Production Neo Quant Scanner Pro (v4.5 - Anti-Bot Safeguards)...")
         
         self.SHEET_NAME = "Xiang Stock Analysis"
         self.WORKSHEET_NAME = "Stock Summary USD"
@@ -39,7 +40,16 @@ class NeoQuantScannerPro:
         self._ticker_row_map = {}
         self._nlp_lock = threading.Lock()
 
-        # ── INITIALIZE FINBERT (Thread-Safe via Lock) ──
+        # ── HARDENED NETWORK SESSION CONFIGURATION ──
+        self.custom_session = requests.Session()
+        self.custom_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive"
+        })
+
+        # ── INITIALIZE FINBERT ──
         if HAS_TRANSFORMERS:
             try:
                 logging.info("🧠 Initializing FinBERT Sentiment Architecture...")
@@ -47,10 +57,9 @@ class NeoQuantScannerPro:
                 model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
                 self.nlp_engine = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
             except Exception as e:
-                logging.error(f"FinBERT initialization failed: {e}. Falling back.")
+                logging.error(f"FinBERT initialization failed: {e}")
                 self.nlp_engine = None
         else:
-            logging.warning("⚠️ 'transformers' not found. Run: pip install transformers torch")
             self.nlp_engine = None
 
     # ───────────────────────────────────────────────
@@ -111,23 +120,18 @@ class NeoQuantScannerPro:
             logging.error(f"Batch write failed: {e}")
 
     # ───────────────────────────────────────────────
-    # FIXED BUG #1 & #5: PEAD METRICS (Ordering-Safe)
+    # PEAD METRICS (Short-Circuit Safe)
     # ───────────────────────────────────────────────
     def get_pead_metrics(self, stock_obj):
-        """
-        FIXED: Uses get_earnings_dates() exclusively (no stock.calendar).
-        FIXED: Explicitly sorts index to avoid ordering-dependent .iloc[0] vs [-1].
-        """
         try:
             earnings_df = stock_obj.get_earnings_dates(limit=4)
-            if earnings_df is None or earnings_df.empty:
+            if earnings_df is None or earnings_df.empty or isinstance(earnings_df, list):
                 return 0.0, 999
 
             past = earnings_df[earnings_df.index <= pd.Timestamp.now()]
             if past.empty:
                 return 0.0, 999
 
-            # FIX BUG #5: Sort ascending, take last = most recent
             past_sorted = past.sort_index()
             most_recent_date = past_sorted.index[-1]
             days = (datetime.now().date() - most_recent_date.date()).days
@@ -139,27 +143,24 @@ class NeoQuantScannerPro:
                     surp = float(surp_series.iloc[-1])
                     return surp, days
             return 0.0, days
-        except Exception as e:
-            logging.debug(f"PEAD metrics lookup failed: {e}")
+        except Exception:
             return 0.0, 999
 
     # ───────────────────────────────────────────────
-    # FIXED BUG #6: FINBERT (Thread-Safe via Lock)
+    # FINBERT (Short-Circuit Safe)
     # ───────────────────────────────────────────────
     def get_finbert_sentiment(self, stock_obj):
-        """Thread-safe FinBERT inference using self._nlp_lock."""
         if not self.nlp_engine:
             return 0.0, "BERT Inactive"
         try:
             news_items = stock_obj.news
-            if not news_items:
+            if not news_items or isinstance(news_items, float):
                 return 0.0, "Neutral (No News)"
 
-            titles = [item['title'] for item in news_items[:6] if 'title' in item]
+            titles = [item['title'] for item in news_items[:6] if isinstance(item, dict) and 'title' in item]
             if not titles:
                 return 0.0, "Neutral (Blank Titles)"
 
-            # FIX BUG #6: Thread-safe inference
             with self._nlp_lock:
                 predictions = self.nlp_engine(titles)
 
@@ -177,7 +178,6 @@ class NeoQuantScannerPro:
                     neg_count += 1
 
             avg_score = net_sentiment_score / len(titles)
-
             if avg_score > 0.15:
                 status_str = f"🚀 Bullish NLP ({pos_count}/{len(titles)} Pos)"
             elif avg_score < -0.15:
@@ -186,13 +186,9 @@ class NeoQuantScannerPro:
                 status_str = "💤 Neutral Sentiment"
 
             return float(avg_score), status_str
-        except Exception as e:
-            logging.debug(f"FinBERT inference failed: {e}")
-            return 0.0, "Inference Errored"
+        except Exception:
+            return 0.0, "Inference Bypassed"
 
-    # ───────────────────────────────────────────────
-    # VOLUME PROFILE
-    # ───────────────────────────────────────────────
     def calculate_vp_nuanced(self, df):
         if df.empty or len(df) < 15:
             return 0, 0
@@ -206,55 +202,56 @@ class NeoQuantScannerPro:
         vah = va.index.max().right if not va.empty else poc
         return float(poc), float(vah)
 
-    # ───────────────────────────────────────────────
-    # TELEGRAM
-    # ───────────────────────────────────────────────
     def send_telegram_chunked(self, html_text):
         if not self.telegram_token:
             return
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         if len(html_text) <= 4000:
-            try:
-                requests.post(
-                    url,
-                    json={"chat_id": self.telegram_chat_id, "text": html_text, "parse_mode": "HTML"},
-                    timeout=10
-                )
-            except Exception:
-                pass
+            try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": html_text, "parse_mode": "HTML"}, timeout=10)
+            except Exception: pass
             return
         lines = html_text.split('\n')
         current_chunk = ""
         for line in lines:
             if len(current_chunk) + len(line) + 1 > 4000:
-                requests.post(
-                    url,
-                    json={"chat_id": self.telegram_chat_id, "text": current_chunk, "parse_mode": "HTML"},
-                    timeout=10
-                )
+                try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": current_chunk, "parse_mode": "HTML"}, timeout=10)
+                except Exception: pass
                 current_chunk = line + '\n'
             else:
                 current_chunk += line + '\n'
         if current_chunk:
-            requests.post(
-                url,
-                json={"chat_id": self.telegram_chat_id, "text": current_chunk, "parse_mode": "HTML"},
-                timeout=10
-            )
+            try: requests.post(url, json={"chat_id": self.telegram_chat_id, "text": current_chunk, "parse_mode": "HTML"}, timeout=10)
+            except Exception: pass
 
     # ───────────────────────────────────────────────
-    # PER-TICKER PROCESSING (ALL BUGS FIXED)
+    # PER-TICKER CONVEYOR (ANTI-BOT HARDENED)
     # ───────────────────────────────────────────────
     def process_ticker(self, ticker):
         clean_tk = ticker.replace('.', '-')
+        
+        # Anti-Bot Strategy 1: Staggered thread execution to break concurrent scraping patterns
+        time.sleep(random.uniform(0.5, 2.5))
+        
         try:
-            stock = yf.Ticker(clean_tk)
-            info = stock.info
-            sector = info.get('sector', 'Technology') if info else 'Technology'
+            # Explicitly inject browser proxy headers into yfinance execution instance
+            stock = yf.Ticker(clean_tk, session=self.custom_session)
+            
+            # Anti-Bot Strategy 2: Absolute NoneType Short-Circuit Protection Matrix
+            try:
+                info = stock.info
+                if info is None or not isinstance(info, dict):
+                    logging.warning(f"⚠️ Yahoo blocked info lookup for {clean_tk}. Skipping.")
+                    return None
+                sector = info.get('sector', 'Technology')
+            except Exception:
+                logging.warning(f"⚠️ Yahoo returned a 401 response for {clean_tk}. Short-circuiting.")
+                return None
+
             sector_etf = self.SECTOR_MAP.get(sector, 'SPY')
 
-            data = yf.download([clean_tk, sector_etf], period="1y", auto_adjust=True, progress=False)
-            if data.empty or 'Close' not in data:
+            # Anti-Bot Strategy 3: Download via the hardened session layout
+            data = yf.download([clean_tk, sector_etf], period="1y", auto_adjust=True, progress=False, session=self.custom_session)
+            if data is None or data.empty or 'Close' not in data:
                 return None
 
             lvl = data.columns.nlevels > 1
@@ -267,11 +264,9 @@ class NeoQuantScannerPro:
             except KeyError:
                 return None
 
-            if len(t_prices) < 25:
-                return None
+            if len(t_prices) < 25: return None
             px = float(t_prices.iloc[-1])
-            if px <= 0:
-                return None
+            if px <= 0: return None
             
             m10 = t_prices.rolling(10).mean().iloc[-1]
             m20 = t_prices.rolling(20).mean().iloc[-1]
@@ -284,11 +279,10 @@ class NeoQuantScannerPro:
             sector_ret = (s_prices.iloc[-1] / s_prices.iloc[-lookback]) - 1
             alpha = asset_ret - sector_ret
 
-            # FIX BUG #3: MANUAL VOLUME PROFILE SPLIT ADJUSTMENT IS MULTIPLICATIVE
             adjusted_vols = t_vols.copy()
             try:
                 splits = stock.splits
-                if splits is not None and not splits.empty:
+                if splits is not None and not splits.empty and not isinstance(splits, list):
                     horizon_start = t_prices.index[-65]
                     active_splits = splits[splits.index >= horizon_start]
                     for split_date, ratio in active_splits.items():
@@ -318,18 +312,15 @@ class NeoQuantScannerPro:
                     score = 0.1
                     status = "⛔ PEAD PENALTY BOX (Evaluating Follow-Through & Washouts)"
                 else:
-                    # FIX BUG #5: Use ordering-safe ascending sort to determine correct date anchor
                     earnings_df = stock.get_earnings_dates(limit=4)
-                    if earnings_df is not None and not earnings_df.empty:
+                    if earnings_df is not None and not earnings_df.empty and not isinstance(earnings_df, list):
                         past_earnings = earnings_df[earnings_df.index <= pd.Timestamp.now()]
                         if not past_earnings.empty:
                             earn_dt = past_earnings.sort_index().index[-1]
                             earn_bar_pos = abs(t_prices.index - earn_dt).argmin()
                             earn_idx = int(earn_bar_pos - len(t_prices))
-                        else:
-                            earn_idx = max(-len(t_prices), -int(days))
-                    else:
-                        earn_idx = max(-len(t_prices), -int(days))
+                        else: earn_idx = max(-len(t_prices), -int(days))
+                    else: earn_idx = max(-len(t_prices), -int(days))
 
                     if abs(earn_idx) <= len(t_prices):
                         e_close = t_prices.iloc[earn_idx]
@@ -337,17 +328,14 @@ class NeoQuantScannerPro:
                         e_low = t_lows.iloc[earn_idx]
                         earn_day_range = e_high - e_low
                         close_pos = (e_close - e_low) / earn_day_range if earn_day_range != 0 else 0.5
-                    else:
-                        close_pos = 0.5
+                    else: close_pos = 0.5
 
                     if close_pos < 0.40:
                         score = 0.0
                         status = "⚠️ PEAD DISTRIBUTION (Weak Earnings Day Close Position)"
                     else:
-                        # FIX BUG #4: Convert calendar days into accurate trading bar historical lookbacks
                         bars_since_earnings = -earn_idx
-                        if bars_since_earnings <= 0:
-                            bars_since_earnings = 1
+                        if bars_since_earnings <= 0: bars_since_earnings = 1
 
                         post_earnings_history = t_highs.tail(bars_since_earnings)
                         pe_max_high = float(post_earnings_history.max()) if not post_earnings_history.empty else px
@@ -375,38 +363,28 @@ class NeoQuantScannerPro:
                         if depth_valid and respects_ma_floor and volume_dried and respects_poc:
                             alpha_modifier = min(2.0, max(0.0, alpha * 10)) 
                             time_decay = 1.0 if days <= 45 else 0.6
-                            
                             nlp_modifier = 0.5 if nlp_score > 0.25 else (-1.5 if nlp_score < -0.25 else 0.0)
 
                             base_score = (7.0 + depth_bonus + alpha_modifier + nlp_modifier) * time_decay
                             score = min(base_score, 10.0)
-                            
-                            exit_logic_note = f"🎯 1/2 Trim Target: ${px * 1.10:.2f} (3-5 Days) | 🛡️ Tail Remaining Slot on 20-DMA (${m20:.2f})"
+                            exit_logic_note = f"🎯 1/2 Trim Target: ${px * 1.10:.2f} | 🛡️ Stop: 20-DMA (${m20:.2f})"
 
-                            if px >= resistance_20d:
-                                status = f"🔥 PEAD BREAKOUT | {nlp_desc}"
-                                if score < 8.0: score = 8.5
-                            else:
-                                status = f"⏳ PEAD FLAG COILING | {nlp_desc}"
+                            if px >= resistance_20d: status = f"🔥 PEAD BREAKOUT | {nlp_desc}"
+                            else: status = f"⏳ PEAD FLAG COILING | {nlp_desc}"
                         else:
                             score = 2.0
-                            # FIX ISSUE #7: Appended NLP context to degraded flag paths
                             status = f"⚠️ PEAD STRUCTURE DEGRADED | {nlp_desc}"
             
             if not is_pead_active:
                 alpha_score = 3.0 if alpha > 0.05 else (1.5 if alpha > 0 else 0)
                 regime_score = 3.0 if bull_regime else 0
                 profile_score = 2.0 if px > vah else 0
-                
                 nlp_modifier = 0.5 if nlp_score > 0.3 else 0.0
                 score = alpha_score + regime_score + profile_score + nlp_modifier
                 
-                if px >= resistance_20d:
-                    status = f"🔥 TECHNICAL BREAKOUT ACTIVE | {nlp_desc}"
-                elif px > (poc * 1.05):
-                    status = "EXTENDED (Wait for Pullback)"
-                else:
-                    status = f"COILING | {nlp_desc}"
+                if px >= resistance_20d: status = f"🔥 TECHNICAL BREAKOUT ACTIVE | {nlp_desc}"
+                elif px > (poc * 1.05): status = "EXTENDED (Wait for Pullback)"
+                else: status = f"COILING | {nlp_desc}"
 
             return {
                 "ticker": clean_tk, "score": round(score, 1), "alpha_str": f"{alpha:+.2%}",
@@ -417,14 +395,15 @@ class NeoQuantScannerPro:
             return None
 
     # ───────────────────────────────────────────────
-    # ENTRANCE & EXECUTION DISPATCH
+    # ENTRANCE & PIPELINE EXECUTION
     # ───────────────────────────────────────────────
     def run(self):
         self.init_sheet_mapping()
         tickers = [t for t in self._ticker_row_map.keys() if t not in ["TICKER", "SYMBOL"]]
         all_updates, t1, t2, t3, neutral = {}, [], [], [], []
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # Anti-Bot Strategy 4: Dropping concurrent workers from 10 down to 3 to reduce the request velocity signature
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {executor.submit(self.process_ticker, tk): tk for tk in tickers}
             for future in as_completed(futures):
                 res = future.result()
@@ -445,16 +424,14 @@ class NeoQuantScannerPro:
     def send_report(self, t1, t2, neutral, t3):
         msg = f"<b>🚀 NEO QUANT DUO ENGINE REPORT - {datetime.now().strftime('%Y-%m-%d')}</b>\n\n"
         msg += "<b>🔥 TIER 1: ACTIONABLE BUYS (In Play / Breakouts + FinBERT Verified)</b>\n"
-        if not t1:
-            msg += "<i>No dual-conviction setups discovered today.</i>\n"
+        if not t1: msg += "<i>No dual-conviction setups discovered today.</i>\n"
         for i in t1:
             msg += f"• <b>{i['ticker']}</b> (Score: <b>{i['score']:.1f}</b>) | Price: <b>${i['px']:.2f}</b>\n"
             msg += f"  📊 Status: <i>{i['status']}</i>\n"
             msg += f"  🚧 Exit Protocol: <i>{i['exits']}</i>\n\n"
 
         msg += "\n<b>👀 TIER 2: HIGH-ALPHA WATCH (Coiling / Technical Monitoring)</b>\n"
-        if not t2:
-            msg += "<i>No pending setups.</i>\n"
+        if not t2: msg += "<i>No pending setups.</i>\n"
         for i in t2:
             msg += f"• <b>{i['ticker']}</b> (Score: {i['score']:.1f}) | Price: ${i['px']:.2f}\n"
             msg += f"  📊 Status: <i>{i['status']}</i>\n\n"
