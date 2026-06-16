@@ -30,9 +30,11 @@ MAX_PCT_CHANGE = 8       # max acceptable price change since purchase
 FRESH_DAYS     = 7       # trades <= N days ago are "fresh"
 FRESH_PCT      = 5       # max change for "fresh" status
 
-CSV_URL = "https://www.housestockwatcher.com/api/transactions?format=csv"
+# Swapped out to Kadoa's stable, aggregated data portal JSON payload mirror
+DATA_URL = "https://congress.kadoa.com/data/transactions.json"
+
 TELEGRAM_CHAR_LIMIT = 3800   # safe buffer below 4096 bytes
-CHUNK_PADDING       = 10     # padding buffer for line breaks and formatting string joins
+CHUNK_PADDING       = 10     # padding buffer for line breaks and string joins
 INTER_CHUNK_DELAY   = 1.5    # seconds to sleep between multi-part telegram messages
 
 # Global cache to avoid redundant yfinance calls for the same ticker
@@ -41,23 +43,39 @@ INDUSTRY_CACHE = {}
 # ── Helper Functions ────────────────────────────────────────────────────────
 
 def fetch_trades():
-    """Download HouseStockWatcher CSV, return list of stock purchases."""
+    """
+    Fetch normalized data directly from the Kadoa Congress Trading project mirror.
+    Bypasses broken endpoints by leveraging their consolidated registry dataset.
+    """
     try:
-        resp = requests.get(CSV_URL, timeout=30)
+        logging.info(f"Connecting to Kadoa Data Registry via: {DATA_URL}")
+        resp = requests.get(DATA_URL, timeout=30)
         resp.raise_for_status()
+        raw_data = resp.json()
     except requests.RequestException as e:
-        logging.error(f"Failed to download data: {e}")
+        logging.error(f"Failed to download data from Kadoa source: {e}")
         return []
 
-    reader = csv.DictReader(StringIO(resp.text))
     trades = []
-    for row in reader:
-        if row.get('transaction_type', '').lower() != 'purchase':
+    for item in raw_data:
+        # Standardize transaction parameters to search specifically for purchases
+        tx_type = item.get('type', item.get('transaction_type', '')).lower()
+        if tx_type != 'purchase':
             continue
-        asset = row.get('asset_type', '').lower()
-        if asset not in ('stock', 'common stock', ''):
+            
+        # Filter explicitly for stock equity assets
+        asset_category = item.get('asset_type', '').lower()
+        if asset_category and asset_category not in ('stock', 'common stock', 'equity'):
             continue
-        trades.append(row)
+
+        # Remap data fields cleanly back to our script core tracking structure
+        trades.append({
+            'ticker': item.get('ticker', '').strip().upper(),
+            'transaction_date': item.get('date', item.get('transaction_date', '')),
+            'representative': item.get('filer_name', item.get('representative', '')),
+            'asset_type': asset_category
+        })
+        
     return trades
 
 def get_price_info(ticker, trade_date_str, retries=3):
@@ -115,7 +133,7 @@ def enrich_trades(raw_trades):
         except ValueError:
             continue
 
-        # Date criteria evaluation BEFORE calling heavy external APIs
+        # Date filter criteria evaluated BEFORE calling heavy external APIs
         days_ago = (datetime.now() - trade_date).days
         if days_ago > MAX_DAYS_AGO or days_ago < 0:
             continue
@@ -131,8 +149,8 @@ def enrich_trades(raw_trades):
 
         industry = get_industry(ticker)
 
-        # Politician name parsing (last name fallback)
-        name = trade.get('representative', trade.get('filer_names', '')).strip()
+        # Politician name parsing (last name fallback validation)
+        name = trade.get('representative', '').strip()
         parts = name.split()
         last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
 
@@ -214,19 +232,13 @@ def build_chunks(aggregated):
         lines.append(line)
 
     chunks = []
-    # Part 1 initialization includes the complete Telemetry Suite
     current_chunk = base_header + summary_line
-    is_first_chunk = True
 
     for line in lines:
-        # Evaluate line inclusion boundary conditions dynamically
         if len(current_chunk) + len(line) + len(footer) + CHUNK_PADDING > TELEGRAM_CHAR_LIMIT:
             current_chunk += footer
             chunks.append(current_chunk)
-            
-            # Sub-sequential chunks receive an elegant continuous header title
             current_chunk = cont_header + line + "\n"
-            is_first_chunk = False
         else:
             current_chunk += line + "\n"
 
@@ -246,10 +258,10 @@ def main():
     if not raw:
         logging.warning("No raw trades found.")
         return
-    logging.info(f"Downloaded {len(raw)} historical trades. Filtering and enriching active data window...")
+    logging.info(f"Downloaded {len(raw)} total historical trades. Filtering data window...")
 
     enriched = enrich_trades(raw)
-    logging.info(f"Enriched {len(enriched)} actionable trades within window limits.")
+    logging.info(f"Enriched {len(enriched)} actionable trades within active window limits.")
 
     if not enriched:
         logging.info("No actionable trades found inside parameters during this run.")
