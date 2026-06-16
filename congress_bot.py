@@ -30,8 +30,8 @@ MAX_PCT_CHANGE = 8       # max acceptable price change since purchase
 FRESH_DAYS     = 7       # trades <= N days ago are "fresh"
 FRESH_PCT      = 5       # max change for "fresh" status
 
-# High-availability consolidated repository source for Congress Stock Trades
-DATA_URL = "https://raw.githubusercontent.com/datasets/congress-stock-trades/master/data/transactions.csv"
+# Direct CDN pointer to Kadoa's main repository tracking matrix database file
+RAW_KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/all_transactions.json"
 
 TELEGRAM_CHAR_LIMIT = 3800   # safe buffer below 4096 bytes
 CHUNK_PADDING       = 10     # padding buffer for line breaks and string joins
@@ -44,37 +44,36 @@ INDUSTRY_CACHE = {}
 
 def fetch_trades():
     """
-    Fetch normalized data directly from the official open data portal.
-    Bypasses individual API vulnerabilities completely.
+    Fetch normalized data directly from the Kadoa repository file tree via GitHub's CDN.
+    Extracts the compiled static JSON array without touching external web app routers.
     """
     try:
-        logging.info(f"Connecting to Open Congress Data Archive via: {DATA_URL}")
-        resp = requests.get(DATA_URL, timeout=30)
+        logging.info(f"Connecting to Kadoa GitHub Storage Core: {RAW_KADOA_URL}")
+        resp = requests.get(RAW_KADOA_URL, timeout=30)
         resp.raise_for_status()
-        
-        reader = csv.DictReader(StringIO(resp.text))
-        raw_data = list(reader)
+        raw_data = resp.json()
     except requests.RequestException as e:
-        logging.error(f"Failed to download data from archive mirror: {e}")
+        logging.error(f"Failed to stream raw data payload from GitHub CDN: {e}")
         return []
 
     trades = []
     for item in raw_data:
-        # Filter for buys/purchases
+        # Standardize transaction parameters to search specifically for purchases
         tx_type = item.get('type', item.get('transaction_type', '')).lower()
-        if 'purchase' not in tx_type:
+        if tx_type != 'purchase':
             continue
             
-        # Target stock equity assets
+        # Filter explicitly for stock equity assets
         asset_category = item.get('asset_type', '').lower()
         if asset_category and asset_category not in ('stock', 'common stock', 'equity'):
             continue
 
-        # Map to common baseline schema parameters
+        # Remap Kadoa's data dictionary keys back to our tracking structure
         trades.append({
             'ticker': item.get('ticker', '').strip().upper(),
-            'transaction_date': item.get('transaction_date', item.get('date', '')),
-            'representative': item.get('representative', item.get('filer_name', '')),
+            'transaction_date': item.get('date', item.get('transaction_date', '')),
+            'representative': item.get('filer_name', item.get('representative', '')),
+            'asset_type': asset_category
         })
         
     return trades
@@ -134,7 +133,7 @@ def enrich_trades(raw_trades):
         except ValueError:
             continue
 
-        # Date parameters checked BEFORE initiating outer asset network evaluations
+        # Date parameters checked BEFORE initiating heavy pricing loops
         days_ago = (datetime.now() - trade_date).days
         if days_ago > MAX_DAYS_AGO or days_ago < 0:
             continue
@@ -150,12 +149,12 @@ def enrich_trades(raw_trades):
 
         industry = get_industry(ticker)
 
-        # Clean individual name values (extracting last name)
+        # Extract last name from politician full name values
         name = trade.get('representative', '').strip()
         parts = name.split()
         last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
 
-        # Segmenting classification flags
+        # Segmenting classification indicators
         if days_ago <= FRESH_DAYS and pct_change <= FRESH_PCT:
             status = "🟢"
         elif days_ago <= MAX_DAYS_AGO and pct_change <= MAX_PCT_CHANGE:
@@ -173,7 +172,7 @@ def enrich_trades(raw_trades):
             'transaction_date': trade_date
         })
 
-        # Base loop buffer delay to remain highly compliant with Yahoo limits
+        # Internal loop throttle baseline to conform with Yahoo rate limits
         time.sleep(0.2)
 
     return enriched
@@ -259,7 +258,7 @@ def main():
     if not raw:
         logging.warning("No raw trades found.")
         return
-    logging.info(f"Downloaded {len(raw)} total historical trades. Synchronizing active reporting parameters...")
+    logging.info(f"Downloaded {len(raw)} total historical trades. Synchronizing parameters...")
 
     enriched = enrich_trades(raw)
     logging.info(f"Enriched {len(enriched)} actionable trades within active window limits.")
