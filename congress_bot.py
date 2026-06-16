@@ -30,8 +30,8 @@ MAX_PCT_CHANGE = 8       # max acceptable price change since purchase
 FRESH_DAYS     = 7       # trades <= N days ago are "fresh"
 FRESH_PCT      = 5       # max change for "fresh" status
 
-# Swapped out to Kadoa's stable, aggregated data portal JSON payload mirror
-DATA_URL = "https://congress.kadoa.com/data/transactions.json"
+# High-availability consolidated repository source for Congress Stock Trades
+DATA_URL = "https://raw.githubusercontent.com/datasets/congress-stock-trades/master/data/transactions.csv"
 
 TELEGRAM_CHAR_LIMIT = 3800   # safe buffer below 4096 bytes
 CHUNK_PADDING       = 10     # padding buffer for line breaks and string joins
@@ -44,36 +44,37 @@ INDUSTRY_CACHE = {}
 
 def fetch_trades():
     """
-    Fetch normalized data directly from the Kadoa Congress Trading project mirror.
-    Bypasses broken endpoints by leveraging their consolidated registry dataset.
+    Fetch normalized data directly from the official open data portal.
+    Bypasses individual API vulnerabilities completely.
     """
     try:
-        logging.info(f"Connecting to Kadoa Data Registry via: {DATA_URL}")
+        logging.info(f"Connecting to Open Congress Data Archive via: {DATA_URL}")
         resp = requests.get(DATA_URL, timeout=30)
         resp.raise_for_status()
-        raw_data = resp.json()
+        
+        reader = csv.DictReader(StringIO(resp.text))
+        raw_data = list(reader)
     except requests.RequestException as e:
-        logging.error(f"Failed to download data from Kadoa source: {e}")
+        logging.error(f"Failed to download data from archive mirror: {e}")
         return []
 
     trades = []
     for item in raw_data:
-        # Standardize transaction parameters to search specifically for purchases
+        # Filter for buys/purchases
         tx_type = item.get('type', item.get('transaction_type', '')).lower()
-        if tx_type != 'purchase':
+        if 'purchase' not in tx_type:
             continue
             
-        # Filter explicitly for stock equity assets
+        # Target stock equity assets
         asset_category = item.get('asset_type', '').lower()
         if asset_category and asset_category not in ('stock', 'common stock', 'equity'):
             continue
 
-        # Remap data fields cleanly back to our script core tracking structure
+        # Map to common baseline schema parameters
         trades.append({
             'ticker': item.get('ticker', '').strip().upper(),
-            'transaction_date': item.get('date', item.get('transaction_date', '')),
-            'representative': item.get('filer_name', item.get('representative', '')),
-            'asset_type': asset_category
+            'transaction_date': item.get('transaction_date', item.get('date', '')),
+            'representative': item.get('representative', item.get('filer_name', '')),
         })
         
     return trades
@@ -121,7 +122,7 @@ def enrich_trades(raw_trades):
     enriched = []
     for trade in raw_trades:
         ticker = trade.get('ticker', '').strip().upper()
-        if not ticker or ticker in ('--', 'N/A'):
+        if not ticker or ticker in ('--', 'N/A') or len(ticker) > 5:
             continue
 
         trade_date_str = trade.get('transaction_date', '')
@@ -133,12 +134,12 @@ def enrich_trades(raw_trades):
         except ValueError:
             continue
 
-        # Date filter criteria evaluated BEFORE calling heavy external APIs
+        # Date parameters checked BEFORE initiating outer asset network evaluations
         days_ago = (datetime.now() - trade_date).days
         if days_ago > MAX_DAYS_AGO or days_ago < 0:
             continue
 
-        logging.info(f"Fetching market metrics for active ticker: ${ticker}")
+        logging.info(f"Processing historical price metrics for active ticker: ${ticker}")
         purchase_price, current_price = get_price_info(ticker, trade_date_str)
         if purchase_price is None:
             continue
@@ -149,12 +150,12 @@ def enrich_trades(raw_trades):
 
         industry = get_industry(ticker)
 
-        # Politician name parsing (last name fallback validation)
+        # Clean individual name values (extracting last name)
         name = trade.get('representative', '').strip()
         parts = name.split()
         last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
 
-        # Status emoji thresholds
+        # Segmenting classification flags
         if days_ago <= FRESH_DAYS and pct_change <= FRESH_PCT:
             status = "🟢"
         elif days_ago <= MAX_DAYS_AGO and pct_change <= MAX_PCT_CHANGE:
@@ -172,7 +173,7 @@ def enrich_trades(raw_trades):
             'transaction_date': trade_date
         })
 
-        # Steady throttle delay to remain polite to Yahoo Finance APIs
+        # Base loop buffer delay to remain highly compliant with Yahoo limits
         time.sleep(0.2)
 
     return enriched
@@ -258,7 +259,7 @@ def main():
     if not raw:
         logging.warning("No raw trades found.")
         return
-    logging.info(f"Downloaded {len(raw)} total historical trades. Filtering data window...")
+    logging.info(f"Downloaded {len(raw)} total historical trades. Synchronizing active reporting parameters...")
 
     enriched = enrich_trades(raw)
     logging.info(f"Enriched {len(enriched)} actionable trades within active window limits.")
