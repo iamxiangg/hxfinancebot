@@ -25,17 +25,17 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID')
 
-MAX_DAYS_AGO   = 14      # only trades filed within last N days
-MAX_PCT_CHANGE = 8       # max acceptable price change since purchase
-FRESH_DAYS     = 7       # trades <= N days ago are "fresh"
-FRESH_PCT      = 5       # max change for "fresh" status
+MAX_DAYS_AGO   = 30      # Tracks disclosures filed within the last 30 days
+MAX_PCT_CHANGE = 8       # Max acceptable price change since purchase
+FRESH_DAYS     = 7       # Filings <= 7 days old are marked "fresh"
+FRESH_PCT      = 5       # Max change for "fresh" status
 
-# Direct CDN pointer to Kadoa's real 'trades.json' data file visible in your screenshot
+# Direct CDN pointer to Kadoa's real 'trades.json' data file 
 RAW_KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/trades.json"
 
-TELEGRAM_CHAR_LIMIT = 3800   # safe buffer below 4096 bytes
-CHUNK_PADDING       = 10     # padding buffer for line breaks and string joins
-INTER_CHUNK_DELAY   = 1.5    # seconds to sleep between multi-part telegram messages
+TELEGRAM_CHAR_LIMIT = 3800   # Safe buffer below 4096 bytes
+CHUNK_PADDING       = 10     # Padding buffer for line breaks and string joins
+INTER_CHUNK_DELAY   = 1.5    # Seconds to sleep between multi-part telegram messages
 
 # Global cache to avoid redundant yfinance calls for the same ticker
 INDUSTRY_CACHE = {}
@@ -45,7 +45,7 @@ INDUSTRY_CACHE = {}
 def fetch_trades():
     """
     Fetch normalized data directly from the Kadoa repository file tree via GitHub's CDN.
-    Reads the 'trades.json' file directly.
+    Reads and filters the 'trades.json' file using advanced structural validation.
     """
     try:
         logging.info(f"Connecting to Kadoa GitHub Storage Core: {RAW_KADOA_URL}")
@@ -58,27 +58,34 @@ def fetch_trades():
 
     trades = []
     for item in raw_data:
-        # Standardize transaction parameters to search specifically for purchases
-        tx_type = str(item.get('type', item.get('transaction_type', ''))).lower()
+        # 1. Standardize transaction parameters to search specifically for purchases
+        tx_type = str(item.get('transaction_type', item.get('type', ''))).lower()
         if 'purchase' not in tx_type and 'buy' not in tx_type:
             continue
             
-        # Filter explicitly for stock equity assets
-        asset_category = str(item.get('asset_type', item.get('asset_description', ''))).lower()
-        if asset_category and asset_category not in ('stock', 'common stock', 'equity', 'n/a', ''):
+        # 2. Match asset types including 'st' (House) and 'stock' (Senate)
+        asset_category = str(item.get('asset_type', '')).lower().strip()
+        valid_stock_tags = ('stock', 'common stock', 'equity', 'st')
+        if asset_category not in valid_stock_tags:
             continue
 
-        # Remap Kadoa's data dictionary keys back to our tracking structure
+        # 3. Guardrail check: Skip items missing tickers (e.g. bonds or raw data errors)
+        ticker = item.get('ticker')
+        if not ticker or str(ticker).lower() in ('null', 'none', '--', 'n/a'):
+            continue
+
+        # Remap data fields cleanly, capturing the vital filing date parameters
         trades.append({
-            'ticker': str(item.get('ticker', '')).strip().upper(),
-            'transaction_date': item.get('date', item.get('transaction_date', '')),
-            'representative': item.get('filer_name', item.get('representative', item.get('filer', ''))),
+            'ticker': str(ticker).strip().upper(),
+            'transaction_date': item.get('transaction_date', ''),
+            'filing_date': item.get('filing_date', ''),
+            'representative': item.get('filer_name', item.get('representative', ''))
         })
         
     return trades
 
 def get_price_info(ticker, trade_date_str, retries=3):
-    """Return (purchase_price, current_price) with retries."""
+    """Return (purchase_price, current_price) with retries using trade purchase date."""
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
@@ -116,28 +123,32 @@ def get_industry(ticker, retries=2):
     return 'N/A'
 
 def enrich_trades(raw_trades):
-    """Filter and enrich raw trades with price, industry, status."""
+    """Filter and enrich raw trades with price, industry, status based on FILING DATE."""
     enriched = []
     for trade in raw_trades:
         ticker = trade.get('ticker', '').strip().upper()
-        if not ticker or ticker in ('--', 'N/A') or len(ticker) > 5:
+        if len(ticker) > 5:
             continue
 
+        # Target the public filing disclosure date to track freshness
+        filing_date_str = trade.get('filing_date', '')
         trade_date_str = trade.get('transaction_date', '')
-        if not trade_date_str:
+        if not filing_date_str or not trade_date_str:
             continue
 
         try:
+            filing_date = datetime.strptime(filing_date_str, '%Y-%m-%d')
             trade_date = datetime.strptime(trade_date_str, '%Y-%m-%d')
         except ValueError:
             continue
 
-        # Date parameters checked BEFORE initiating heavy pricing loops
-        days_ago = (datetime.now() - trade_date).days
+        # Evaluate date metrics BEFORE initiating heavy outer network calls
+        days_ago = (datetime.now() - filing_date).days
         if days_ago > MAX_DAYS_AGO or days_ago < 0:
             continue
 
         logging.info(f"Processing historical price metrics for active ticker: ${ticker}")
+        # Always check performance metrics starting from the initial transaction date
         purchase_price, current_price = get_price_info(ticker, trade_date_str)
         if purchase_price is None:
             continue
@@ -153,7 +164,7 @@ def enrich_trades(raw_trades):
         parts = name.split()
         last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
 
-        # Segmenting classification indicators
+        # Segmenting classification flags based on how recently it was made public
         if days_ago <= FRESH_DAYS and pct_change <= FRESH_PCT:
             status = "🟢"
         elif days_ago <= MAX_DAYS_AGO and pct_change <= MAX_PCT_CHANGE:
@@ -168,10 +179,10 @@ def enrich_trades(raw_trades):
             'pct_change': round(pct_change, 1),
             'days_ago': days_ago,
             'status': status,
-            'transaction_date': trade_date
+            'transaction_date': filing_date # Group sorting handles latest disclosure
         })
 
-        # Internal loop throttle baseline to conform with Yahoo rate limits
+        # Throttle delay to conform to Yahoo Finance rate limiting
         time.sleep(0.2)
 
     return enriched
@@ -227,7 +238,7 @@ def build_chunks(aggregated):
     for t in aggregated:
         prefix = f"{t['status']} 👥{t['unique_buyers']}x" if t['unique_buyers'] >= 2 else t['status']
         line = (f"{prefix} ${t['ticker']} | {t['buyer_str']} | "
-                f"{t['industry'][:10]} | {t['pct_change']:+.1f}% | {t['days_ago']}d ago")
+                f"{t['industry'][:10]} | {t['pct_change']:+.1f}% | {t['days_ago']}d filed ago")
         lines.append(line)
 
     chunks = []
