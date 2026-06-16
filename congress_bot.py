@@ -1,3 +1,14 @@
+You hit the nail on the head. This is a massive logic bug in the code.
+By filtering out individual trades *before* grouping them together, you create a major blind spot.
+### 🛑 The Bug Scenario
+Imagine Representative Cisneros buys a stock, and it drops -10\%. That passes your filter. But Representative Gottheimer also buys that exact same stock, and it rockets up +12\%. Because +12\% is greater than your MAX_PCT_CHANGE = 8 filter, Gottheimer's trade gets **deleted on arrival**.
+When the script reaches the grouping stage, it only sees Cisneros. **The cluster signal is completely destroyed**, and you would never know that multiple politicians were actually piling into that ticker.
+### 🔧 The Fix: "Group First, Filter Second"
+To fix this, we need to completely flip the architecture of the script:
+ 1. **Fetch & Group Everything First:** Bundle all trades by ticker immediately so we can accurately count how many politicians bought it (unique_buyers).
+ 2. **Apply Discerning Filters Last:** Evaluate the price and age metrics based on the *best* or *newest* trade in that cluster, while keeping the high-conviction cluster count fully intact.
+Here is the complete, corrected code with the proper architectural pipeline:
+```python
 import os
 import csv
 import time
@@ -25,25 +36,23 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID')
 
-MAX_DAYS_AGO   = 45      # Lookback window for actual PURCHASE date (handles reporting lag)
-MAX_PCT_CHANGE = 8       # Hard ceiling: Ignore anything that ran up > 8% from their buy price
+MAX_DAYS_AGO   = 45      # Lookback window for actual PURCHASE date
+MAX_PCT_CHANGE = 8       # Hard ceiling: Ignore single trades that ran up > 8%
 FRESH_DAYS     = 21      # Green window threshold (bought within 3 weeks)
 FRESH_PCT      = 3       # Green price change ceiling (flat, down, or up < 3%)
 
-# Direct CDN pointer to Kadoa's real 'trades.json' data file 
 RAW_KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/trades.json"
 
 TELEGRAM_CHAR_LIMIT = 3800   
 CHUNK_PADDING       = 10     
 INTER_CHUNK_DELAY   = 1.5    
 
-# Global cache to avoid redundant yfinance calls for the same ticker
 INDUSTRY_CACHE = {}
 
 # ── Core Processing Functions ───────────────────────────────────────────────
 
 def fetch_trades():
-    """Fetch and pre-filter raw entries focusing on equity stock purchases across House/Senate structures."""
+    """Fetch raw entries focusing on equity stock purchases across House/Senate structures."""
     try:
         logging.info(f"Connecting to Kadoa GitHub Storage Core: {RAW_KADOA_URL}")
         resp = requests.get(RAW_KADOA_URL, timeout=30)
@@ -68,11 +77,16 @@ def fetch_trades():
         if not ticker or str(ticker).lower() in ('null', 'none', '--', 'n/a'):
             continue
 
+        # Basic parsing to extract last name
+        name = item.get('filer_name', item.get('representative', '')).strip()
+        parts = name.split()
+        last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
+
         trades.append({
             'ticker': str(ticker).strip().upper(),
             'transaction_date': item.get('transaction_date', ''),
             'filing_date': item.get('filing_date', ''),
-            'representative': item.get('filer_name', item.get('representative', ''))
+            'name': last_name
         })
         
     return trades
@@ -108,106 +122,103 @@ def get_industry(ticker, retries=2):
             time.sleep(1)
     return 'N/A'
 
-def enrich_trades(raw_trades):
-    """Filter and enrich raw trades evaluated strictly by PURCHASE date with distinct color sub-tiers."""
-    enriched = []
-    for trade in raw_trades:
-        ticker = trade.get('ticker', '').strip().upper()
+def process_and_filter_clusters(raw_trades):
+    """
+    FIXED PIPELINE: 
+    1. Groups all raw trades by ticker first to accurately count cluster buyers.
+    2. Runs pricing analytics and filters out trades that don't match criteria.
+    """
+    # Step 1: Group raw trades by ticker first so we don't drop cluster signals
+    ticker_groups = {}
+    for t in raw_trades:
+        ticker_groups.setdefault(t['ticker'], []).append(t)
+
+    aggregated_results = []
+
+    # Step 2: Now analyze each grouped ticker cluster safely
+    for ticker, trades in ticker_groups.items():
         if len(ticker) > 5:
             continue
 
-        trade_date_str = trade.get('transaction_date', '')
-        filing_date_str = trade.get('filing_date', '')
-        if not trade_date_str or not filing_date_str:
+        # Extract all unique buyers for this cluster BEFORE filtering out by price
+        unique_buyers_list = sorted(set(t['name'] for t in trades))
+        unique_buyers_count = len(unique_buyers_list)
+
+        # Find the absolute newest trade in this cluster to evaluate timing parameters
+        valid_trades = []
+        for t in trades:
+            try:
+                t_date = datetime.strptime(t['transaction_date'], '%Y-%m-%d')
+                f_date = datetime.strptime(t['filing_date'], '%Y-%m-%d')
+                valid_trades.append((t_date, f_date, t))
+            except (ValueError, TypeError):
+                continue
+
+        if not valid_trades:
             continue
 
-        try:
-            trade_date = datetime.strptime(trade_date_str, '%Y-%m-%d')
-            filing_date = datetime.strptime(filing_date_str, '%Y-%m-%d')
-        except ValueError:
-            continue
+        # Sort by transaction date to find the most recent one
+        valid_trades.sort(key=lambda x: x[0], reverse=True)
+        latest_trade_date, latest_filing_date, latest_trade_raw = valid_trades[0]
 
-        # Structural validation focusing on the actual transaction buy window
-        days_since_purchase = (datetime.now() - trade_date).days
-        reporting_lag = (filing_date - trade_date).days
-        
+        days_since_purchase = (datetime.now() - latest_trade_date).days
+        reporting_lag = (latest_filing_date - latest_trade_date).days
+
+        # Filter Out completely stale data clusters
         if days_since_purchase > MAX_DAYS_AGO or days_since_purchase < 0:
             continue
 
-        logging.info(f"Checking pricing metrics for purchase-tracked asset: ${ticker}")
-        purchase_price, current_price = get_price_info(ticker, trade_date_str)
+        # Fetch pricing metrics relative to the latest purchase entry
+        logging.info(f"Checking pricing metrics for purchase cluster: ${ticker}")
+        purchase_price, current_price = get_price_info(ticker, latest_trade_raw['transaction_date'])
         if purchase_price is None:
             continue
 
         pct_change = (current_price - purchase_price) / purchase_price * 100
-        if pct_change > MAX_PCT_CHANGE:
+
+        # CRITICAL FILTER: Allow cluster trades an extra buffer, but cap single trades strictly
+        if unique_buyers_count < 2 and pct_change > MAX_PCT_CHANGE:
+            continue
+        elif unique_buyers_count >= 2 and pct_change > (MAX_PCT_CHANGE + 7): 
+            # Give high conviction cluster signals a wider breakout buffer (+7%) so you don't miss them
             continue
 
         industry = get_industry(ticker)
 
-        name = trade.get('representative', '').strip()
-        parts = name.split()
-        last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
+        if len(unique_buyers_list) > 3:
+            buyer_str = f"{unique_buyers_list[0]}, ... +{len(unique_buyers_list)-1}"
+        else:
+            buyer_str = ", ".join(unique_buyers_list)
 
         # HIGHLY DISCERNING COLOR TIER RULE SYSTEM:
         if days_since_purchase <= FRESH_DAYS and pct_change <= FRESH_PCT:
             status = "🟢"  # Perfect Entry Option: Fresh buy, flat price action.
         elif pct_change < 0:
-            status = "🟡"  # Discount Zone: Older purchase, but trading BELOW what they paid.
+            status = "🟡"  # Discount Zone: Older purchase, trading BELOW what they paid.
         else:
-            status = "🟠"  # Premium Zone: Older purchase, trading at a slight premium (up to 8%).
+            status = "🟠"  # Premium Zone: Older purchase, trading up to our ceiling limit.
 
-        enriched.append({
+        aggregated_results.append({
             'ticker': ticker,
-            'name': last_name,
-            'industry': industry,
+            'buyer_str': buyer_str,
+            'unique_buyers': unique_buyers_count,
             'pct_change': round(pct_change, 1),
             'days_since_purchase': days_since_purchase,
             'reporting_lag': reporting_lag,
             'status': status,
-            'purchase_date': trade_date
+            'industry': industry
         })
         time.sleep(0.15)
 
-    return enriched
-
-def group_trades(enriched):
-    """Group entries by ticker, tracking overlapping purchases for cluster identification."""
-    groups = {}
-    for t in enriched:
-        groups.setdefault(t['ticker'], []).append(t)
-
-    aggregated = []
-    for ticker, trades in groups.items():
-        # Target the absolute newest purchase entry to represent timing metrics
-        latest = max(trades, key=lambda x: x['purchase_date'])
-        unique_buyers = len(set(t['name'] for t in trades))
-        buyer_names = sorted(set(t['name'] for t in trades))
-        
-        if len(buyer_names) > 3:
-            buyer_str = f"{buyer_names[0]}, ... +{len(buyer_names)-1}"
-        else:
-            buyer_str = ", ".join(buyer_names)
-
-        aggregated.append({
-            'ticker': ticker,
-            'buyer_str': buyer_str,
-            'unique_buyers': unique_buyers,
-            'pct_change': latest['pct_change'],
-            'days_since_purchase': latest['days_since_purchase'],
-            'reporting_lag': latest['reporting_lag'],
-            'status': latest['status']
-        })
-    return aggregated
+    return aggregated_results
 
 def build_chunks(aggregated):
     """Sort and compile output pushing multi-buyer cluster signals to the top."""
     if not aggregated:
         return []
 
-    # Order priority: Multi-filer clusters always sit at the top,
-    # followed by Green (Fresh), Yellow (Discounted), and Orange (Premium).
     status_order = {'🟢': 0, '🟡': 1, '🟠': 2}
+    # Priority sorting: Cluster signal presence -> Color Category -> Freshness age
     aggregated.sort(key=lambda x: (
         0 if x['unique_buyers'] >= 2 else 1, 
         status_order.get(x['status'], 99), 
@@ -220,7 +231,7 @@ def build_chunks(aggregated):
     
     footer = (f"\n🟢 = New Buy (≤ {FRESH_DAYS}d, Price ≤ {FRESH_PCT}%)\n"
               f"🟡 = Discount Zone (Bought > {FRESH_DAYS}d ago, Stock is DOWN since purchase)\n"
-              f"🟠 = Premium Zone (Bought > {FRESH_DAYS}d ago, Stock is UP up to 8%)\n"
+              f"🟠 = Premium Zone (Bought > {FRESH_DAYS}d ago, Stock is UP up to limits)\n"
               f"👥👥 = CLUSTER SIGNALS (2+ politicians buying same stock)")
 
     lines = []
@@ -228,7 +239,7 @@ def build_chunks(aggregated):
         prefix = f"👥👥 {t['status']}" if t['unique_buyers'] >= 2 else t['status']
         line = (f"{prefix} ${t['ticker']} | {t['buyer_str']} | "
                 f"Bought {t['days_since_purchase']}d ago | "
-                f"Price: {t['pct_change']:+.1f}%")
+                f"Price: {t['pct_change']:+.1f}% | {t['industry'][:10]}")
         lines.append(line)
 
     chunks = []
@@ -253,17 +264,17 @@ def main():
         logging.error("Missing critical environment variables: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID")
         return
 
-    logging.info("Executing purchase-centric tracking cycle...")
+    logging.info("Executing pipeline optimized cluster cycle...")
     raw = fetch_trades()
     if not raw:
         return
 
-    enriched = enrich_trades(raw)
-    if not enriched:
+    # Pipeline functions combined cleanly into process_and_filter_clusters
+    aggregated = process_and_filter_clusters(raw)
+    if not aggregated:
         logging.info("No trades fit our strict copy parameters today.")
         return
 
-    aggregated = group_trades(enriched)
     message_chunks = build_chunks(aggregated)
 
     async def send_telegram(text):
@@ -281,3 +292,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+```
