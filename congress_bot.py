@@ -30,8 +30,8 @@ MAX_PCT_CHANGE = 8       # max acceptable price change since purchase
 FRESH_DAYS     = 7       # trades <= N days ago are "fresh"
 FRESH_PCT      = 5       # max change for "fresh" status
 
-# Direct CDN pointer to Kadoa's main repository tracking matrix database file
-RAW_KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/all_transactions.json"
+# Direct CDN pointer to Kadoa's real 'trades.json' data file visible in your screenshot
+RAW_KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/trades.json"
 
 TELEGRAM_CHAR_LIMIT = 3800   # safe buffer below 4096 bytes
 CHUNK_PADDING       = 10     # padding buffer for line breaks and string joins
@@ -45,7 +45,7 @@ INDUSTRY_CACHE = {}
 def fetch_trades():
     """
     Fetch normalized data directly from the Kadoa repository file tree via GitHub's CDN.
-    Extracts the compiled static JSON array without touching external web app routers.
+    Reads the 'trades.json' file directly.
     """
     try:
         logging.info(f"Connecting to Kadoa GitHub Storage Core: {RAW_KADOA_URL}")
@@ -59,21 +59,20 @@ def fetch_trades():
     trades = []
     for item in raw_data:
         # Standardize transaction parameters to search specifically for purchases
-        tx_type = item.get('type', item.get('transaction_type', '')).lower()
-        if tx_type != 'purchase':
+        tx_type = str(item.get('type', item.get('transaction_type', ''))).lower()
+        if 'purchase' not in tx_type and 'buy' not in tx_type:
             continue
             
         # Filter explicitly for stock equity assets
-        asset_category = item.get('asset_type', '').lower()
-        if asset_category and asset_category not in ('stock', 'common stock', 'equity'):
+        asset_category = str(item.get('asset_type', item.get('asset_description', ''))).lower()
+        if asset_category and asset_category not in ('stock', 'common stock', 'equity', 'n/a', ''):
             continue
 
         # Remap Kadoa's data dictionary keys back to our tracking structure
         trades.append({
-            'ticker': item.get('ticker', '').strip().upper(),
+            'ticker': str(item.get('ticker', '')).strip().upper(),
             'transaction_date': item.get('date', item.get('transaction_date', '')),
-            'representative': item.get('filer_name', item.get('representative', '')),
-            'asset_type': asset_category
+            'representative': item.get('filer_name', item.get('representative', item.get('filer', ''))),
         })
         
     return trades
