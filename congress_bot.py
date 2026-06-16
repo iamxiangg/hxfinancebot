@@ -1,14 +1,3 @@
-You hit the nail on the head. This is a massive logic bug in the code.
-By filtering out individual trades *before* grouping them together, you create a major blind spot.
-### 🛑 The Bug Scenario
-Imagine Representative Cisneros buys a stock, and it drops -10\%. That passes your filter. But Representative Gottheimer also buys that exact same stock, and it rockets up +12\%. Because +12\% is greater than your MAX_PCT_CHANGE = 8 filter, Gottheimer's trade gets **deleted on arrival**.
-When the script reaches the grouping stage, it only sees Cisneros. **The cluster signal is completely destroyed**, and you would never know that multiple politicians were actually piling into that ticker.
-### 🔧 The Fix: "Group First, Filter Second"
-To fix this, we need to completely flip the architecture of the script:
- 1. **Fetch & Group Everything First:** Bundle all trades by ticker immediately so we can accurately count how many politicians bought it (unique_buyers).
- 2. **Apply Discerning Filters Last:** Evaluate the price and age metrics based on the *best* or *newest* trade in that cluster, while keeping the high-conviction cluster count fully intact.
-Here is the complete, corrected code with the proper architectural pipeline:
-```python
 import os
 import csv
 import time
@@ -292,5 +281,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-```
