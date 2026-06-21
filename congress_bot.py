@@ -88,13 +88,6 @@ MAX_WAIT = 6
 MAX_RISK = 6
 MAX_TOTAL_RESULTS = 20
 
-# Always report that the scheduled run completed. When no ticker meets the
-# strict actionable/wait/risk thresholds, show a small, clearly labelled list
-# of the nearest signals instead of silently exiting.
-SEND_STATUS_WHEN_NO_QUALIFYING = True
-MAX_NEAREST_SIGNALS = 5
-NEAREST_SIGNAL_MIN_CONVICTION = 15.0
-
 # Sales and options affect one final conviction score.
 MAX_STOCK_SALE_PENALTY = 20.0
 MAX_OPTION_ADJUSTMENT = 15.0
@@ -1955,37 +1948,6 @@ def select_results(results):
     return actionable, wait, risk, selected
 
 
-def select_nearest_signals(results):
-    """
-    Select informative near-misses for a status-only Telegram message.
-
-    These are not promoted into actionable/wait/risk categories. Conviction
-    remains the primary sort key so a high entry score cannot make a weak
-    congressional signal look attractive.
-    """
-    candidates = [
-        result
-        for result in results
-        if result["category"] == "other"
-        and (
-            result["conviction_score"] >= NEAREST_SIGNAL_MIN_CONVICTION
-            or result["call_purchase_midpoint"]
-            >= OPTION_ENRICHMENT_MIN_CALL_PREMIUM
-        )
-    ]
-
-    candidates.sort(
-        key=lambda result: (
-            result["conviction_score"],
-            result["entry_score"],
-            result["effective_amount"],
-            result["call_purchase_midpoint"],
-        ),
-        reverse=True,
-    )
-    return candidates[:MAX_NEAREST_SIGNALS]
-
-
 def change_signature(result):
     return {
         "trade_ids": result["trade_ids"],
@@ -2227,58 +2189,6 @@ def build_messages(actionable, wait, risk, total_analysed):
     return messages
 
 
-def build_no_qualifying_message(nearest, total_analysed):
-    """Build a completion/status report when strict thresholds select none."""
-    lines = [
-        "📊 CONGRESS TRADE MONITOR",
-        "No ticker met the strict actionable, wait or risk thresholds.",
-        f"Analysed: {total_analysed} tickers | Qualified: 0",
-        "",
-    ]
-
-    if nearest:
-        lines.append("🔎 NEAREST SIGNALS — NOT QUALIFIED")
-        for result in nearest:
-            lines.append(result_line(result))
-        lines.append("")
-    else:
-        lines.append("No near-miss reached the minimum reporting level.")
-        lines.append("")
-
-    lines.extend(
-        [
-            "Current thresholds:",
-            (
-                f"Actionable: C≥{ACTIONABLE_MIN_CONVICTION:.0f} and "
-                f"E≥{ACTIONABLE_MIN_ENTRY:.0f}"
-            ),
-            (
-                f"Wait: C≥{WAIT_MIN_CONVICTION:.0f} or effective stock buys "
-                f"≥{format_amount(WAIT_MIN_EFFECTIVE_AMOUNT)}"
-            ),
-            (
-                "Risk: meaningful bullish activity plus severe drawdown or "
-                "strong distribution"
-            ),
-            "",
-            "C = final conviction after sales/options | E = entry quality",
-            "Near-miss entries are monitoring context, not purchase signals.",
-        ]
-    )
-
-    return ["\n".join(lines)]
-
-
-def build_no_recent_activity_message():
-    return [
-        (
-            "📊 CONGRESS TRADE MONITOR\n"
-            "Feed checked successfully, but no relevant recent bullish "
-            "purchase signals were retained."
-        )
-    ]
-
-
 async def send_messages(messages):
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     for index, message in enumerate(messages):
@@ -2328,11 +2238,6 @@ def main():
             logger.info(
                 "Feed retrieved, but no relevant recent transactions found."
             )
-            if SEND_STATUS_WHEN_NO_QUALIFYING:
-                asyncio.run(
-                    send_messages(build_no_recent_activity_message())
-                )
-                logger.info("Sent no-recent-activity Telegram status.")
             return
 
         analysed = process_all_trades(trades)
@@ -2344,54 +2249,11 @@ def main():
             )
             return
 
-        actionable, wait, risk, qualified = select_results(analysed)
-
-        if not qualified:
-            nearest = select_nearest_signals(analysed)
-            logger.info(
-                "No ticker met the strict reporting thresholds; "
-                "sending completion status with %d near-miss signal(s).",
-                len(nearest),
-            )
-            if SEND_STATUS_WHEN_NO_QUALIFYING:
-                messages = build_no_qualifying_message(
-                    nearest=nearest,
-                    total_analysed=len(analysed),
-                )
-                asyncio.run(send_messages(messages))
-                logger.info(
-                    "Sent %d no-qualifying-status Telegram message(s).",
-                    len(messages),
-                )
-            return
-
-        selected = filter_changed_results(qualified)
+        actionable, wait, risk, selected = select_results(analysed)
+        selected = filter_changed_results(selected)
 
         if not selected:
-            logger.info(
-                "Qualified opportunities exist, but none are new or "
-                "materially changed under repeat-alert suppression."
-            )
-            if SEND_STATUS_WHEN_NO_QUALIFYING:
-                nearest = qualified[:MAX_NEAREST_SIGNALS]
-                messages = build_no_qualifying_message(
-                    nearest=nearest,
-                    total_analysed=len(analysed),
-                )
-                # Make the status accurate when suppression, rather than the
-                # investment thresholds, caused the empty notification set.
-                messages[0] = messages[0].replace(
-                    "No ticker met the strict actionable, wait or risk thresholds.",
-                    "Qualified signals were found, but none changed materially.",
-                ).replace(
-                    "Qualified: 0",
-                    f"Qualified: {len(qualified)} | New/changed: 0",
-                ).replace(
-                    "🔎 NEAREST SIGNALS — NOT QUALIFIED",
-                    "📌 QUALIFIED SIGNALS — UNCHANGED",
-                )
-                asyncio.run(send_messages(messages))
-                logger.info("Sent unchanged-signals Telegram status.")
+            logger.info("No new or materially changed opportunities to send.")
             return
 
         selected_by_ticker = {
