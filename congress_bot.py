@@ -1,10 +1,9 @@
 import os
-import csv
 import time
+import math
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from io import StringIO
 from collections import Counter
 
 import requests
@@ -25,18 +24,81 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID')
 
-MAX_DAYS_AGO   = 45      # Lookback window for actual PURCHASE date
-MAX_PCT_CHANGE = 8       # Hard ceiling: Ignore single trades that ran up > 8%
-FRESH_DAYS     = 21      # Green window threshold (bought within 3 weeks)
-FRESH_PCT      = 3       # Green price change ceiling (flat, down, or up < 3%)
+MAX_DAYS_AGO   = 45
+MAX_PCT_CHANGE = 8
+FRESH_DAYS     = 21
+FRESH_PCT      = 3
 
 RAW_KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/trades.json"
 
-TELEGRAM_CHAR_LIMIT = 3800   
-CHUNK_PADDING       = 10     
-INTER_CHUNK_DELAY   = 1.5    
+TELEGRAM_CHAR_LIMIT = 3800
+CHUNK_PADDING       = 10
+INTER_CHUNK_DELAY   = 1.5
 
 INDUSTRY_CACHE = {}
+
+# ── Amount / Scoring Helpers ────────────────────────────────────────────────
+
+def estimate_amounts(item):
+    """Return low, midpoint, high disclosed transaction estimates."""
+    try:
+        low = item.get("amount_range_low")
+        high = item.get("amount_range_high")
+
+        if low is None or high is None:
+            return 0, 0, 0
+
+        low = float(low)
+        high = float(high)
+        midpoint = (low + high) / 2
+
+        return low, midpoint, high
+
+    except (TypeError, ValueError):
+        return 0, 0, 0
+
+
+def format_amount(value):
+    """Compact amount formatting for Telegram."""
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.1f}m"
+    if value >= 1_000:
+        return f"${value / 1_000:.0f}k"
+    return f"${value:.0f}"
+
+
+def calculate_signal_score(total_midpoint_amount, unique_buyers, days_since_purchase, pct_change):
+    """
+    Dollar-conviction-heavy scoring model.
+
+    Approx weighting:
+    - 65% dollar conviction
+    - 20% freshness
+    - 10% cluster confirmation
+    - 5% entry quality
+    """
+
+    # 1. Dollar conviction dominates.
+    # $1m midpoint roughly reaches full amount score.
+    amount_score = min(total_midpoint_amount / 1_000_000, 1.0) * 65
+
+    # 2. Freshness decays across MAX_DAYS_AGO.
+    freshness_score = max(0, 1 - (days_since_purchase / MAX_DAYS_AGO)) * 20
+
+    # 3. Cluster confirmation helps, but does not dominate.
+    cluster_score = min(max(unique_buyers - 1, 0) * 5, 10)
+
+    # 4. Entry quality.
+    if pct_change < 0:
+        entry_score = 5
+    elif pct_change <= FRESH_PCT:
+        entry_score = 4
+    elif pct_change <= MAX_PCT_CHANGE:
+        entry_score = 2
+    else:
+        entry_score = 0
+
+    return round(amount_score + freshness_score + cluster_score + entry_score, 1)
 
 # ── Core Processing Functions ───────────────────────────────────────────────
 
@@ -52,13 +114,15 @@ def fetch_trades():
         return []
 
     trades = []
+
     for item in raw_data:
         tx_type = str(item.get('transaction_type', item.get('type', ''))).lower()
         if 'purchase' not in tx_type and 'buy' not in tx_type:
             continue
-            
+
         asset_category = str(item.get('asset_type', '')).lower().strip()
         valid_stock_tags = ('stock', 'common stock', 'equity', 'st')
+
         if asset_category not in valid_stock_tags:
             continue
 
@@ -66,75 +130,90 @@ def fetch_trades():
         if not ticker or str(ticker).lower() in ('null', 'none', '--', 'n/a'):
             continue
 
-        # Basic parsing to extract last name
         name = item.get('filer_name', item.get('representative', '')).strip()
         parts = name.split()
         last_name = parts[-1] if len(parts) >= 2 else parts[0] if parts else 'Unknown'
+
+        low, midpoint, high = estimate_amounts(item)
 
         trades.append({
             'ticker': str(ticker).strip().upper(),
             'transaction_date': item.get('transaction_date', ''),
             'filing_date': item.get('filing_date', ''),
-            'name': last_name
+            'name': last_name,
+            'amount_low': low,
+            'amount_midpoint': midpoint,
+            'amount_high': high
         })
-        
+
     return trades
 
+
 def get_price_info(ticker, trade_date_str, retries=3):
-    """Return (purchase_price, current_price) calculated from the purchase date."""
+    """Return purchase_price and current_price calculated from the purchase date."""
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
             end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
             hist = stock.history(start=trade_date_str, end=end_date)
+
             if hist.empty:
                 return None, None
+
             purchase = float(hist.iloc[0]['Close'])
             current  = float(hist.iloc[-1]['Close'])
+
             return purchase, current
-        except Exception as e:
+
+        except Exception:
             wait = (attempt + 1) * 2
             time.sleep(wait)
+
     return None, None
+
 
 def get_industry(ticker, retries=2):
     """Fetch corporate industry metadata, cached internally per ticker."""
     if ticker in INDUSTRY_CACHE:
         return INDUSTRY_CACHE[ticker]
+
     for attempt in range(retries):
         try:
             info = yf.Ticker(ticker).info
             industry = info.get('industry', info.get('sector', 'N/A'))
             INDUSTRY_CACHE[ticker] = industry
             return industry
-        except Exception as e:
+        except Exception:
             time.sleep(1)
+
     return 'N/A'
+
 
 def process_and_filter_clusters(raw_trades):
     """
-    FIXED PIPELINE: 
-    1. Groups all raw trades by ticker first to accurately count cluster buyers.
-    2. Runs pricing analytics and filters out trades that don't match criteria.
+    Groups trades by ticker, aggregates disclosed amount ranges,
+    applies price filters, then scores each ticker by conviction.
     """
-    # Step 1: Group raw trades by ticker first so we don't drop cluster signals
+
     ticker_groups = {}
     for t in raw_trades:
         ticker_groups.setdefault(t['ticker'], []).append(t)
 
     aggregated_results = []
 
-    # Step 2: Now analyze each grouped ticker cluster safely
     for ticker, trades in ticker_groups.items():
         if len(ticker) > 5:
             continue
 
-        # Extract all unique buyers for this cluster BEFORE filtering out by price
         unique_buyers_list = sorted(set(t['name'] for t in trades))
         unique_buyers_count = len(unique_buyers_list)
 
-        # Find the absolute newest trade in this cluster to evaluate timing parameters
+        total_low_amount = sum(t.get('amount_low', 0) for t in trades)
+        total_midpoint_amount = sum(t.get('amount_midpoint', 0) for t in trades)
+        total_high_amount = sum(t.get('amount_high', 0) for t in trades)
+
         valid_trades = []
+
         for t in trades:
             try:
                 t_date = datetime.strptime(t['transaction_date'], '%Y-%m-%d')
@@ -146,46 +225,53 @@ def process_and_filter_clusters(raw_trades):
         if not valid_trades:
             continue
 
-        # Sort by transaction date to find the most recent one
         valid_trades.sort(key=lambda x: x[0], reverse=True)
         latest_trade_date, latest_filing_date, latest_trade_raw = valid_trades[0]
 
         days_since_purchase = (datetime.now() - latest_trade_date).days
         reporting_lag = (latest_filing_date - latest_trade_date).days
 
-        # Filter Out completely stale data clusters
         if days_since_purchase > MAX_DAYS_AGO or days_since_purchase < 0:
             continue
 
-        # Fetch pricing metrics relative to the latest purchase entry
         logging.info(f"Checking pricing metrics for purchase cluster: ${ticker}")
-        purchase_price, current_price = get_price_info(ticker, latest_trade_raw['transaction_date'])
+
+        purchase_price, current_price = get_price_info(
+            ticker,
+            latest_trade_raw['transaction_date']
+        )
+
         if purchase_price is None:
             continue
 
         pct_change = (current_price - purchase_price) / purchase_price * 100
 
-        # CRITICAL FILTER: Allow cluster trades an extra buffer, but cap single trades strictly
+        # Keep original breakout discipline.
         if unique_buyers_count < 2 and pct_change > MAX_PCT_CHANGE:
             continue
-        elif unique_buyers_count >= 2 and pct_change > (MAX_PCT_CHANGE + 7): 
-            # Give high conviction cluster signals a wider breakout buffer (+7%) so you don't miss them
+        elif unique_buyers_count >= 2 and pct_change > (MAX_PCT_CHANGE + 7):
             continue
 
         industry = get_industry(ticker)
 
         if len(unique_buyers_list) > 3:
-            buyer_str = f"{unique_buyers_list[0]}, ... +{len(unique_buyers_list)-1}"
+            buyer_str = f"{unique_buyers_list[0]}, ... +{len(unique_buyers_list) - 1}"
         else:
             buyer_str = ", ".join(unique_buyers_list)
 
-        # HIGHLY DISCERNING COLOR TIER RULE SYSTEM:
         if days_since_purchase <= FRESH_DAYS and pct_change <= FRESH_PCT:
-            status = "🟢"  # Perfect Entry Option: Fresh buy, flat price action.
+            status = "🟢"
         elif pct_change < 0:
-            status = "🟡"  # Discount Zone: Older purchase, trading BELOW what they paid.
+            status = "🟡"
         else:
-            status = "🟠"  # Premium Zone: Older purchase, trading up to our ceiling limit.
+            status = "🟠"
+
+        signal_score = calculate_signal_score(
+            total_midpoint_amount=total_midpoint_amount,
+            unique_buyers=unique_buyers_count,
+            days_since_purchase=days_since_purchase,
+            pct_change=pct_change
+        )
 
         aggregated_results.append({
             'ticker': ticker,
@@ -195,40 +281,67 @@ def process_and_filter_clusters(raw_trades):
             'days_since_purchase': days_since_purchase,
             'reporting_lag': reporting_lag,
             'status': status,
-            'industry': industry
+            'industry': industry,
+            'total_low_amount': total_low_amount,
+            'total_midpoint_amount': total_midpoint_amount,
+            'total_high_amount': total_high_amount,
+            'signal_score': signal_score
         })
+
         time.sleep(0.15)
 
     return aggregated_results
 
+
 def build_chunks(aggregated):
-    """Sort and compile output pushing multi-buyer cluster signals to the top."""
+    """Sort and compile Telegram output by conviction score."""
     if not aggregated:
         return []
 
-    status_order = {'🟢': 0, '🟡': 1, '🟠': 2}
-    # Priority sorting: Cluster signal presence -> Color Category -> Freshness age
-    aggregated.sort(key=lambda x: (
-        0 if x['unique_buyers'] >= 2 else 1, 
-        status_order.get(x['status'], 99), 
-        x['days_since_purchase']
-    ))
+    aggregated.sort(
+        key=lambda x: x.get('signal_score', 0),
+        reverse=True
+    )
 
     counts = Counter(t['status'] for t in aggregated)
-    summary_line = f"🟢 Fresh Window: {counts['🟢']}  |  🟡 Discounted: {counts['🟡']}  |  🟠 Premium: {counts['🟠']}\n\n"
-    base_header = f"📊 CONGRESS PURCHASES (Sorted by Alpha Signal & Clustered Conviction)\n"
-    
-    footer = (f"\n🟢 = New Buy (≤ {FRESH_DAYS}d, Price ≤ {FRESH_PCT}%)\n"
-              f"🟡 = Discount Zone (Bought > {FRESH_DAYS}d ago, Stock is DOWN since purchase)\n"
-              f"🟠 = Premium Zone (Bought > {FRESH_DAYS}d ago, Stock is UP up to limits)\n"
-              f"👥👥 = CLUSTER SIGNALS (2+ politicians buying same stock)")
+
+    summary_line = (
+        f"🟢 Fresh Window: {counts['🟢']}  |  "
+        f"🟡 Discounted: {counts['🟡']}  |  "
+        f"🟠 Premium: {counts['🟠']}\n\n"
+    )
+
+    base_header = (
+        f"📊 CONGRESS PURCHASES\n"
+        f"Sorted by Dollar Conviction, Freshness & Cluster Signal\n"
+    )
+
+    footer = (
+        f"\n🟢 = New Buy ≤ {FRESH_DAYS}d and Price ≤ {FRESH_PCT}%\n"
+        f"🟡 = Stock below latest purchase price\n"
+        f"🟠 = Stock up, but within filter limit\n"
+        f"👥👥 = 2+ politicians buying same ticker\n"
+        f"Est = Sum of midpoint disclosed purchase ranges"
+    )
 
     lines = []
+
     for t in aggregated:
         prefix = f"👥👥 {t['status']}" if t['unique_buyers'] >= 2 else t['status']
-        line = (f"{prefix} ${t['ticker']} | {t['buyer_str']} | "
-                f"Bought {t['days_since_purchase']}d ago | "
-                f"Price: {t['pct_change']:+.1f}% | {t['industry'][:10]}")
+
+        est_mid = format_amount(t.get('total_midpoint_amount', 0))
+        est_low = format_amount(t.get('total_low_amount', 0))
+        est_high = format_amount(t.get('total_high_amount', 0))
+
+        line = (
+            f"{prefix} ${t['ticker']} | {t['buyer_str']} | "
+            f"Est: {est_mid} [{est_low}-{est_high}] | "
+            f"Score: {t['signal_score']} | "
+            f"Bought {t['days_since_purchase']}d ago | "
+            f"Price: {t['pct_change']:+.1f}% | "
+            f"{t['industry'][:10]}"
+        )
+
         lines.append(line)
 
     chunks = []
@@ -244,6 +357,7 @@ def build_chunks(aggregated):
 
     current_chunk += footer
     chunks.append(current_chunk)
+
     return chunks
 
 # ── Main Control Cycle ──────────────────────────────────────────────────────
@@ -253,15 +367,18 @@ def main():
         logging.error("Missing critical environment variables: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID")
         return
 
-    logging.info("Executing pipeline optimized cluster cycle...")
+    logging.info("Executing conviction-weighted congress purchase pipeline...")
+
     raw = fetch_trades()
+
     if not raw:
+        logging.info("No raw purchase trades found.")
         return
 
-    # Pipeline functions combined cleanly into process_and_filter_clusters
     aggregated = process_and_filter_clusters(raw)
+
     if not aggregated:
-        logging.info("No trades fit our strict copy parameters today.")
+        logging.info("No trades fit the strict copy parameters today.")
         return
 
     message_chunks = build_chunks(aggregated)
@@ -273,11 +390,14 @@ def main():
     async def send_all():
         for idx, chunk in enumerate(message_chunks):
             await send_telegram(chunk)
+
             if len(message_chunks) > 1 and idx < len(message_chunks) - 1:
-                await asyncio.sleep(INTER_CHUNK_DELAY) 
+                await asyncio.sleep(INTER_CHUNK_DELAY)
 
     asyncio.run(send_all())
+
     logging.info("All dispatches executed successfully.")
+
 
 if __name__ == "__main__":
     main()
