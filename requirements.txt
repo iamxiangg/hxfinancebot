@@ -1,5 +1,5 @@
 # --- Core Math, Analytics & Data Orchestration ---
-yfinance>=0.2.40
+yfinance==1.4.1
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0
