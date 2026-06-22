@@ -1,4 +1,4 @@
-# VERSION: 2026-06-22-PILOT-WORKFLOW-2
+# VERSION: 2026-06-22-PILOT-SIGNAL-LOG-WORKFLOW-1
 
 name: Funnel - Pilot
 
@@ -14,6 +14,7 @@ name: Funnel - Pilot
           - reader
           - congress-dry-run
           - pilot-sheet-setup
+          - pilot-signal-log-write
 
       preview_count:
         description: Number of ticker rows to display
@@ -27,6 +28,15 @@ name: Funnel - Pilot
 
       confirm_pilot_sheet_setup:
         description: Select YES only when running pilot-sheet-setup
+        required: true
+        default: "NO"
+        type: choice
+        options:
+          - "NO"
+          - "YES"
+
+      confirm_pilot_signal_log_write:
+        description: Select YES only when running pilot-signal-log-write
         required: true
         default: "NO"
         type: choice
@@ -80,6 +90,12 @@ jobs:
           echo "pilot-sheet-setup requires confirm_pilot_sheet_setup=YES."
           exit 1
 
+      - name: Reject unconfirmed signal-log write
+        if: ${{ inputs.mode == 'pilot-signal-log-write' && inputs.confirm_pilot_signal_log_write != 'YES' }}
+        run: |
+          echo "pilot-signal-log-write requires confirm_pilot_signal_log_write=YES."
+          exit 1
+
       - name: Run read-only Google Sheets test
         if: ${{ inputs.mode == 'reader' }}
         env:
@@ -117,6 +133,20 @@ jobs:
         run: |
           set -euo pipefail
           python -m funnel.pilot_sheet_setup
+
+      - name: Write current Congress signals to pilot signal log
+        if: ${{ inputs.mode == 'pilot-signal-log-write' && inputs.confirm_pilot_signal_log_write == 'YES' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+          MIN_CONVICTION: ${{ inputs.min_conviction }}
+          CONFIRM_PILOT_SIGNAL_LOG_WRITE: ${{ inputs.confirm_pilot_signal_log_write }}
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.pilot_signal_log_writer
 
       - name: Upload funnel output
         if: ${{ success() && inputs.mode != 'reader' }}
