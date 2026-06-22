@@ -1,5 +1,6 @@
-# VERSION: 2026-06-22-PILOT-SHEET-SETUP-LEGACY-MIGRATION-2
-# Funnel Pilot: create, verify and safely migrate pilot worksheet headers
+# VERSION: 2026-06-22-PILOT-SHEET-SETUP-LEGACY-MIGRATION-3
+# Creates and verifies pilot worksheets.
+# Known legacy headers are migrated only when no data rows exist.
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from funnel.google_client import (
 
 
 logger = logging.getLogger(__name__)
+
 
 PROTECTED_PRODUCTION_SHEET = "Stock Summary USD"
 
@@ -102,23 +104,6 @@ FUNNEL_HEADERS = [
 ]
 
 
-# Known header from the earlier pilot-tab design.
-#
-# This may be migrated automatically only when there are no data rows
-# beneath the header.
-LEGACY_PENDING_HEADERS = [
-    "Ticker",
-    "Stock Name",
-    "Google Ticker",
-    "Discovery Source",
-    "Discovery Reason",
-    "Date Discovered",
-    "Validation Status",
-    "Add to Stock Summary USD?",
-    "Added Date",
-]
-
-
 PILOT_SCHEMAS = {
     PENDING_SHEET: PENDING_HEADERS,
     SIGNAL_LOG_SHEET: SIGNAL_HEADERS,
@@ -126,16 +111,71 @@ PILOT_SCHEMAS = {
 }
 
 
-ALLOWED_WRITE_SHEETS = set(
-    PILOT_SCHEMAS
-)
+# Earlier schemas generated during the initial pilot.
+# They can be replaced automatically only when the worksheet contains
+# no data rows below row 1.
+LEGACY_SCHEMAS = {
+    PENDING_SHEET: [
+        [
+            "Ticker",
+            "Stock Name",
+            "Google Ticker",
+            "Discovery Source",
+            "Discovery Reason",
+            "Date Discovered",
+            "Validation Status",
+            "Add to Stock Summary USD?",
+            "Added Date",
+        ],
+    ],
+    SIGNAL_LOG_SHEET: [
+        [
+            "Signal ID",
+            "Ticker",
+            "Scanner",
+            "Classification",
+            "Score",
+            "Observed At",
+            "Valid Until",
+            "Details",
+            "Active",
+        ],
+        [
+            "Signal ID",
+            "Ticker",
+            "Scanner",
+            "Classification",
+            "Score",
+            "Observed At",
+            "Valid Until",
+            "Details JSON",
+            "Active",
+        ],
+    ],
+    FUNNEL_SHEET: [
+        [
+            "Ticker",
+            "Stock Name",
+            "Already in Stock Summary USD?",
+            "Discovery Source",
+            "Latest Classification",
+            "Latest Score",
+            "Latest Signal Date",
+            "Valid Until",
+            "Signal Count",
+            "Opportunity Stage",
+            "Manual Decision",
+            "Notes",
+        ],
+    ],
+}
+
+
+ALLOWED_WRITE_SHEETS = set(PILOT_SCHEMAS)
 
 
 def _require_confirmation() -> None:
-    """
-    Require explicit workflow confirmation before any worksheet creation
-    or header migration.
-    """
+    """Require explicit confirmation before creating or changing headers."""
     confirmation = str(
         os.getenv(
             "CONFIRM_PILOT_SHEET_SETUP",
@@ -150,18 +190,31 @@ def _require_confirmation() -> None:
         )
 
 
+def _assert_allowed_sheet(
+    sheet_name: str,
+) -> None:
+    """Block every write outside the approved pilot worksheets."""
+    if sheet_name == PROTECTED_PRODUCTION_SHEET:
+        raise RuntimeError(
+            "Writing to Stock Summary USD is prohibited."
+        )
+
+    if sheet_name not in ALLOWED_WRITE_SHEETS:
+        raise RuntimeError(
+            f"Writing to worksheet {sheet_name!r} is prohibited."
+        )
+
+
 def _column_letter(
     column_number: int,
 ) -> str:
-    """
-    Convert a 1-based column number into a Google Sheets column label.
-    """
+    """Convert a one-based column number to a Sheets column letter."""
     if column_number < 1:
         raise ValueError(
             "column_number must be at least 1."
         )
 
-    output = ""
+    result = ""
     remaining = column_number
 
     while remaining:
@@ -170,68 +223,33 @@ def _column_letter(
             26,
         )
 
-        output = (
+        result = (
             chr(65 + remainder)
-            + output
+            + result
         )
 
-    return output
+    return result
 
 
-def _assert_allowed_sheet(
-    sheet_name: str,
-) -> None:
-    """
-    Prevent every write outside the three approved pilot worksheets.
-    """
-    if sheet_name == PROTECTED_PRODUCTION_SHEET:
-        raise RuntimeError(
-            "Pilot setup is forbidden from writing "
-            "to Stock Summary USD."
-        )
-
-    if sheet_name not in ALLOWED_WRITE_SHEETS:
-        raise RuntimeError(
-            "Pilot setup is forbidden from writing "
-            f"to {sheet_name!r}."
-        )
-
-
-def _normalise_cells(
-    values: list[Any],
+def _normalise_row(
+    row: list[Any],
 ) -> list[str]:
-    """
-    Convert a worksheet row into stripped strings.
-    """
-    return [
+    """Convert cells to stripped strings and remove trailing blanks."""
+    values = [
         str(value).strip()
-        for value in values
+        for value in row
     ]
 
+    while values and values[-1] == "":
+        values.pop()
 
-def _trim_trailing_blanks(
-    values: list[str],
-) -> list[str]:
-    """
-    Remove trailing blank cells while retaining internal blank cells.
-    """
-    trimmed = list(values)
-
-    while (
-        trimmed
-        and trimmed[-1] == ""
-    ):
-        trimmed.pop()
-
-    return trimmed
+    return values
 
 
 def _contains_data_rows(
     rows: list[list[Any]],
 ) -> bool:
-    """
-    Return True when at least one non-empty cell exists below row 1.
-    """
+    """Return True when a non-empty cell exists below the header."""
     for row in rows[1:]:
         for value in row:
             if str(value).strip():
@@ -241,12 +259,10 @@ def _contains_data_rows(
 
 
 def _get_sheet_metadata(
-    service,
+    service: Any,
     spreadsheet_id: str,
 ) -> dict[str, dict[str, Any]]:
-    """
-    Retrieve worksheet titles, IDs and grid sizes.
-    """
+    """Return worksheet metadata keyed by worksheet title."""
     response = (
         service.spreadsheets()
         .get(
@@ -280,24 +296,20 @@ def _get_sheet_metadata(
         ).strip()
 
         if title:
-            metadata[
-                title
-            ] = properties
+            metadata[title] = properties
 
     return metadata
 
 
 def _create_missing_pilot_sheets(
-    service,
+    service: Any,
     spreadsheet_id: str,
     metadata: dict[str, dict[str, Any]],
 ) -> list[str]:
-    """
-    Create only approved pilot worksheets that do not already exist.
-    """
+    """Create only missing approved pilot worksheets."""
     missing = sorted(
         ALLOWED_WRITE_SHEETS.difference(
-            metadata
+            metadata.keys()
         )
     )
 
@@ -313,15 +325,6 @@ def _create_missing_pilot_sheets(
             sheet_name
         )
 
-        required_columns = max(
-            40,
-            len(
-                PILOT_SCHEMAS[
-                    sheet_name
-                ]
-            ),
-        )
-
         requests.append(
             {
                 "addSheet": {
@@ -329,7 +332,7 @@ def _create_missing_pilot_sheets(
                         "title": sheet_name,
                         "gridProperties": {
                             "rowCount": 2000,
-                            "columnCount": required_columns,
+                            "columnCount": 40,
                         },
                     }
                 }
@@ -346,24 +349,21 @@ def _create_missing_pilot_sheets(
     return missing
 
 
-def _expand_existing_pilot_sheets(
-    service,
+def _ensure_grid_capacity(
+    service: Any,
     spreadsheet_id: str,
     metadata: dict[str, dict[str, Any]],
 ) -> list[str]:
-    """
-    Ensure every pilot worksheet has enough rows and columns.
-    """
+    """Ensure pilot worksheets have at least 2,000 rows and 40 columns."""
     requests: list[
         dict[str, Any]
     ] = []
 
     expanded: list[str] = []
 
-    for (
-        sheet_name,
-        headers,
-    ) in PILOT_SCHEMAS.items():
+    for sheet_name in sorted(
+        ALLOWED_WRITE_SHEETS
+    ):
         _assert_allowed_sheet(
             sheet_name
         )
@@ -372,10 +372,9 @@ def _expand_existing_pilot_sheets(
             sheet_name
         )
 
-        if not properties:
+        if properties is None:
             raise RuntimeError(
-                "Missing metadata for pilot "
-                f"worksheet {sheet_name!r}."
+                f"Missing metadata for {sheet_name!r}."
             )
 
         grid = properties.get(
@@ -401,7 +400,7 @@ def _expand_existing_pilot_sheets(
         target_columns = max(
             current_columns,
             40,
-            len(headers),
+            len(PILOT_SCHEMAS[sheet_name]),
         )
 
         if (
@@ -446,20 +445,13 @@ def _expand_existing_pilot_sheets(
 
 
 def _read_sheet_rows(
-    service,
+    service: Any,
     spreadsheet_id: str,
     sheet_name: str,
-    column_count: int,
 ) -> list[list[Any]]:
-    """
-    Read the worksheet area needed for schema verification.
-    """
+    """Read the used cells of an approved pilot worksheet."""
     _assert_allowed_sheet(
         sheet_name
-    )
-
-    last_column = _column_letter(
-        column_count
     )
 
     response = (
@@ -467,10 +459,7 @@ def _read_sheet_rows(
         .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            range=(
-                f"'{sheet_name}'!"
-                f"A:{last_column}"
-            ),
+            range=f"'{sheet_name}'!A:AZ",
             majorDimension="ROWS",
         )
         .execute()
@@ -483,14 +472,12 @@ def _read_sheet_rows(
 
 
 def _write_header(
-    service,
+    service: Any,
     spreadsheet_id: str,
     sheet_name: str,
     headers: list[str],
 ) -> None:
-    """
-    Write one approved pilot worksheet header.
-    """
+    """Write one approved pilot worksheet header."""
     _assert_allowed_sheet(
         sheet_name
     )
@@ -507,47 +494,84 @@ def _write_header(
     ).execute()
 
 
+def _format_header(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_id: int,
+    header_count: int,
+) -> None:
+    """Apply basic formatting and freeze row 1."""
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": header_count,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {
+                                    "bold": True
+                                },
+                                "wrapStrategy": "WRAP",
+                            }
+                        },
+                        "fields": (
+                            "userEnteredFormat.textFormat.bold,"
+                            "userEnteredFormat.wrapStrategy"
+                        ),
+                    }
+                },
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {
+                                "frozenRowCount": 1
+                            },
+                        },
+                        "fields": (
+                            "gridProperties.frozenRowCount"
+                        ),
+                    }
+                },
+            ]
+        },
+    ).execute()
+
+
 def _is_known_legacy_header(
     sheet_name: str,
-    actual_headers: list[str],
+    actual_header: list[str],
 ) -> bool:
-    """
-    Identify an explicitly supported earlier pilot schema.
-    """
-    if sheet_name != PENDING_SHEET:
-        return False
-
-    return (
-        actual_headers
-        == LEGACY_PENDING_HEADERS
+    """Return True when a header matches a supported legacy schema."""
+    return actual_header in LEGACY_SCHEMAS.get(
+        sheet_name,
+        [],
     )
 
 
 def _set_or_verify_header(
-    service,
+    service: Any,
     spreadsheet_id: str,
     sheet_name: str,
     expected_headers: list[str],
 ) -> str:
     """
-    Create, verify or safely migrate a pilot worksheet header.
+    Create, verify or safely migrate a worksheet header.
 
-    Rules:
-    - an empty worksheet receives the current header;
-    - the current header is accepted unchanged;
-    - a known legacy header is migrated only when no data rows exist;
-    - every other existing structure causes a safe failure.
+    A known legacy header is migrated only when there are no data rows.
     """
-    read_column_count = max(
-        len(expected_headers),
-        len(LEGACY_PENDING_HEADERS),
-    )
-
     rows = _read_sheet_rows(
         service,
         spreadsheet_id,
         sheet_name,
-        read_column_count,
     )
 
     if not rows:
@@ -560,26 +584,23 @@ def _set_or_verify_header(
 
         return "HEADER_CREATED"
 
-    actual_headers = _trim_trailing_blanks(
-        _normalise_cells(
-            rows[0]
-        )
+    actual_header = _normalise_row(
+        rows[0]
     )
 
-    if actual_headers == expected_headers:
+    if actual_header == expected_headers:
         return "HEADER_ALREADY_VALID"
 
     if _is_known_legacy_header(
         sheet_name,
-        actual_headers,
+        actual_header,
     ):
         if _contains_data_rows(
             rows
         ):
             raise RuntimeError(
-                f"{sheet_name} uses the recognised legacy header, "
-                "but contains data rows. No migration was performed. "
-                "Back up or migrate those records before rerunning."
+                f"{sheet_name} contains a recognised legacy header, "
+                "but it also contains data rows. No migration was performed."
             )
 
         _write_header(
@@ -593,19 +614,16 @@ def _set_or_verify_header(
 
     raise RuntimeError(
         f"{sheet_name} already contains an unexpected header. "
-        f"Expected {expected_headers}; "
-        f"found {actual_headers}. "
+        f"Expected {expected_headers}; found {actual_header}. "
         "No data were cleared or replaced."
     )
 
 
 def _verify_headers(
-    service,
+    service: Any,
     spreadsheet_id: str,
 ) -> None:
-    """
-    Verify all three pilot worksheet headers after setup.
-    """
+    """Confirm all pilot worksheets have the current exact headers."""
     for (
         sheet_name,
         expected_headers,
@@ -614,36 +632,28 @@ def _verify_headers(
             service,
             spreadsheet_id,
             sheet_name,
-            len(expected_headers),
         )
 
         if not rows:
             raise RuntimeError(
-                "Post-setup verification failed: "
-                f"{sheet_name} is empty."
+                f"Post-setup verification failed: {sheet_name} is empty."
             )
 
-        actual_headers = _trim_trailing_blanks(
-            _normalise_cells(
-                rows[0]
-            )
+        actual_header = _normalise_row(
+            rows[0]
         )
 
-        if actual_headers != expected_headers:
+        if actual_header != expected_headers:
             raise RuntimeError(
-                "Post-setup verification failed for "
-                f"{sheet_name}. "
-                f"Expected {expected_headers}; "
-                f"found {actual_headers}."
+                f"Post-setup verification failed for {sheet_name}. "
+                f"Expected {expected_headers}; found {actual_header}."
             )
 
 
 def _write_receipt(
     receipt: dict[str, Any],
 ) -> Path:
-    """
-    Write an auditable setup receipt to the workflow artefact directory.
-    """
+    """Write a setup receipt for the GitHub Actions artifact."""
     output_dir = Path(
         os.getenv(
             "FUNNEL_OUTPUT_DIR",
@@ -656,12 +666,12 @@ def _write_receipt(
         exist_ok=True,
     )
 
-    path = (
+    receipt_path = (
         output_dir
         / "pilot_sheet_setup_receipt.json"
     )
 
-    path.write_text(
+    receipt_path.write_text(
         json.dumps(
             receipt,
             ensure_ascii=False,
@@ -671,13 +681,11 @@ def _write_receipt(
         encoding="utf-8",
     )
 
-    return path
+    return receipt_path
 
 
 def main() -> None:
-    """
-    Create, migrate and verify pilot worksheet structures.
-    """
+    """Run the controlled header-only pilot worksheet setup."""
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -707,15 +715,16 @@ def main() -> None:
         not in metadata
     ):
         raise RuntimeError(
-            "Required worksheet "
-            f"{PROTECTED_PRODUCTION_SHEET!r} "
+            f"Required worksheet {PROTECTED_PRODUCTION_SHEET!r} "
             "was not found."
         )
 
-    created = _create_missing_pilot_sheets(
-        service,
-        spreadsheet_id,
-        metadata,
+    created_sheets = (
+        _create_missing_pilot_sheets(
+            service,
+            spreadsheet_id,
+            metadata,
+        )
     )
 
     metadata = _get_sheet_metadata(
@@ -723,24 +732,26 @@ def main() -> None:
         spreadsheet_id,
     )
 
-    unresolved = sorted(
+    missing_after_creation = sorted(
         ALLOWED_WRITE_SHEETS.difference(
-            metadata
+            metadata.keys()
         )
     )
 
-    if unresolved:
+    if missing_after_creation:
         raise RuntimeError(
             "Unable to create pilot worksheets: "
             + ", ".join(
-                unresolved
+                missing_after_creation
             )
         )
 
-    expanded = _expand_existing_pilot_sheets(
-        service,
-        spreadsheet_id,
-        metadata,
+    expanded_sheets = (
+        _ensure_grid_capacity(
+            service,
+            spreadsheet_id,
+            metadata,
+        )
     )
 
     header_results: dict[
@@ -750,15 +761,30 @@ def main() -> None:
 
     for (
         sheet_name,
-        headers,
+        expected_headers,
     ) in PILOT_SCHEMAS.items():
-        header_results[
-            sheet_name
-        ] = _set_or_verify_header(
+        result = _set_or_verify_header(
             service,
             spreadsheet_id,
             sheet_name,
-            headers,
+            expected_headers,
+        )
+
+        header_results[
+            sheet_name
+        ] = result
+
+        _format_header(
+            service,
+            spreadsheet_id,
+            int(
+                metadata[
+                    sheet_name
+                ][
+                    "sheetId"
+                ]
+            ),
+            len(expected_headers),
         )
 
     _verify_headers(
@@ -766,7 +792,7 @@ def main() -> None:
         spreadsheet_id,
     )
 
-    migrated = sorted(
+    migrated_sheets = sorted(
         sheet_name
         for (
             sheet_name,
@@ -778,14 +804,16 @@ def main() -> None:
 
     receipt = {
         "status": "PASSED",
-        "created_sheets": created,
-        "expanded_sheets": expanded,
-        "migrated_legacy_headers": migrated,
+        "created_sheets": created_sheets,
+        "expanded_sheets": expanded_sheets,
+        "migrated_legacy_headers": migrated_sheets,
         "header_results": header_results,
         "allowed_write_sheets": sorted(
             ALLOWED_WRITE_SHEETS
         ),
-        "protected_sheet": PROTECTED_PRODUCTION_SHEET,
+        "protected_sheet": (
+            PROTECTED_PRODUCTION_SHEET
+        ),
         "protected_sheet_written": False,
         "data_rows_written": 0,
     }
@@ -801,26 +829,23 @@ def main() -> None:
     print(
         "=" * 39
     )
-    print(
-        "Pilot worksheets:"
-    )
 
     for sheet_name in sorted(
         PILOT_SCHEMAS
     ):
         print(
-            f"  {sheet_name}: "
+            f"{sheet_name}: "
             f"{header_results[sheet_name]}"
         )
 
     print()
     print(
         f"Created worksheets:          "
-        f"{len(created)}"
+        f"{len(created_sheets)}"
     )
     print(
         f"Migrated legacy headers:     "
-        f"{len(migrated)}"
+        f"{len(migrated_sheets)}"
     )
     print(
         "Data rows written:           0"
@@ -833,12 +858,10 @@ def main() -> None:
         f"{receipt_path}"
     )
     print(
-        "PILOT SHEET HEADER "
-        "VERIFICATION PASSED"
+        "PILOT SHEET HEADER VERIFICATION PASSED"
     )
     print(
-        "PILOT SHEET SETUP "
-        "COMPLETED SUCCESSFULLY"
+        "PILOT SHEET SETUP COMPLETED SUCCESSFULLY"
     )
     print()
 
