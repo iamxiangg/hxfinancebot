@@ -1,3 +1,5 @@
+# VERSION: 2026-06-22-PILOT-SHEET-SETUP-WORKFLOW-1
+
 name: Funnel - Pilot
 
 "on":
@@ -11,6 +13,7 @@ name: Funnel - Pilot
         options:
           - reader
           - congress-dry-run
+          - pilot-sheet-setup
 
       preview_count:
         description: Number of ticker rows to display
@@ -22,12 +25,25 @@ name: Funnel - Pilot
         required: false
         default: "15"
 
+      confirm_pilot_sheet_setup:
+        description: Select YES only when running pilot-sheet-setup
+        required: true
+        default: "NO"
+        type: choice
+        options:
+          - "NO"
+          - "YES"
+
 permissions:
   contents: read
 
+concurrency:
+  group: funnel-pilot
+  cancel-in-progress: false
+
 jobs:
   test-funnel:
-    name: Test Funnel Pilot
+    name: Test and run Funnel Pilot
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -58,6 +74,12 @@ jobs:
           set -euo pipefail
           python -m unittest discover -s tests -v
 
+      - name: Reject unconfirmed pilot sheet setup
+        if: ${{ inputs.mode == 'pilot-sheet-setup' && inputs.confirm_pilot_sheet_setup != 'YES' }}
+        run: |
+          echo "pilot-sheet-setup requires confirm_pilot_sheet_setup=YES."
+          exit 1
+
       - name: Run read-only Google Sheets test
         if: ${{ inputs.mode == 'reader' }}
         env:
@@ -83,11 +105,24 @@ jobs:
           set -euo pipefail
           python -m funnel.congress_dry_run
 
-      - name: Upload Congress dry-run files
-        if: ${{ inputs.mode == 'congress-dry-run' }}
+      - name: Create and verify pilot worksheet headers
+        if: ${{ inputs.mode == 'pilot-sheet-setup' && inputs.confirm_pilot_sheet_setup == 'YES' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+          CONFIRM_PILOT_SHEET_SETUP: ${{ inputs.confirm_pilot_sheet_setup }}
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.pilot_sheet_setup
+
+      - name: Upload funnel output
+        if: ${{ always() && inputs.mode != 'reader' }}
         uses: actions/upload-artifact@v4
         with:
-          name: funnel-congress-dry-run-${{ github.run_number }}
+          name: funnel-${{ inputs.mode }}-${{ github.run_number }}
           path: funnel_output/
           if-no-files-found: error
           retention-days: 14
