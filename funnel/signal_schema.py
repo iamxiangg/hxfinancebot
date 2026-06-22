@@ -1,4 +1,4 @@
-# VERSION: 2026-06-22-COMPATIBILITY-FIX-1
+# VERSION: 2026-06-22-SIGNAL-ID-FIX-2
 # Funnel Pilot: Common scanner signal schema
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def _clean_text(value: Any) -> str:
 
 def _normalise_ticker(value: Any) -> str:
     """
-    Normalise a ticker while preserving the ticker convention used in
+    Normalise a ticker while retaining the ticker convention used in
     Stock Summary USD column A.
     """
     return _clean_text(value).upper()
@@ -41,7 +41,7 @@ def _normalise_scanner(value: Any) -> str:
 
 
 def _normalise_classification(value: Any) -> str:
-    """Return the signal classification in lowercase."""
+    """Return the classification in lowercase."""
     return _clean_text(value).lower()
 
 
@@ -56,12 +56,10 @@ def _normalise_datetime(
         2026-06-22T19:00:00+08:00
         2026-06-22T11:00:00Z
 
-    Date-only and timezone-naive values are rejected because signal expiry
-    and ordering require an unambiguous point in time.
+    Timezone-naive values and date-only strings are rejected.
     """
     if isinstance(value, datetime):
         parsed = value
-
     else:
         text = _clean_text(value)
 
@@ -108,9 +106,7 @@ class Signal:
     """
     Common signal structure used by all funnel scanners.
 
-    Scanner-specific information belongs inside `details`, while these
-    outer fields remain consistent across Congress, VP/MA, gamma and
-    earnings signals.
+    Scanner-specific information belongs in details.
     """
 
     ticker: str
@@ -174,11 +170,9 @@ class Signal:
         )
 
         if self.valid_until is not None:
-            self.valid_until = (
-                _normalise_datetime(
-                    self.valid_until,
-                    "valid_until",
-                )
+            self.valid_until = _normalise_datetime(
+                self.valid_until,
+                "valid_until",
             )
 
         self.score = _normalise_score(
@@ -199,15 +193,18 @@ class Signal:
 
     def _generate_signal_id(self) -> str:
         """
-        Generate a stable signal ID.
+        Generate a stable signal identifier.
 
-        Identical ticker, scanner, classification and observation time
-        values produce the same ID.
+        Format:
+            scanner-TICKER-hash
+
+        Example:
+            congress-MSFT-a1b2c3d4e5f6
         """
         identity = "|".join(
             [
-                self.ticker,
                 self.scanner,
+                self.ticker,
                 self.classification,
                 str(self.observed_at),
             ]
@@ -217,14 +214,9 @@ class Signal:
             identity.encode("utf-8")
         ).hexdigest()[:12]
 
-        observed_date = str(
-            self.observed_at
-        )[:10].replace("-", "")
-
         return (
-            f"{observed_date}-"
+            f"{self.scanner}-"
             f"{self.ticker}-"
-            f"{self.scanner.upper()}-"
             f"{short_hash}"
         )
 
@@ -252,8 +244,7 @@ def signal_from_dict(
     """
     Create a Signal from a dictionary.
 
-    Unknown fields are ignored so that stored records can contain
-    additional metadata without breaking this constructor.
+    Unknown fields are ignored.
     """
     permitted_fields = {
         "ticker",
@@ -276,26 +267,14 @@ def signal_from_dict(
     )
 
 
-# -------------------------------------------------------------------------
-# Backwards compatibility
-# -------------------------------------------------------------------------
-#
-# Some earlier pilot modules import:
-#
-#     from funnel.signal_schema import ScannerSignal
-#
-# Newer modules import:
-#
-#     from funnel.signal_schema import Signal
-#
-# Both names now refer to the same class.
+# Compatibility with earlier funnel modules.
 ScannerSignal = Signal
 
 
 def main() -> None:
     """Run a small compatibility demonstration."""
     example_signal = Signal(
-        ticker="bwxt",
+        ticker="msft",
         scanner="congress",
         classification="actionable",
         score=74,
@@ -308,9 +287,6 @@ def main() -> None:
         details={
             "buyers": 2,
             "estimated_capital_mid": 180000,
-            "reason": (
-                "Recent disclosed purchase activity"
-            ),
         },
     )
 
@@ -324,10 +300,7 @@ def main() -> None:
     )
     print()
     print(
-        "Signal class:        available"
-    )
-    print(
-        "ScannerSignal alias: available"
+        f"Signal ID: {example_signal.signal_id}"
     )
     print(
         "SIGNAL SCHEMA TEST COMPLETED SUCCESSFULLY"
