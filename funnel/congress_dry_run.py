@@ -1,4 +1,5 @@
-# NEW — Funnel Pilot Step 4: Congress versus Google Sheets dry run
+# VERSION: 2026-06-22-CONGRESS-DRY-RUN-ROUTING-1
+# Funnel Pilot: read-only Congress comparison and candidate routing
 
 from __future__ import annotations
 
@@ -6,322 +7,366 @@ import csv
 import json
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from funnel.congress_adapter import run_congress_adapter
-from funnel.sheet_reader import get_stock_summary_ticker_records
-from funnel.signal_schema import ScannerSignal
-
-
-OUTPUT_DIRECTORY = Path(
-    os.getenv(
-        "FUNNEL_OUTPUT_DIR",
-        "funnel_output",
-    )
+from funnel.candidate_ingestor import (
+    classify_signals,
+    get_pending_new_ticker_records,
+)
+from funnel.congress_adapter import (
+    run_congress_adapter,
+)
+from funnel.sheet_reader import (
+    get_stock_summary_ticker_records,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+
+logger = logging.getLogger(
+    __name__
 )
 
-logger = logging.getLogger(__name__)
+
+COMPARISON_COLUMNS = [
+    "ticker",
+    "already_in_stock_summary",
+    "stock_summary_row",
+    "google_ticker",
+    "stock_name",
+    "candidate_status",
+    "pending_new_ticker",
+    "review_route",
+    "review_priority",
+    "scanner",
+    "classification",
+    "score",
+    "entry_quality",
+    "estimated_capital_mid",
+    "buyers",
+    "cluster_buyers",
+    "flow",
+    "names",
+    "opportunity_stage",
+    "discovery_reason",
+    "signal_count",
+    "observed_at",
+    "valid_until",
+    "signal_id",
+]
 
 
-def _get_min_conviction() -> float:
-    """Read the near-miss conviction threshold."""
-    raw_value = os.getenv(
-        "MIN_CONVICTION",
-        "15",
+PENDING_COLUMNS = [
+    "ticker",
+    "stock_name",
+    "google_ticker",
+    "scanner",
+    "classification",
+    "score",
+    "entry_quality",
+    "estimated_capital_mid",
+    "buyers",
+    "cluster_buyers",
+    "flow",
+    "names",
+    "review_priority",
+    "opportunity_stage",
+    "discovery_reason",
+    "observed_at",
+    "valid_until",
+    "signal_id",
+]
+
+
+def _float_environment(
+    name: str,
+    default: float,
+) -> float:
+    """Read a finite float from an environment variable."""
+    raw_value = str(
+        os.getenv(
+            name,
+            str(default),
+        )
     ).strip()
 
     try:
-        return float(raw_value)
-    except ValueError:
-        logger.warning(
-            "Invalid MIN_CONVICTION '%s'. Using 15.",
-            raw_value,
+        return float(
+            raw_value
         )
-        return 15.0
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be numeric. "
+            f"Received: {raw_value}"
+        ) from exc
 
 
-def _classification_priority(
-    classification: str,
-) -> int:
-    """Rank Congress classifications for presentation."""
-    priority = {
-        "actionable": 4,
-        "wait": 3,
-        "risk": 2,
-        "near_miss": 1,
-    }
-
-    return priority.get(
-        classification,
-        0,
+def _output_directory() -> Path:
+    """Return and create the workflow artifact directory."""
+    output_dir = Path(
+        os.getenv(
+            "FUNNEL_OUTPUT_DIR",
+            "funnel_output",
+        )
     )
 
-
-def _opportunity_stage(
-    classification: str,
-) -> str:
-    """
-    Assign a pilot organisational stage.
-
-    These are not trade instructions.
-    """
-    mapping = {
-        "actionable": "SHORTLISTED",
-        "wait": "ENTRY_WATCH",
-        "risk": "RESEARCH_RISK",
-        "near_miss": "RESEARCH",
-    }
-
-    return mapping.get(
-        classification,
-        "MONITORING",
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-
-def _build_comparison_records(
-    signals: list[ScannerSignal],
-    stock_records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Compare Congress signals with Stock Summary USD column A."""
-    stock_record_map = {
-        record["ticker"]: record
-        for record in stock_records
-    }
-
-    comparison_records: list[dict[str, Any]] = []
-
-    for signal in signals:
-        existing_record = stock_record_map.get(
-            signal.ticker
-        )
-
-        already_monitored = (
-            existing_record is not None
-        )
-
-        comparison_records.append(
-            {
-                "ticker": signal.ticker,
-                "already_in_stock_summary": (
-                    "YES"
-                    if already_monitored
-                    else "NO"
-                ),
-                "stock_summary_row": (
-                    existing_record["sheet_row"]
-                    if existing_record
-                    else ""
-                ),
-                "google_ticker": (
-                    existing_record["google_ticker"]
-                    if existing_record
-                    else ""
-                ),
-                "stock_name": (
-                    existing_record["stock_name"]
-                    if existing_record
-                    else ""
-                ),
-                "candidate_status": (
-                    "EXISTING_MONITORED_TICKER"
-                    if already_monitored
-                    else "NEW_CANDIDATE"
-                ),
-                "scanner": signal.scanner,
-                "classification": (
-                    signal.classification
-                ),
-                "score": signal.score,
-                "opportunity_stage": (
-                    _opportunity_stage(
-                        signal.classification
-                    )
-                ),
-                "observed_at": signal.observed_at,
-                "valid_until": (
-                    signal.valid_until or ""
-                ),
-                "signal_id": signal.signal_id,
-                "entry_quality": signal.details.get(
-                    "entry_quality",
-                    "",
-                ),
-                "estimated_capital_mid": (
-                    signal.details.get(
-                        "estimated_capital_mid",
-                        "",
-                    )
-                ),
-                "buyers": signal.details.get(
-                    "buyers",
-                    "",
-                ),
-                "cluster_buyers": (
-                    signal.details.get(
-                        "cluster_buyers",
-                        "",
-                    )
-                ),
-                "flow": signal.details.get(
-                    "flow",
-                    "",
-                ),
-                "names": ", ".join(
-                    signal.details.get(
-                        "names",
-                        [],
-                    )
-                ),
-            }
-        )
-
-    comparison_records.sort(
-        key=lambda record: (
-            _classification_priority(
-                str(record["classification"])
-            ),
-            float(record["score"] or 0),
-            str(record["ticker"]),
-        ),
-        reverse=True,
-    )
-
-    return comparison_records
+    return output_dir
 
 
 def _write_json(
     path: Path,
-    data: Any,
+    payload: Any,
 ) -> None:
-    """Write formatted JSON."""
+    """Write formatted UTF-8 JSON."""
     path.write_text(
         json.dumps(
-            data,
-            indent=2,
+            payload,
             ensure_ascii=False,
+            indent=2,
             sort_keys=True,
+            default=str,
         ),
         encoding="utf-8",
     )
 
 
-def _write_comparison_csv(
+def _write_csv(
     path: Path,
-    records: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    columns: list[str],
 ) -> None:
-    """Write the ticker comparison report."""
-    fieldnames = [
-        "ticker",
-        "already_in_stock_summary",
-        "stock_summary_row",
-        "google_ticker",
-        "stock_name",
-        "candidate_status",
-        "scanner",
-        "classification",
-        "score",
-        "entry_quality",
-        "estimated_capital_mid",
-        "buyers",
-        "cluster_buyers",
-        "flow",
-        "names",
-        "opportunity_stage",
-        "observed_at",
-        "valid_until",
-        "signal_id",
-    ]
-
+    """Write a CSV with stable columns even when no records qualify."""
     with path.open(
         "w",
-        encoding="utf-8",
         newline="",
-    ) as output_file:
+        encoding="utf-8-sig",
+    ) as handle:
         writer = csv.DictWriter(
-            output_file,
-            fieldnames=fieldnames,
+            handle,
+            fieldnames=columns,
+            extrasaction="ignore",
         )
 
         writer.writeheader()
-        writer.writerows(records)
+
+        for row in rows:
+            writer.writerow(
+                {
+                    column: row.get(
+                        column,
+                        "",
+                    )
+                    for column in columns
+                }
+            )
+
+
+def _pending_export_rows(
+    pending: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the reduced manual-review export."""
+    return [
+        {
+            column: row.get(
+                column,
+                "",
+            )
+            for column in PENDING_COLUMNS
+        }
+        for row in pending
+    ]
+
+
+def _print_preview(
+    title: str,
+    rows: list[dict[str, Any]],
+    maximum: int = 10,
+) -> None:
+    """Print a compact workflow preview."""
+    print()
+    print(
+        title
+    )
+    print(
+        "-" * len(title)
+    )
+
+    if not rows:
+        print(
+            "None"
+        )
+        return
+
+    for row in rows[
+        :maximum
+    ]:
+        ticker = row.get(
+            "ticker",
+            "",
+        )
+
+        classification = row.get(
+            "classification",
+            "",
+        )
+
+        score = float(
+            row.get("score")
+            or 0.0
+        )
+
+        route = row.get(
+            "review_route",
+            "",
+        )
+
+        print(
+            f"{ticker:<8} | "
+            f"{classification:<10} | "
+            f"{score:>6.1f} | "
+            f"{route}"
+        )
 
 
 def main() -> None:
-    """Run the complete read-only Congress comparison."""
-    min_conviction = _get_min_conviction()
+    """Run the complete read-only Congress funnel comparison."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s "
+            "[%(levelname)s] "
+            "%(message)s"
+        ),
+    )
+
+    minimum_conviction = (
+        _float_environment(
+            "MIN_CONVICTION",
+            15.0,
+        )
+    )
+
+    output_dir = (
+        _output_directory()
+    )
 
     logger.info(
         "Loading Stock Summary USD ticker universe."
     )
 
-    stock_records = (
+    ticker_records = (
         get_stock_summary_ticker_records()
     )
 
     logger.info(
-        "Running Congress adapter with minimum conviction %.1f.",
-        min_conviction,
+        "Loaded %d unique monitored tickers "
+        "from Stock Summary USD",
+        len(ticker_records),
     )
 
-    signals, analysed_count = run_congress_adapter(
-        min_conviction=min_conviction
+    logger.info(
+        "Running Congress adapter with "
+        "minimum conviction %.1f.",
+        minimum_conviction,
     )
 
-    comparison_records = _build_comparison_records(
+    signals, analysed_count = (
+        run_congress_adapter(
+            min_conviction=minimum_conviction
+        )
+    )
+
+    comparison = classify_signals(
         signals=signals,
-        stock_records=stock_records,
+        ticker_records=ticker_records,
     )
 
-    existing_records = [
-        record
-        for record in comparison_records
-        if record["already_in_stock_summary"] == "YES"
-    ]
-
-    new_candidate_records = [
-        record
-        for record in comparison_records
-        if record["already_in_stock_summary"] == "NO"
-    ]
-
-    OUTPUT_DIRECTORY.mkdir(
-        parents=True,
-        exist_ok=True,
+    pending = (
+        get_pending_new_ticker_records(
+            comparison
+        )
     )
+
+    signal_payload = [
+        signal.to_dict()
+        for signal in signals
+    ]
 
     _write_json(
-        OUTPUT_DIRECTORY
+        output_dir
         / "stock_summary_tickers.json",
-        stock_records,
+        ticker_records,
     )
 
     _write_json(
-        OUTPUT_DIRECTORY
+        output_dir
         / "congress_signals.json",
-        [
-            signal.to_dict()
-            for signal in signals
-        ],
+        signal_payload,
     )
 
-    _write_comparison_csv(
-        OUTPUT_DIRECTORY
+    _write_csv(
+        output_dir
         / "candidate_comparison.csv",
-        comparison_records,
+        comparison,
+        COMPARISON_COLUMNS,
+    )
+
+    _write_csv(
+        output_dir
+        / "pending_new_tickers.csv",
+        _pending_export_rows(
+            pending
+        ),
+        PENDING_COLUMNS,
+    )
+
+    existing_count = sum(
+        1
+        for row in comparison
+        if row[
+            "already_in_stock_summary"
+        ]
+        == "YES"
+    )
+
+    absent_count = sum(
+        1
+        for row in comparison
+        if row[
+            "already_in_stock_summary"
+        ]
+        == "NO"
+    )
+
+    signal_log_only_count = sum(
+        1
+        for row in comparison
+        if row[
+            "review_route"
+        ]
+        == "SIGNAL_LOG_ONLY"
+    )
+
+    classification_counts = Counter(
+        row["classification"]
+        for row in comparison
     )
 
     print()
-    print("FUNNEL PILOT — CONGRESS DRY RUN")
-    print("=" * 38)
+    print(
+        "FUNNEL PILOT — CONGRESS DRY RUN"
+    )
+    print(
+        "=" * 39
+    )
     print(
         f"Stock Summary tickers:       "
-        f"{len(stock_records)}"
+        f"{len(ticker_records)}"
     )
     print(
         f"Congress tickers analysed:   "
@@ -333,52 +378,61 @@ def main() -> None:
     )
     print(
         f"Existing monitored tickers:  "
-        f"{len(existing_records)}"
+        f"{existing_count}"
     )
     print(
-        f"Potential new candidates:    "
-        f"{len(new_candidate_records)}"
+        f"Absent signal tickers:       "
+        f"{absent_count}"
+    )
+    print(
+        f"Pending manual review:       "
+        f"{len(pending)}"
+    )
+    print(
+        f"Signal-log-only tickers:     "
+        f"{signal_log_only_count}"
     )
     print(
         f"Minimum conviction:          "
-        f"{min_conviction:.1f}"
+        f"{minimum_conviction:.1f}"
     )
-    print("Google Sheets writes:        None")
-    print("Telegram messages:           None")
-
-    print()
-    print("EXISTING MONITORED TICKERS")
-
-    if existing_records:
-        for record in existing_records[:15]:
-            print(
-                f"  {record['ticker']} | "
-                f"{record['classification']} | "
-                f"C{float(record['score']):.0f} | "
-                f"Sheet row {record['stock_summary_row']}"
-            )
-    else:
-        print("  None")
-
-    print()
-    print("POTENTIAL NEW CANDIDATES")
-
-    if new_candidate_records:
-        for record in new_candidate_records[:20]:
-            print(
-                f"  {record['ticker']} | "
-                f"{record['classification']} | "
-                f"C{float(record['score']):.0f} | "
-                f"{record['opportunity_stage']}"
-            )
-    else:
-        print("  None")
 
     print()
     print(
-        f"Output directory: "
-        f"{OUTPUT_DIRECTORY.resolve()}"
+        "Classification counts:"
     )
+
+    if classification_counts:
+        for classification in sorted(
+            classification_counts
+        ):
+            print(
+                f"  {classification:<12} "
+                f"{classification_counts[classification]}"
+            )
+    else:
+        print(
+            "  None"
+        )
+
+    _print_preview(
+        "PENDING NEW TICKER REVIEW",
+        pending,
+    )
+
+    risk_log_rows = [
+        row
+        for row in comparison
+        if row["review_route"]
+        == "SIGNAL_LOG_ONLY"
+    ]
+
+    _print_preview(
+        "SIGNAL LOG ONLY",
+        risk_log_rows,
+    )
+
+    print()
     print(
         "Files created:"
     )
@@ -390,6 +444,17 @@ def main() -> None:
     )
     print(
         "  candidate_comparison.csv"
+    )
+    print(
+        "  pending_new_tickers.csv"
+    )
+
+    print()
+    print(
+        "Google Sheets writes:        None"
+    )
+    print(
+        "Telegram messages:           None"
     )
     print()
     print(
