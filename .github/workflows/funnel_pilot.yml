@@ -1,4 +1,4 @@
-# VERSION: 2026-06-22-PILOT-SHEET-SETUP-WORKFLOW-1
+# VERSION: 2026-06-22-PILOT-WORKFLOW-2
 
 name: Funnel - Pilot
 
@@ -119,10 +119,10 @@ jobs:
           python -m funnel.pilot_sheet_setup
 
       - name: Upload funnel output
-        if: ${{ always() && inputs.mode != 'reader' }}
+        if: ${{ success() && inputs.mode != 'reader' }}
         uses: actions/upload-artifact@v4
         with:
           name: funnel-${{ inputs.mode }}-${{ github.run_number }}
           path: funnel_output/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
