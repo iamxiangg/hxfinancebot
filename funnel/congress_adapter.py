@@ -1,106 +1,337 @@
-# NEW — Funnel Pilot Step 4: Congress scanner adapter
+# VERSION: 2026-06-22-FIX-4
+# Funnel Pilot: Congress scanner adapter
 
 from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import congress_bot
 
 from funnel.signal_schema import Signal
 
+
 logger = logging.getLogger(__name__)
+
 SINGAPORE_TZ = ZoneInfo("Asia/Singapore")
 
+SUPPORTED_CATEGORIES = {
+    "actionable",
+    "wait",
+    "risk",
+}
 
-def _finite_number(value, default=0.0) -> float:
+
+def _finite_number(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    """Convert a value to a finite float."""
     try:
         number = float(value)
-        return number if math.isfinite(number) else float(default)
     except (TypeError, ValueError):
         return float(default)
 
+    if not math.isfinite(number):
+        return float(default)
 
-def _classification(result: dict) -> str:
-    category = str(result.get("category") or "other").strip().lower()
-    return "near_miss" if category == "other" else category
-
-
-def _remaining_validity_days(result: dict) -> int:
-    purchase_days = int(getattr(congress_bot, "PURCHASE_DAYS", 45))
-    weighted_age = _finite_number(result.get("weighted_age"), 0.0)
-    return max(1, int(math.ceil(purchase_days - weighted_age)))
+    return number
 
 
-def result_to_signal(result: dict, observed_at: datetime) -> Signal:
-    """Convert one congress_bot result dictionary into the common schema."""
-    valid_until = observed_at + timedelta(
+def _normalise_datetime(
+    value: str | date | datetime,
+) -> datetime:
+    """
+    Convert an ISO string, date or datetime into a timezone-aware datetime.
+
+    Date-only and timezone-naive values are treated as Singapore time.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+
+    elif isinstance(value, date):
+        parsed = datetime.combine(
+            value,
+            time.min,
+        )
+
+    else:
+        text = str(value or "").strip()
+
+        if not text:
+            raise ValueError(
+                "observed_at cannot be blank."
+            )
+
+        try:
+            parsed = datetime.fromisoformat(
+                text.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "observed_at must be a valid ISO-8601 "
+                f"date or datetime: {text}"
+            ) from exc
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=SINGAPORE_TZ
+        )
+
+    return parsed
+
+
+def _remaining_validity_days(
+    result: dict[str, Any],
+) -> int:
+    """Calculate the remaining life of the Congress signal."""
+    purchase_days = int(
+        getattr(
+            congress_bot,
+            "PURCHASE_DAYS",
+            45,
+        )
+    )
+
+    weighted_age = _finite_number(
+        result.get("weighted_age"),
+        0.0,
+    )
+
+    remaining_days = math.ceil(
+        purchase_days - weighted_age
+    )
+
+    return max(
+        1,
+        int(remaining_days),
+    )
+
+
+def result_to_signal(
+    result: dict[str, Any],
+    observed_at: str | date | datetime,
+    min_conviction: float = 15.0,
+) -> Signal | None:
+    """
+    Convert one congress_bot result into the common Signal format.
+
+    - actionable, wait and risk results are retained;
+    - other results become near_miss when conviction meets the threshold;
+    - blank tickers and weak other results are excluded.
+    """
+    ticker = str(
+        result.get("ticker") or ""
+    ).strip().upper()
+
+    if not ticker:
+        return None
+
+    original_category = str(
+        result.get("category") or "other"
+    ).strip().lower()
+
+    conviction = _finite_number(
+        result.get("conviction")
+    )
+
+    if original_category in SUPPORTED_CATEGORIES:
+        classification = original_category
+
+    elif (
+        original_category == "other"
+        and conviction >= float(min_conviction)
+    ):
+        classification = "near_miss"
+
+    else:
+        return None
+
+    observed_datetime = _normalise_datetime(
+        observed_at
+    )
+
+    valid_until = observed_datetime + timedelta(
         days=_remaining_validity_days(result)
     )
+
     details = {
-        "model_version": getattr(congress_bot, "MODEL_VERSION", "unknown"),
-        "conviction": round(_finite_number(result.get("conviction")), 2),
-        "entry_quality": round(_finite_number(result.get("entry")), 2),
-        "bullish_capital_low": _finite_number(result.get("low")),
-        "bullish_capital_mid": _finite_number(result.get("mid")),
-        "bullish_capital_high": _finite_number(result.get("high")),
-        "effective_bullish_capital": _finite_number(result.get("effective")),
-        "buyers": int(_finite_number(result.get("buyers"))),
-        "cluster_buyers": int(_finite_number(result.get("cluster_buyers"))),
-        "weighted_age_days": round(
-            _finite_number(result.get("weighted_age")), 2
+        "model_version": getattr(
+            congress_bot,
+            "MODEL_VERSION",
+            "unknown",
         ),
-        "return_since_activity_pct": round(
-            _finite_number(result.get("weighted_return")), 2
+        "original_category": original_category,
+        "conviction": conviction,
+        "entry_quality": _finite_number(
+            result.get("entry")
         ),
-        "flow": str(result.get("flow") or "").strip(),
-        "names": list(result.get("names") or []),
-        "original_category": str(result.get("category") or "other"),
+        "base_conviction": _finite_number(
+            result.get("base")
+        ),
+        "sale_penalty": _finite_number(
+            result.get("sale_penalty")
+        ),
+        "call_bonus": _finite_number(
+            result.get("call_bonus")
+        ),
+        "put_penalty": _finite_number(
+            result.get("put_penalty")
+        ),
+        "estimated_capital_low": _finite_number(
+            result.get("low")
+        ),
+        "estimated_capital_mid": _finite_number(
+            result.get("mid")
+        ),
+        "estimated_capital_high": _finite_number(
+            result.get("high")
+        ),
+        "effective_capital": _finite_number(
+            result.get("effective")
+        ),
+        "call_premium_mid": _finite_number(
+            result.get("call_mid")
+        ),
+        "put_premium_mid": _finite_number(
+            result.get("put_mid")
+        ),
+        "buyers": int(
+            _finite_number(
+                result.get("buyers")
+            )
+        ),
+        "cluster_buyers": int(
+            _finite_number(
+                result.get("cluster_buyers")
+            )
+        ),
+        "weighted_age_days": _finite_number(
+            result.get("weighted_age")
+        ),
+        "return_since_activity_pct": _finite_number(
+            result.get("weighted_return")
+        ),
+        "flow": str(
+            result.get("flow") or ""
+        ).strip(),
+        "names": list(
+            result.get("names") or []
+        ),
+        "unclear_option_sales": int(
+            _finite_number(
+                result.get("unclear_sales")
+            )
+        ),
+        "matched_option_sales": int(
+            _finite_number(
+                result.get("matched_sales")
+            )
+        ),
     }
+
     return Signal(
-        ticker=result.get("ticker"),
+        ticker=ticker,
         scanner="congress",
-        classification=_classification(result),
-        score=_finite_number(result.get("conviction")),
-        observed_at=observed_at.isoformat(),
+        classification=classification,
+        score=conviction,
+        observed_at=observed_datetime.isoformat(),
         valid_until=valid_until.isoformat(),
         details=details,
     )
 
 
-def get_congress_signals(min_conviction: float = 15.0) -> list[Signal]:
+def _fetch_congress_results() -> list[dict[str, Any]]:
     """
-    Run congress_bot's existing data and scoring functions without Telegram.
-
-    Actionable, wait and risk results are retained. Other results are retained
-    only when conviction meets min_conviction, matching the monitor's near-miss
-    concept.
+    Run the existing Congress calculations without calling Telegram main().
     """
-    observed_at = datetime.now(SINGAPORE_TZ)
     congress_bot.init_yf()
+
     trades = congress_bot.fetch_trades()
+
     if trades is None:
-        raise RuntimeError("Congress trade feed could not be retrieved")
+        raise RuntimeError(
+            "Congress trade feed could not be retrieved."
+        )
+
+    if not trades:
+        raise RuntimeError(
+            "Congress trade feed returned no retained transactions."
+        )
 
     results = congress_bot.process(trades)
+
+    if not results:
+        raise RuntimeError(
+            "Congress analysis produced no usable ticker results."
+        )
+
+    return results
+
+
+def run_congress_adapter(
+    min_conviction: float = 15.0,
+) -> tuple[list[Signal], int]:
+    """
+    Return standardised signals and the total analysed ticker count.
+    """
+    observed_at = datetime.now(
+        SINGAPORE_TZ
+    )
+
+    results = _fetch_congress_results()
+
     signals: list[Signal] = []
+
     for result in results:
-        category = str(result.get("category") or "other").lower()
-        conviction = _finite_number(result.get("conviction"))
-        if category == "other" and conviction < float(min_conviction):
-            continue
-        signals.append(result_to_signal(result, observed_at))
+        signal = result_to_signal(
+            result=result,
+            observed_at=observed_at,
+            min_conviction=min_conviction,
+        )
+
+        if signal is not None:
+            signals.append(signal)
+
+    category_priority = {
+        "actionable": 4,
+        "wait": 3,
+        "risk": 2,
+        "near_miss": 1,
+    }
 
     signals.sort(
         key=lambda signal: (
-            signal.classification == "actionable",
-            signal.classification == "wait",
+            category_priority.get(
+                signal.classification,
+                0,
+            ),
             signal.score or 0.0,
             signal.ticker,
         ),
         reverse=True,
     )
-    logger.info("Created %d Congress pilot signals", len(signals))
+
+    logger.info(
+        "Created %d Congress pilot signals from %d analysed tickers.",
+        len(signals),
+        len(results),
+    )
+
+    return signals, len(results)
+
+
+def get_congress_signals(
+    min_conviction: float = 15.0,
+) -> list[Signal]:
+    """
+    Compatibility function for the original pilot_runner.py.
+    """
+    signals, _ = run_congress_adapter(
+        min_conviction=min_conviction
+    )
+
     return signals
