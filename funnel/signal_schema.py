@@ -1,4 +1,4 @@
-# VERSION: 2026-06-22-SIGNAL-ID-FIX-2
+# VERSION: 2026-06-22-PUBLIC-NORMALISE-TICKER-FIX-3
 # Funnel Pilot: Common scanner signal schema
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ ALLOWED_SCANNERS = {
 }
 
 
-def _clean_text(value: Any) -> str:
+def clean_text(value: Any) -> str:
     """Return a stripped string representation."""
     if value is None:
         return ""
@@ -27,25 +27,27 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _normalise_ticker(value: Any) -> str:
+def normalise_ticker(value: Any) -> str:
     """
-    Normalise a ticker while retaining the ticker convention used in
-    Stock Summary USD column A.
+    Return a ticker in the same format used by Stock Summary USD column A.
+
+    This function is intentionally public because other funnel modules,
+    including candidate_ingestor.py, import it directly.
     """
-    return _clean_text(value).upper()
+    return clean_text(value).upper()
 
 
-def _normalise_scanner(value: Any) -> str:
+def normalise_scanner(value: Any) -> str:
     """Return the scanner name in lowercase."""
-    return _clean_text(value).lower()
+    return clean_text(value).lower()
 
 
-def _normalise_classification(value: Any) -> str:
-    """Return the classification in lowercase."""
-    return _clean_text(value).lower()
+def normalise_classification(value: Any) -> str:
+    """Return the signal classification in lowercase."""
+    return clean_text(value).lower()
 
 
-def _normalise_datetime(
+def normalise_datetime(
     value: str | datetime,
     field_name: str,
 ) -> str:
@@ -56,12 +58,14 @@ def _normalise_datetime(
         2026-06-22T19:00:00+08:00
         2026-06-22T11:00:00Z
 
-    Timezone-naive values and date-only strings are rejected.
+    Date-only and timezone-naive values are rejected because signals require
+    an unambiguous observation time.
     """
     if isinstance(value, datetime):
         parsed = value
+
     else:
-        text = _clean_text(value)
+        text = clean_text(value)
 
         if not text:
             raise ValueError(
@@ -86,7 +90,7 @@ def _normalise_datetime(
     return parsed.isoformat()
 
 
-def _normalise_score(
+def normalise_score(
     value: Any,
 ) -> float | None:
     """Convert a score to float while permitting None."""
@@ -106,7 +110,8 @@ class Signal:
     """
     Common signal structure used by all funnel scanners.
 
-    Scanner-specific information belongs in details.
+    Scanner-specific information belongs inside details, while the outer
+    fields remain consistent across Congress, VP/MA, gamma and earnings.
     """
 
     ticker: str
@@ -126,18 +131,16 @@ class Signal:
 
     def __post_init__(self) -> None:
         """Normalise and validate the signal."""
-        self.ticker = _normalise_ticker(
+        self.ticker = normalise_ticker(
             self.ticker
         )
 
-        self.scanner = _normalise_scanner(
+        self.scanner = normalise_scanner(
             self.scanner
         )
 
-        self.classification = (
-            _normalise_classification(
-                self.classification
-            )
+        self.classification = normalise_classification(
+            self.classification
         )
 
         if not self.ticker:
@@ -164,18 +167,18 @@ class Signal:
                 "classification cannot be blank."
             )
 
-        self.observed_at = _normalise_datetime(
+        self.observed_at = normalise_datetime(
             self.observed_at,
             "observed_at",
         )
 
         if self.valid_until is not None:
-            self.valid_until = _normalise_datetime(
+            self.valid_until = normalise_datetime(
                 self.valid_until,
                 "valid_until",
             )
 
-        self.score = _normalise_score(
+        self.score = normalise_score(
             self.score
         )
 
@@ -187,9 +190,7 @@ class Signal:
                 "details must be a dictionary."
             )
 
-        self.signal_id = (
-            self._generate_signal_id()
-        )
+        self.signal_id = self._generate_signal_id()
 
     def _generate_signal_id(self) -> str:
         """
@@ -267,23 +268,19 @@ def signal_from_dict(
     )
 
 
-# Compatibility with earlier funnel modules.
+# Backwards compatibility for earlier funnel modules.
 ScannerSignal = Signal
 
 
 def main() -> None:
-    """Run a small compatibility demonstration."""
+    """Run a small schema demonstration."""
     example_signal = Signal(
         ticker="msft",
         scanner="congress",
         classification="actionable",
         score=74,
-        observed_at=(
-            "2026-06-22T19:00:00+08:00"
-        ),
-        valid_until=(
-            "2026-07-07T19:00:00+08:00"
-        ),
+        observed_at="2026-06-22T19:00:00+08:00",
+        valid_until="2026-07-07T19:00:00+08:00",
         details={
             "buyers": 2,
             "estimated_capital_mid": 180000,
@@ -291,20 +288,16 @@ def main() -> None:
     )
 
     print()
-    print(
-        "FUNNEL PILOT — SIGNAL SCHEMA TEST"
-    )
+    print("FUNNEL PILOT — SIGNAL SCHEMA TEST")
     print("=" * 39)
-    print(
-        example_signal.to_json()
-    )
+    print(example_signal.to_json())
     print()
+    print(f"Signal ID: {example_signal.signal_id}")
     print(
-        f"Signal ID: {example_signal.signal_id}"
+        "normalise_ticker(' msft ') = "
+        f"{normalise_ticker(' msft ')}"
     )
-    print(
-        "SIGNAL SCHEMA TEST COMPLETED SUCCESSFULLY"
-    )
+    print("SIGNAL SCHEMA TEST COMPLETED SUCCESSFULLY")
     print()
 
 
