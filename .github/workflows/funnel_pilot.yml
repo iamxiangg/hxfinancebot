@@ -53,4 +53,4 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
-          python funnel/sheet_reader.py
+          python -m funnel.sheet_reader
