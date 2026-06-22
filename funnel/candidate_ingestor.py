@@ -1,4 +1,5 @@
-# NEW — Funnel Pilot Step 5: compare scanner signals with Stock Summary USD
+# VERSION: 2026-06-22-CANDIDATE-ROUTING-FIX-1
+# Funnel Pilot: compare scanner signals against Stock Summary USD
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ from typing import Any, Iterable
 
 from funnel.signal_schema import Signal, normalise_ticker
 
+
 CLASSIFICATION_RANK = {
     "actionable": 5,
     "wait": 4,
@@ -14,6 +16,7 @@ CLASSIFICATION_RANK = {
     "near_miss": 2,
     "other": 1,
 }
+
 
 STAGE_BY_CLASSIFICATION = {
     "actionable": "SHORTLISTED",
@@ -24,26 +27,220 @@ STAGE_BY_CLASSIFICATION = {
 }
 
 
+REVIEW_PRIORITY_BY_CLASSIFICATION = {
+    "actionable": "HIGH",
+    "wait": "MEDIUM",
+    "near_miss": "OPTIONAL",
+    "risk": "RISK_LOG_ONLY",
+    "other": "MONITOR_ONLY",
+}
+
+
+# Only these classifications can place an absent ticker into the
+# Pending_New_Tickers review queue.
+PENDING_ELIGIBLE_CLASSIFICATIONS = {
+    "actionable",
+    "wait",
+    "near_miss",
+}
+
+
 def build_ticker_index(
     ticker_records: Iterable[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    return {
-        normalise_ticker(record["ticker"]): dict(record)
-        for record in ticker_records
-    }
+    """
+    Build a lookup table for the permanent Stock Summary USD universe.
+
+    Column A ticker values are treated as the master matching key.
+    Blank ticker rows are ignored.
+    """
+    ticker_index: dict[str, dict[str, Any]] = {}
+
+    for record in ticker_records:
+        raw_ticker = str(
+            record.get("ticker") or ""
+        ).strip()
+
+        if not raw_ticker:
+            continue
+
+        ticker = normalise_ticker(
+            raw_ticker
+        )
+
+        ticker_index[ticker] = dict(
+            record
+        )
+
+    return ticker_index
 
 
-def select_primary_signal(signals: Iterable[Signal]) -> Signal:
-    signal_list = list(signals)
+def select_primary_signal(
+    signals: Iterable[Signal],
+) -> Signal:
+    """
+    Select the most important signal for a ticker.
+
+    Classification takes precedence over score. Risk ranks above near-miss
+    so that an adverse signal is not hidden by a weaker positive signal.
+    """
+    signal_list = list(
+        signals
+    )
+
     if not signal_list:
-        raise ValueError("Cannot select a primary signal from an empty list")
+        raise ValueError(
+            "Cannot select a primary signal from an empty list."
+        )
+
     return max(
         signal_list,
         key=lambda signal: (
-            CLASSIFICATION_RANK.get(signal.classification, 0),
-            signal.score if signal.score is not None else -1.0,
+            CLASSIFICATION_RANK.get(
+                signal.classification,
+                0,
+            ),
+            (
+                signal.score
+                if signal.score is not None
+                else -1.0
+            ),
             signal.observed_at,
         ),
+    )
+
+
+def _is_pending_eligible(
+    signal: Signal,
+    existing: bool,
+) -> bool:
+    """
+    Determine whether a signal should enter Pending_New_Tickers.
+
+    Existing monitored tickers never enter the new-ticker queue.
+    Risk-only signals remain in the signal log.
+    """
+    return (
+        not existing
+        and signal.classification
+        in PENDING_ELIGIBLE_CLASSIFICATIONS
+    )
+
+
+def _review_route(
+    signal: Signal,
+    existing: bool,
+) -> str:
+    """Return the appropriate destination for the signal."""
+    if existing:
+        return "EXISTING_FUNNEL"
+
+    if _is_pending_eligible(
+        signal,
+        existing=False,
+    ):
+        return "PENDING_NEW_TICKERS"
+
+    return "SIGNAL_LOG_ONLY"
+
+
+def _build_reason(
+    signal: Signal,
+) -> str:
+    """Build a readable discovery explanation."""
+    details = signal.details
+
+    conviction = details.get(
+        "conviction"
+    )
+
+    entry_quality = details.get(
+        "entry_quality"
+    )
+
+    flow = str(
+        details.get("flow") or ""
+    ).strip()
+
+    parts = [
+        signal.classification
+        .replace("_", " ")
+        .title()
+    ]
+
+    if conviction is not None:
+        try:
+            parts.append(
+                "Congress conviction "
+                f"{float(conviction):.1f}"
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if entry_quality is not None:
+        try:
+            parts.append(
+                "entry quality "
+                f"{float(entry_quality):.1f}"
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if flow:
+        parts.append(
+            flow
+        )
+
+    return " | ".join(
+        parts
+    )
+
+
+def _names_as_text(
+    signal: Signal,
+) -> str:
+    """Convert disclosed names into a CSV-friendly string."""
+    names = signal.details.get(
+        "names"
+    )
+
+    if isinstance(
+        names,
+        (list, tuple, set),
+    ):
+        return ", ".join(
+            str(name).strip()
+            for name in names
+            if str(name).strip()
+        )
+
+    return str(
+        names or ""
+    ).strip()
+
+
+def _detail_value(
+    signal: Signal,
+    primary_key: str,
+    fallback_key: str | None = None,
+) -> Any:
+    """Retrieve a scanner detail with optional backwards compatibility."""
+    value = signal.details.get(
+        primary_key
+    )
+
+    if (
+        value is None
+        and fallback_key is not None
+    ):
+        value = signal.details.get(
+            fallback_key
+        )
+
+    return (
+        ""
+        if value is None
+        else value
     )
 
 
@@ -51,62 +248,245 @@ def classify_signals(
     signals: Iterable[Signal],
     ticker_records: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return one consolidated comparison record per signalled ticker."""
-    ticker_index = build_ticker_index(ticker_records)
-    by_ticker: dict[str, list[Signal]] = defaultdict(list)
-    for signal in signals:
-        by_ticker[signal.ticker].append(signal)
+    """
+    Return one consolidated comparison record per signalled ticker.
 
-    comparison: list[dict[str, Any]] = []
-    for ticker, ticker_signals in sorted(by_ticker.items()):
-        primary = select_primary_signal(ticker_signals)
-        existing = ticker_index.get(ticker)
+    Important distinction:
+
+    NEW_SIGNAL_TICKER
+        The scanner found a ticker absent from Stock Summary USD.
+
+    PENDING_NEW_TICKERS
+        The absent ticker has an actionable, wait or qualifying near-miss
+        signal and is suitable for manual review.
+
+    SIGNAL_LOG_ONLY
+        The absent ticker currently has a risk or monitoring-only signal.
+    """
+    ticker_index = build_ticker_index(
+        ticker_records
+    )
+
+    by_ticker: dict[
+        str,
+        list[Signal],
+    ] = defaultdict(list)
+
+    for signal in signals:
+        by_ticker[
+            signal.ticker
+        ].append(signal)
+
+    comparison: list[
+        dict[str, Any]
+    ] = []
+
+    for ticker, ticker_signals in by_ticker.items():
+        primary = select_primary_signal(
+            ticker_signals
+        )
+
+        existing_record = ticker_index.get(
+            ticker
+        )
+
+        existing = (
+            existing_record is not None
+        )
+
+        pending_eligible = (
+            _is_pending_eligible(
+                primary,
+                existing,
+            )
+        )
+
         comparison.append(
             {
                 "ticker": ticker,
-                "already_in_stock_summary": bool(existing),
-                "sheet_row": existing.get("sheet_row") if existing else "",
-                "google_ticker": existing.get("google_ticker", "") if existing else "",
-                "stock_name": existing.get("stock_name", "") if existing else "",
+                "already_in_stock_summary": (
+                    "YES"
+                    if existing
+                    else "NO"
+                ),
+                "stock_summary_row": (
+                    existing_record.get(
+                        "sheet_row",
+                        "",
+                    )
+                    if existing_record
+                    else ""
+                ),
+                "google_ticker": (
+                    existing_record.get(
+                        "google_ticker",
+                        "",
+                    )
+                    if existing_record
+                    else ""
+                ),
+                "stock_name": (
+                    existing_record.get(
+                        "stock_name",
+                        "",
+                    )
+                    if existing_record
+                    else ""
+                ),
                 "candidate_status": (
                     "EXISTING_MONITORED_TICKER"
                     if existing
-                    else "NEW_CANDIDATE"
+                    else "NEW_SIGNAL_TICKER"
                 ),
-                "primary_scanner": primary.scanner,
-                "primary_classification": primary.classification,
-                "primary_score": primary.score,
-                "latest_signal_date": primary.observed_at,
-                "valid_until": primary.valid_until or "",
-                "signal_count": len(ticker_signals),
-                "opportunity_stage": STAGE_BY_CLASSIFICATION.get(
-                    primary.classification, "MONITORING"
+                "pending_new_ticker": (
+                    "YES"
+                    if pending_eligible
+                    else "NO"
                 ),
-                "discovery_reason": _build_reason(primary),
+                "review_route": _review_route(
+                    primary,
+                    existing,
+                ),
+                "review_priority": (
+                    REVIEW_PRIORITY_BY_CLASSIFICATION.get(
+                        primary.classification,
+                        "MONITOR_ONLY",
+                    )
+                ),
+                "scanner": primary.scanner,
+                "classification": (
+                    primary.classification
+                ),
+                "score": primary.score,
+                "entry_quality": _detail_value(
+                    primary,
+                    "entry_quality",
+                ),
+                "estimated_capital_mid": (
+                    _detail_value(
+                        primary,
+                        "estimated_capital_mid",
+                        "bullish_capital_mid",
+                    )
+                ),
+                "buyers": _detail_value(
+                    primary,
+                    "buyers",
+                ),
+                "cluster_buyers": (
+                    _detail_value(
+                        primary,
+                        "cluster_buyers",
+                    )
+                ),
+                "flow": str(
+                    primary.details.get(
+                        "flow"
+                    )
+                    or ""
+                ).strip(),
+                "names": _names_as_text(
+                    primary
+                ),
+                "opportunity_stage": (
+                    STAGE_BY_CLASSIFICATION.get(
+                        primary.classification,
+                        "MONITORING",
+                    )
+                ),
+                "discovery_reason": (
+                    _build_reason(
+                        primary
+                    )
+                ),
+                "signal_count": len(
+                    ticker_signals
+                ),
+                "observed_at": (
+                    primary.observed_at
+                ),
+                "valid_until": (
+                    primary.valid_until
+                    or ""
+                ),
+                "signal_id": (
+                    primary.signal_id
+                ),
             }
         )
 
     return sorted(
         comparison,
         key=lambda row: (
-            row["already_in_stock_summary"],
-            CLASSIFICATION_RANK.get(row["primary_classification"], 0),
-            row["primary_score"] or 0.0,
+            row["pending_new_ticker"]
+            == "YES",
+            CLASSIFICATION_RANK.get(
+                str(
+                    row["classification"]
+                ),
+                0,
+            ),
+            float(
+                row["score"]
+                or 0.0
+            ),
+            str(
+                row["ticker"]
+            ),
         ),
         reverse=True,
     )
 
 
-def _build_reason(signal: Signal) -> str:
-    details = signal.details
-    conviction = details.get("conviction")
-    entry = details.get("entry_quality")
-    flow = str(details.get("flow") or "").strip()
-    parts = [signal.classification.replace("_", " ").title()]
-    if conviction is not None:
-        parts.append(f"Congress conviction {float(conviction):.0f}")
-    if entry is not None:
-        parts.append(f"entry quality {float(entry):.0f}")
-    if flow:
-        parts.append(flow)
-    return " | ".join(parts)
+def get_pending_new_ticker_records(
+    comparison: Iterable[
+        dict[str, Any]
+    ],
+) -> list[dict[str, Any]]:
+    """
+    Return only absent tickers approved by the routing rules for manual review.
+
+    This function does not approve addition to Stock Summary USD. It only
+    creates a review queue.
+    """
+    pending = [
+        dict(record)
+        for record in comparison
+        if (
+            record.get(
+                "already_in_stock_summary"
+            )
+            == "NO"
+            and record.get(
+                "pending_new_ticker"
+            )
+            == "YES"
+            and record.get(
+                "review_route"
+            )
+            == "PENDING_NEW_TICKERS"
+        )
+    ]
+
+    return sorted(
+        pending,
+        key=lambda row: (
+            CLASSIFICATION_RANK.get(
+                str(
+                    row.get(
+                        "classification"
+                    )
+                ),
+                0,
+            ),
+            float(
+                row.get("score")
+                or 0.0
+            ),
+            str(
+                row.get("ticker")
+                or ""
+            ),
+        ),
+        reverse=True,
+    )
