@@ -1,408 +1,93 @@
-# NEW — Funnel Pilot Step 4: Congress scanner adapter
-# Compatible with both congress_dry_run.py and pilot_runner.py
-
-from __future__ import annotations
-
-import logging
-import math
-from datetime import date, datetime, time, timedelta
-from typing import Any
-from zoneinfo import ZoneInfo
-
-import congress_bot
-
-from funnel.signal_schema import Signal
-
-
-logger = logging.getLogger(__name__)
-
-SINGAPORE_TZ = ZoneInfo("Asia/Singapore")
-
-SUPPORTED_CATEGORIES = {
-    "actionable",
-    "wait",
-    "risk",
-}
-
-
-def _finite_number(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-    """
-    Convert a value to a finite float.
-
-    Invalid, missing, infinite or NaN values return the default.
-    """
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-    if not math.isfinite(number):
-        return float(default)
-
-    return number
-
-
-def _normalise_observed_at(
-    value: str | date | datetime,
-) -> datetime:
-    """
-    Convert a date or datetime into a timezone-aware datetime.
-
-    Accepted examples:
-        "2026-06-22"
-        "2026-06-22T19:00:00+08:00"
-        date(2026, 6, 22)
-        datetime(...)
-
-    Date-only and timezone-naive values are interpreted as Singapore time.
-    """
-    if isinstance(value, datetime):
-        parsed = value
-
-    elif isinstance(value, date):
-        parsed = datetime.combine(
-            value,
-            time.min,
-        )
-
-    else:
-        text = str(value).strip()
-
-        if not text:
-            raise ValueError(
-                "observed_at cannot be blank."
-            )
-
-        try:
-            parsed = datetime.fromisoformat(
-                text.replace("Z", "+00:00")
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "observed_at must be an ISO-8601 date "
-                f"or datetime: {text}"
-            ) from exc
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(
-            tzinfo=SINGAPORE_TZ
-        )
-
-    return parsed
-
-
-def _remaining_validity_days(
-    result: dict[str, Any],
-) -> int:
-    """
-    Estimate the remaining life of the Congress signal.
-
-    The signal remains valid for the unused portion of the Congress
-    purchase lookback period, subject to a minimum of one day.
-    """
-    purchase_days = int(
-        getattr(
-            congress_bot,
-            "PURCHASE_DAYS",
-            45,
-        )
-    )
-
-    weighted_age = _finite_number(
-        result.get("weighted_age"),
-        0.0,
-    )
-
-    remaining_days = math.ceil(
-        purchase_days - weighted_age
-    )
-
-    return max(
-        1,
-        int(remaining_days),
-    )
-
-
-def result_to_signal(
-    result: dict[str, Any],
-    observed_at: str | date | datetime,
-    min_conviction: float = 15.0,
-) -> Signal | None:
-    """
-    Convert one congress_bot result into the common Signal schema.
-
-    Rules:
-    - blank tickers are excluded;
-    - actionable, wait and risk results are retained;
-    - other results become near_miss only when their conviction meets
-      min_conviction;
-    - other results below min_conviction are excluded.
-    """
-    ticker = str(
-        result.get("ticker") or ""
-    ).strip().upper()
-
-    # Check the ticker before performing date calculations.
-    if not ticker:
-        return None
-
-    original_category = str(
-        result.get("category") or "other"
-    ).strip().lower()
-
-    conviction = _finite_number(
-        result.get("conviction")
-    )
-
-    if original_category in SUPPORTED_CATEGORIES:
-        classification = original_category
-
-    elif (
-        original_category == "other"
-        and conviction >= float(min_conviction)
-    ):
-        classification = "near_miss"
-
-    else:
-        return None
-
-    observed_datetime = _normalise_observed_at(
-        observed_at
-    )
-
-    valid_until = observed_datetime + timedelta(
-        days=_remaining_validity_days(result)
-    )
-
-    details = {
-        "model_version": getattr(
-            congress_bot,
-            "MODEL_VERSION",
-            "unknown",
-        ),
-        "original_category": original_category,
-        "conviction": round(
-            conviction,
-            2,
-        ),
-        "entry_quality": round(
-            _finite_number(
-                result.get("entry")
-            ),
-            2,
-        ),
-        "base_conviction": round(
-            _finite_number(
-                result.get("base")
-            ),
-            2,
-        ),
-        "sale_penalty": round(
-            _finite_number(
-                result.get("sale_penalty")
-            ),
-            2,
-        ),
-        "call_bonus": round(
-            _finite_number(
-                result.get("call_bonus")
-            ),
-            2,
-        ),
-        "put_penalty": round(
-            _finite_number(
-                result.get("put_penalty")
-            ),
-            2,
-        ),
-        "bullish_capital_low": _finite_number(
-            result.get("low")
-        ),
-        "bullish_capital_mid": _finite_number(
-            result.get("mid")
-        ),
-        "bullish_capital_high": _finite_number(
-            result.get("high")
-        ),
-        "effective_bullish_capital": _finite_number(
-            result.get("effective")
-        ),
-        "call_premium_mid": _finite_number(
-            result.get("call_mid")
-        ),
-        "put_premium_mid": _finite_number(
-            result.get("put_mid")
-        ),
-        "buyers": int(
-            _finite_number(
-                result.get("buyers")
-            )
-        ),
-        "cluster_buyers": int(
-            _finite_number(
-                result.get("cluster_buyers")
-            )
-        ),
-        "weighted_age_days": round(
-            _finite_number(
-                result.get("weighted_age")
-            ),
-            2,
-        ),
-        "return_since_activity_pct": round(
-            _finite_number(
-                result.get("weighted_return")
-            ),
-            2,
-        ),
-        "flow": str(
-            result.get("flow") or ""
-        ).strip(),
-        "names": list(
-            result.get("names") or []
-        ),
-        "unclear_option_sales": int(
-            _finite_number(
-                result.get("unclear_sales")
-            )
-        ),
-        "matched_option_sales": int(
-            _finite_number(
-                result.get("matched_sales")
-            )
-        ),
-    }
-
-    return Signal(
-        ticker=ticker,
-        scanner="congress",
-        classification=classification,
-        score=conviction,
-        observed_at=(
-            observed_datetime.isoformat()
-        ),
-        valid_until=(
-            valid_until.isoformat()
-        ),
-        details=details,
-    )
-
-
-def _fetch_congress_results() -> list[dict[str, Any]]:
-    """
-    Run the existing Congress data and scoring functions.
-
-    This does not call congress_bot.main() and therefore does not send
-    Telegram messages.
-    """
-    congress_bot.init_yf()
-
-    trades = congress_bot.fetch_trades()
-
-    if trades is None:
-        raise RuntimeError(
-            "Congress trade feed could not be retrieved."
-        )
-
-    if not trades:
-        raise RuntimeError(
-            "Congress trade feed returned no retained transactions."
-        )
-
-    results = congress_bot.process(trades)
-
-    if not results:
-        raise RuntimeError(
-            "Congress analysis produced no usable ticker results."
-        )
-
-    return results
-
-
-def _sort_signals(
-    signals: list[Signal],
-) -> list[Signal]:
-    """Sort stronger categories and scores first."""
-    category_priority = {
-        "actionable": 4,
-        "wait": 3,
-        "risk": 2,
-        "near_miss": 1,
-    }
-
-    return sorted(
-        signals,
-        key=lambda signal: (
-            category_priority.get(
-                signal.classification,
-                0,
-            ),
-            signal.score or 0.0,
-            signal.ticker,
-        ),
-        reverse=True,
-    )
-
-
-def run_congress_adapter(
-    min_conviction: float = 15.0,
-) -> tuple[list[Signal], int]:
-    """
-    Run Congress analysis and return signals plus the analysed ticker count.
-
-    This function supports funnel/congress_dry_run.py.
-
-    Returns:
-        (
-            standardised_signals,
-            total_congress_tickers_analysed,
-        )
-    """
-    observed_at = datetime.now(
-        SINGAPORE_TZ
-    )
-
-    results = _fetch_congress_results()
-
-    signals: list[Signal] = []
-
-    for result in results:
-        signal = result_to_signal(
-            result=result,
-            observed_at=observed_at,
-            min_conviction=min_conviction,
-        )
-
-        if signal is not None:
-            signals.append(signal)
-
-    sorted_signals = _sort_signals(
-        signals
-    )
-
-    logger.info(
-        "Created %d Congress pilot signals "
-        "from %d analysed tickers.",
-        len(sorted_signals),
-        len(results),
-    )
-
-    return sorted_signals, len(results)
-
-
-def get_congress_signals(
-    min_conviction: float = 15.0,
-) -> list[Signal]:
-    """
-    Return only the standardised Congress signals.
-
-    This function remains compatible with the earlier pilot_runner.py.
-    """
-    signals, _ = run_congress_adapter(
-        min_conviction=min_conviction
-    )
-
-    return signals
+name: Funnel - Pilot
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Pilot mode
+        required: true
+        default: reader
+        type: choice
+        options:
+          - reader
+          - congress-dry-run
+
+      preview_count:
+        description: Number of ticker rows to display
+        required: false
+        default: "10"
+
+      min_conviction:
+        description: Minimum conviction for Congress near-miss signals
+        required: false
+        default: "15"
+
+permissions:
+  contents: read
+
+jobs:
+  test-funnel:
+    name: Test Funnel Pilot
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pilot dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install google-api-python-client google-auth
+          python -m pip install pandas requests yfinance python-telegram-bot
+
+      - name: Check Python syntax
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel tests
+          echo "Python syntax checks passed."
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Run read-only Google Sheets test
+        if: ${{ inputs.mode == 'reader' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+          PREVIEW_COUNT: ${{ inputs.preview_count }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.sheet_reader
+
+      - name: Run Congress dry-run comparison
+        if: ${{ inputs.mode == 'congress-dry-run' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+          MIN_CONVICTION: ${{ inputs.min_conviction }}
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.congress_dry_run
+
+      - name: Upload Congress dry-run files
+        if: ${{ inputs.mode == 'congress-dry-run' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: funnel-congress-dry-run-${{ github.run_number }}
+          path: funnel_output/
+          if-no-files-found: error
+          retention-days: 14
