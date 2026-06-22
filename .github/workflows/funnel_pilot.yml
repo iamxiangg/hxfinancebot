@@ -1,28 +1,42 @@
-# NEW — Funnel Pilot Steps 2 and 3:
-# Read-only Google Sheets test and common signal-schema test
+# NEW — Funnel Pilot Steps 2 to 4:
+# Reader, signal schema and Congress dry-run comparison
 
 name: Funnel - Pilot
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Pilot mode"
+        required: true
+        type: choice
+        default: "reader"
+        options:
+          - reader
+          - congress-dry-run
+
       preview_count:
         description: "Number of ticker rows to display"
         required: false
         default: "10"
 
+      min_conviction:
+        description: "Minimum conviction for Congress near-miss signals"
+        required: false
+        default: "15"
+
 permissions:
   contents: read
 
 concurrency:
-  group: funnel-pilot
+  group: funnel-pilot-${{ inputs.mode }}
   cancel-in-progress: false
 
 jobs:
-  test-funnel-foundation:
-    name: Test Funnel Foundation
+  test-funnel:
+    name: Test Funnel Pilot
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
 
     steps:
       - name: Check out repository
@@ -33,19 +47,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Google API dependencies
+      - name: Install pilot dependencies
         run: |
           set -euo pipefail
+
           python -m pip install --upgrade pip
-          python -m pip install google-api-python-client google-auth
+
+          python -m pip install \
+            google-api-python-client \
+            google-auth \
+            pandas \
+            requests \
+            yfinance \
+            python-telegram-bot
 
       - name: Check Python syntax
         run: |
           set -euo pipefail
+
           python -m py_compile funnel/google_client.py
           python -m py_compile funnel/sheet_reader.py
           python -m py_compile funnel/signal_schema.py
+          python -m py_compile funnel/congress_adapter.py
+          python -m py_compile funnel/congress_dry_run.py
           python -m py_compile tests/test_signal_schema.py
+          python -m py_compile tests/test_congress_adapter.py
+
           echo "Python syntax checks passed."
 
       - name: Run unit tests
@@ -53,12 +80,8 @@ jobs:
           set -euo pipefail
           python -m unittest discover -s tests -v
 
-      - name: Run signal schema demonstration
-        run: |
-          set -euo pipefail
-          python -m funnel.signal_schema
-
       - name: Run read-only Google Sheets test
+        if: ${{ inputs.mode == 'reader' }}
         env:
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -68,3 +91,25 @@ jobs:
         run: |
           set -euo pipefail
           python -m funnel.sheet_reader
+
+      - name: Run Congress dry-run comparison
+        if: ${{ inputs.mode == 'congress-dry-run' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: "Stock Summary USD"
+          MIN_CONVICTION: ${{ inputs.min_conviction }}
+          FUNNEL_OUTPUT_DIR: "funnel_output"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.congress_dry_run
+
+      - name: Upload dry-run files
+        if: ${{ inputs.mode == 'congress-dry-run' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: funnel-congress-dry-run-${{ github.run_number }}
+          path: funnel_output/
+          if-no-files-found: error
+          retention-days: 14
