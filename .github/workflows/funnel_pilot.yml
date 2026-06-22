@@ -1,4 +1,5 @@
-# NEW — Funnel Pilot Step 2: Read-only Google Sheets ticker test
+# NEW — Funnel Pilot Steps 2 and 3:
+# Read-only Google Sheets test and common signal-schema test
 
 name: Funnel - Pilot
 
@@ -14,12 +15,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: funnel-pilot-sheet-reader
+  group: funnel-pilot
   cancel-in-progress: false
 
 jobs:
-  test-sheet-reader:
-    name: Test Stock Summary Reader
+  test-funnel-foundation:
+    name: Test Funnel Foundation
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -41,8 +42,21 @@ jobs:
       - name: Check Python syntax
         run: |
           set -euo pipefail
+          python -m py_compile funnel/google_client.py
           python -m py_compile funnel/sheet_reader.py
-          echo "Python syntax check passed."
+          python -m py_compile funnel/signal_schema.py
+          python -m py_compile tests/test_signal_schema.py
+          echo "Python syntax checks passed."
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Run signal schema demonstration
+        run: |
+          set -euo pipefail
+          python -m funnel.signal_schema
 
       - name: Run read-only Google Sheets test
         env:
