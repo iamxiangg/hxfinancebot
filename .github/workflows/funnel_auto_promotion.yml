@@ -1,0 +1,118 @@
+# VERSION: 2026-06-23-AUTO-PROMOTION-WORKFLOW-1
+
+name: Funnel - Auto Promotion
+
+"on":
+  workflow_dispatch:
+    inputs:
+      auto_promotion_mode:
+        description: Dry run or apply eligible promotions
+        required: true
+        default: DRY_RUN
+        type: choice
+        options:
+          - DRY_RUN
+          - APPLY
+
+      auto_promotion_limit:
+        description: Maximum promotions in this run
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "5"
+          - "10"
+
+      confirm_auto_promotion:
+        description: Select YES only for APPLY mode
+        required: true
+        default: "NO"
+        type: choice
+        options:
+          - "NO"
+          - "YES"
+
+permissions:
+  contents: read
+
+# Prevents production, pilot and promotion workflows
+# from writing to the Google Sheet at the same time.
+concurrency:
+  group: funnel-pilot
+  cancel-in-progress: false
+
+jobs:
+  auto-promotion:
+    name: Run Automatic Promotion
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install google-api-python-client google-auth
+          python -m pip install pandas requests yfinance python-telegram-bot
+
+      - name: Check Python syntax
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel tests
+          echo "Python syntax checks passed."
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Reject unconfirmed apply mode
+        if: ${{ inputs.auto_promotion_mode == 'APPLY' && inputs.confirm_auto_promotion != 'YES' }}
+        run: |
+          echo "APPLY mode requires confirm_auto_promotion=YES."
+          exit 1
+
+      - name: Reject unnecessary confirmation in dry-run mode
+        if: ${{ inputs.auto_promotion_mode == 'DRY_RUN' && inputs.confirm_auto_promotion == 'YES' }}
+        run: |
+          echo "DRY_RUN does not require confirmation."
+          echo "Set confirm_auto_promotion=NO."
+          exit 1
+
+      - name: Run automatic promotion
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+
+          AUTO_PROMOTION_MODE: ${{ inputs.auto_promotion_mode }}
+          AUTO_PROMOTION_LIMIT: ${{ inputs.auto_promotion_limit }}
+          CONFIRM_AUTO_PROMOTION: ${{ inputs.confirm_auto_promotion }}
+
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+
+        run: |
+          set -euo pipefail
+          python -m funnel.auto_promotion_runner
+
+      - name: Upload automatic-promotion artefacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-promotion-${{ inputs.auto_promotion_mode }}-${{ github.run_number }}
+          path: funnel_output/
+          if-no-files-found: warn
+          retention-days: 30
