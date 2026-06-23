@@ -618,7 +618,6 @@ def _write_receipt(
 
     return receipt_path
 
-
 def main() -> None:
     """
     Run one consistent Congress snapshot across all three pilot tabs.
@@ -942,4 +941,193 @@ def main() -> None:
             "stock_summary_usd_written": False,
         }
 
-   
+        _write_receipt(
+            output_directory,
+            failure_receipt,
+        )
+
+        if (
+            rollback_result.get(
+                "status"
+            )
+            == "FAILED"
+        ):
+            raise FullRunWriteError(
+                "The consolidated pilot run failed "
+                "and rollback was not fully successful. "
+                "Review the receipt and backup."
+            ) from exc
+
+        raise FullRunWriteError(
+            "The consolidated pilot run failed. "
+            "The prior pilot tables were restored "
+            "from the pre-write backup."
+        ) from exc
+
+    current_funnel_count = sum(
+        1
+        for record in funnel_records
+        if str(
+            record.get(
+                "Current Run",
+                "",
+            )
+        ).strip().upper()
+        == "YES"
+    )
+
+    current_pending_count = sum(
+        1
+        for record in pending_records
+        if str(
+            record.get(
+                "Current Run",
+                "",
+            )
+        ).strip().upper()
+        == "YES"
+    )
+
+    historical_funnel_count = (
+        len(funnel_records)
+        - current_funnel_count
+    )
+
+    historical_pending_count = (
+        len(pending_records)
+        - current_pending_count
+    )
+
+    active_signal_count = sum(
+        1
+        for row in signal_rows
+        if row[7] == "YES"
+    )
+
+    receipt = {
+        "status": "PASSED",
+        "run_id": run_id,
+        "write_timestamp": (
+            run_timestamp.isoformat()
+        ),
+        "minimum_conviction": (
+            minimum_conviction
+        ),
+        "stock_summary_tickers_read": len(
+            ticker_records
+        ),
+        "congress_tickers_analysed": (
+            analysed_count
+        ),
+        "signal_rows_written": len(
+            signal_rows
+        ),
+        "active_signal_rows": (
+            active_signal_count
+        ),
+        "current_funnel_rows": (
+            current_funnel_count
+        ),
+        "historical_funnel_rows": (
+            historical_funnel_count
+        ),
+        "current_pending_rows": (
+            current_pending_count
+        ),
+        "historical_pending_rows": (
+            historical_pending_count
+        ),
+        "cross_sheet_consistency": (
+            consistency_counts
+        ),
+        "manual_fields_preserved": True,
+        "prewrite_backup": str(
+            backup_path
+        ),
+        "rollback": rollback_result,
+        "written_sheets": sorted(
+            ALLOWED_WRITE_SHEETS
+        ),
+        "stock_summary_usd_written": False,
+        "telegram_messages_sent": False,
+    }
+
+    receipt_path = (
+        _write_receipt(
+            output_directory,
+            receipt,
+        )
+    )
+
+    print()
+    print(
+        "FUNNEL PILOT — CONSOLIDATED FULL RUN"
+    )
+    print(
+        "=" * 43
+    )
+    print(
+        "Stock Summary tickers read:  "
+        f"{len(ticker_records)}"
+    )
+    print(
+        "Congress tickers analysed:   "
+        f"{analysed_count}"
+    )
+    print(
+        "Signal-log rows written:     "
+        f"{len(signal_rows)}"
+    )
+    print(
+        "Active signal rows:          "
+        f"{active_signal_count}"
+    )
+    print(
+        "Current funnel rows:         "
+        f"{current_funnel_count}"
+    )
+    print(
+        "Historical funnel rows:      "
+        f"{historical_funnel_count}"
+    )
+    print(
+        "Current pending rows:        "
+        f"{current_pending_count}"
+    )
+    print(
+        "Historical pending rows:     "
+        f"{historical_pending_count}"
+    )
+    print(
+        "Manual fields preserved:    YES"
+    )
+    print(
+        "Cross-sheet consistency:    PASSED"
+    )
+    print(
+        "Stock Summary USD writes:   None"
+    )
+    print(
+        "Telegram messages:          None"
+    )
+    print(
+        "Pre-write backup:            "
+        f"{backup_path}"
+    )
+    print(
+        "Receipt:                     "
+        f"{receipt_path}"
+    )
+    print(
+        "ALL THREE PILOT SHEETS "
+        "READ-BACK VERIFIED"
+    )
+    print(
+        "PILOT CONSOLIDATED FULL RUN "
+        "COMPLETED SUCCESSFULLY"
+    )
+    print()
+
+
+if __name__ == "__main__":
+    main()
