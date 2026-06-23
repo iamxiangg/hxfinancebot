@@ -1,4 +1,4 @@
-# VERSION: 2026-06-23-FUNNEL-PRODUCTION-SCHEDULED-2
+# VERSION: 2026-06-23-FUNNEL-PRODUCTION-WITH-AUTO-PROMOTION-3
 
 name: Funnel - Production
 
@@ -25,8 +25,30 @@ name: Funnel - Production
           - TEST
           - OFF
 
+      auto_promotion_mode:
+        description: Automatic promotion after the scanner completes
+        required: true
+        default: APPLY
+        type: choice
+        options:
+          - APPLY
+          - DRY_RUN
+          - OFF
+
+      auto_promotion_limit:
+        description: Maximum approved tickers promoted in this run
+        required: true
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "5"
+          - "10"
+
       confirm_production_run:
-        description: Select YES to refresh all three funnel sheets
+        description: Select YES to run the production sequence
         required: true
         default: "NO"
         type: choice
@@ -37,17 +59,17 @@ name: Funnel - Production
 permissions:
   contents: read
 
-# Same group used by the pilot workflow.
-# Prevents pilot and production sheet writes from overlapping.
+# Prevents production, pilot and promotion workflows
+# from writing to the Google Sheet simultaneously.
 concurrency:
   group: funnel-pilot
   cancel-in-progress: false
 
 jobs:
   production-refresh:
-    name: Run Funnel Production Refresh
+    name: Scan, Update, Promote and Notify
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
@@ -81,19 +103,24 @@ jobs:
         env:
           INPUT_MIN_CONVICTION: ${{ inputs.min_conviction }}
           INPUT_TELEGRAM_MODE: ${{ inputs.telegram_mode }}
+          INPUT_AUTO_PROMOTION_MODE: ${{ inputs.auto_promotion_mode }}
+          INPUT_AUTO_PROMOTION_LIMIT: ${{ inputs.auto_promotion_limit }}
           INPUT_CONFIRMATION: ${{ inputs.confirm_production_run }}
         run: |
           set -euo pipefail
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             echo "Scheduled production run selected."
+
             echo "MIN_CONVICTION=15" >> "$GITHUB_ENV"
             echo "TELEGRAM_MODE=CHANGES_ONLY" >> "$GITHUB_ENV"
+            echo "AUTO_PROMOTION_MODE=APPLY" >> "$GITHUB_ENV"
+            echo "AUTO_PROMOTION_LIMIT=3" >> "$GITHUB_ENV"
             echo "CONFIRM_PRODUCTION_RUN=YES" >> "$GITHUB_ENV"
             echo "RUN_TRIGGER=SCHEDULED" >> "$GITHUB_ENV"
           else
             if [[ "${INPUT_CONFIRMATION}" != "YES" ]]; then
-              echo "Manual production refresh requires confirm_production_run=YES."
+              echo "Manual production run requires confirm_production_run=YES."
               exit 1
             fi
 
@@ -105,9 +132,20 @@ jobs:
               INPUT_TELEGRAM_MODE="CHANGES_ONLY"
             fi
 
+            if [[ -z "${INPUT_AUTO_PROMOTION_MODE}" ]]; then
+              INPUT_AUTO_PROMOTION_MODE="APPLY"
+            fi
+
+            if [[ -z "${INPUT_AUTO_PROMOTION_LIMIT}" ]]; then
+              INPUT_AUTO_PROMOTION_LIMIT="3"
+            fi
+
             echo "Manual production run selected."
+
             echo "MIN_CONVICTION=${INPUT_MIN_CONVICTION}" >> "$GITHUB_ENV"
             echo "TELEGRAM_MODE=${INPUT_TELEGRAM_MODE}" >> "$GITHUB_ENV"
+            echo "AUTO_PROMOTION_MODE=${INPUT_AUTO_PROMOTION_MODE}" >> "$GITHUB_ENV"
+            echo "AUTO_PROMOTION_LIMIT=${INPUT_AUTO_PROMOTION_LIMIT}" >> "$GITHUB_ENV"
             echo "CONFIRM_PRODUCTION_RUN=YES" >> "$GITHUB_ENV"
             echo "RUN_TRIGGER=MANUAL" >> "$GITHUB_ENV"
           fi
@@ -115,11 +153,14 @@ jobs:
       - name: Show resolved settings
         run: |
           set -euo pipefail
-          echo "Run trigger:       ${RUN_TRIGGER}"
-          echo "Minimum conviction: ${MIN_CONVICTION}"
-          echo "Telegram mode:      ${TELEGRAM_MODE}"
 
-      - name: Run production scanner, funnel refresh and Telegram notifier
+          echo "Run trigger:             ${RUN_TRIGGER}"
+          echo "Minimum conviction:      ${MIN_CONVICTION}"
+          echo "Telegram mode:           ${TELEGRAM_MODE}"
+          echo "Auto-promotion mode:     ${AUTO_PROMOTION_MODE}"
+          echo "Auto-promotion limit:    ${AUTO_PROMOTION_LIMIT}"
+
+      - name: Run production sequence
         env:
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -132,11 +173,12 @@ jobs:
 
           FUNNEL_OUTPUT_DIR: funnel_output
           PYTHONUNBUFFERED: "1"
+
         run: |
           set -euo pipefail
           python -m funnel.production_runner
 
-      - name: Notify Telegram if the production workflow fails
+      - name: Send failure alert only when no consolidated alert was sent
         if: ${{ failure() }}
         continue-on-error: true
         env:
@@ -144,22 +186,106 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
+          import json
           import os
+          from pathlib import Path
+
           import requests
 
-          token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+          receipt_path = Path(
+              "funnel_output/production_run_receipt.json"
+          )
+
+          if receipt_path.exists():
+              try:
+                  receipt = json.loads(
+                      receipt_path.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+
+                  telegram = receipt.get(
+                      "telegram",
+                      {},
+                  )
+
+                  telegram_status = str(
+                      telegram.get(
+                          "status",
+                          "",
+                      )
+                  ).upper()
+
+                  telegram_mode = str(
+                      receipt.get(
+                          "telegram_mode",
+                          "",
+                      )
+                  ).upper()
+
+                  if telegram_status == "SENT":
+                      print(
+                          "Consolidated production Telegram "
+                          "message was already sent."
+                      )
+                      raise SystemExit(0)
+
+                  if telegram_mode == "OFF":
+                      print(
+                          "Telegram failure alert skipped "
+                          "because Telegram mode was OFF."
+                      )
+                      raise SystemExit(0)
+
+              except SystemExit:
+                  raise
+
+              except Exception as exc:
+                  print(
+                      "Could not inspect production receipt: "
+                      f"{exc!r}"
+                  )
+
+          token = os.getenv(
+              "TELEGRAM_BOT_TOKEN",
+              "",
+          ).strip()
+
+          chat_id = os.getenv(
+              "TELEGRAM_CHAT_ID",
+              "",
+          ).strip()
 
           if not token or not chat_id:
-              print("Telegram failure alert skipped: credentials unavailable.")
+              print(
+                  "Telegram failure alert skipped: "
+                  "credentials unavailable."
+              )
               raise SystemExit(0)
 
-          repository = os.getenv("GITHUB_REPOSITORY", "")
-          run_id = os.getenv("GITHUB_RUN_ID", "")
-          server = os.getenv("GITHUB_SERVER_URL", "https://github.com")
-          event = os.getenv("GITHUB_EVENT_NAME", "unknown")
+          repository = os.getenv(
+              "GITHUB_REPOSITORY",
+              "",
+          )
 
-          run_url = f"{server}/{repository}/actions/runs/{run_id}"
+          run_id = os.getenv(
+              "GITHUB_RUN_ID",
+              "",
+          )
+
+          server = os.getenv(
+              "GITHUB_SERVER_URL",
+              "https://github.com",
+          )
+
+          event = os.getenv(
+              "GITHUB_EVENT_NAME",
+              "unknown",
+          )
+
+          run_url = (
+              f"{server}/{repository}/actions/runs/{run_id}"
+          )
 
           message = (
               "❌ HX FUNNEL PRODUCTION FAILED\n\n"
@@ -169,7 +295,10 @@ jobs:
           )
 
           response = requests.post(
-              f"https://api.telegram.org/bot{token}/sendMessage",
+              (
+                  "https://api.telegram.org/"
+                  f"bot{token}/sendMessage"
+              ),
               json={
                   "chat_id": chat_id,
                   "text": message,
@@ -181,7 +310,10 @@ jobs:
           )
 
           response.raise_for_status()
-          print("Telegram failure alert sent.")
+
+          print(
+              "Telegram failure alert sent."
+          )
           PY
 
       - name: Upload production artefacts
