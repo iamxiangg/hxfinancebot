@@ -1,4 +1,4 @@
-# VERSION: 2026-06-23-PROMOTION-DRY-RUN-WORKFLOW-1
+# VERSION: 2026-06-23-CONTROLLED-PROMOTION-WORKFLOW-1
 
 name: Funnel - Pilot
 
@@ -18,6 +18,7 @@ name: Funnel - Pilot
           - pilot-funnel-write
           - pilot-full-run
           - promotion-dry-run
+          - promotion-apply
 
       preview_count:
         description: Number of records to display
@@ -28,6 +29,11 @@ name: Funnel - Pilot
         description: Minimum conviction for Congress near-miss signals
         required: false
         default: "15"
+
+      promotion_ticker:
+        description: Exact ticker to promote, for example BSX
+        required: false
+        default: ""
 
       confirm_pilot_sheet_setup:
         description: Select YES only when running pilot-sheet-setup
@@ -58,6 +64,15 @@ name: Funnel - Pilot
 
       confirm_pilot_full_run:
         description: Select YES only when running pilot-full-run
+        required: true
+        default: "NO"
+        type: choice
+        options:
+          - "NO"
+          - "YES"
+
+      confirm_master_promotion:
+        description: Select YES only when intentionally writing to Stock Summary USD
         required: true
         default: "NO"
         type: choice
@@ -127,6 +142,18 @@ jobs:
         if: ${{ inputs.mode == 'pilot-full-run' && inputs.confirm_pilot_full_run != 'YES' }}
         run: |
           echo "pilot-full-run requires confirm_pilot_full_run=YES."
+          exit 1
+
+      - name: Reject unconfirmed master promotion
+        if: ${{ inputs.mode == 'promotion-apply' && inputs.confirm_master_promotion != 'YES' }}
+        run: |
+          echo "promotion-apply requires confirm_master_promotion=YES."
+          exit 1
+
+      - name: Reject blank promotion ticker
+        if: ${{ inputs.mode == 'promotion-apply' && inputs.promotion_ticker == '' }}
+        run: |
+          echo "promotion-apply requires an exact promotion_ticker."
           exit 1
 
       - name: Run read-only Google Sheets test
@@ -221,6 +248,20 @@ jobs:
         run: |
           set -euo pipefail
           python -m funnel.promotion_dry_run
+
+      - name: Apply one controlled ticker promotion
+        if: ${{ inputs.mode == 'promotion-apply' && inputs.confirm_master_promotion == 'YES' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+          PROMOTION_TICKER: ${{ inputs.promotion_ticker }}
+          CONFIRM_MASTER_PROMOTION: ${{ inputs.confirm_master_promotion }}
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.promotion_apply
 
       - name: Upload funnel output
         if: ${{ success() && inputs.mode != 'reader' }}
