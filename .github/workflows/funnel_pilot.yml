@@ -1,4 +1,4 @@
-# VERSION: 2026-06-23-PILOT-CONSOLIDATED-WORKFLOW-1
+# VERSION: 2026-06-23-PROMOTION-DRY-RUN-WORKFLOW-1
 
 name: Funnel - Pilot
 
@@ -17,9 +17,10 @@ name: Funnel - Pilot
           - pilot-signal-log-write
           - pilot-funnel-write
           - pilot-full-run
+          - promotion-dry-run
 
       preview_count:
-        description: Number of ticker rows to display
+        description: Number of records to display
         required: false
         default: "10"
 
@@ -207,6 +208,19 @@ jobs:
         run: |
           set -euo pipefail
           python -m funnel.pilot_full_runner
+
+      - name: Run approved-ticker promotion dry run
+        if: ${{ inputs.mode == 'promotion-dry-run' }}
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+          PREVIEW_COUNT: ${{ inputs.preview_count }}
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m funnel.promotion_dry_run
 
       - name: Upload funnel output
         if: ${{ success() && inputs.mode != 'reader' }}
