@@ -1,14 +1,15 @@
-# VERSION: 2026-06-23-CONTROLLED-PROMOTION-APPLY-1
+# VERSION: 2026-06-23-CONTROLLED-PROMOTION-APPLY-2
 #
 # Controlled approved-ticker promotion:
 # - revalidates the Pending_New_Tickers approval;
 # - promotes only the explicitly requested ticker;
 # - dynamically discovers the ticker column in Stock Summary USD;
+# - automatically expands worksheet row capacity when required;
 # - inserts one row and copies formulas, formatting and validation;
 # - writes only the ticker into the new master row;
 # - marks the pending record as ADDED;
 # - verifies both worksheets;
-# - rolls back if verification fails.
+# - rolls back the inserted data if verification fails.
 
 from __future__ import annotations
 
@@ -36,9 +37,7 @@ from funnel.promotion_dry_run import (
     _ticker,
     _write_json,
 )
-from funnel.sheet_reader import (
-    get_stock_summary_ticker_records,
-)
+from funnel.sheet_reader import get_stock_summary_ticker_records
 
 
 logger = logging.getLogger(__name__)
@@ -214,24 +213,22 @@ def _row_value(
     row_index = row_number - 1
     column_index = column_number - 1
 
-    if row_index < 0 or row_index >= len(
-        rows
+    if (
+        row_index < 0
+        or row_index >= len(rows)
     ):
         return ""
 
-    row = rows[
-        row_index
-    ]
+    row = rows[row_index]
 
-    if column_index < 0 or column_index >= len(
-        row
+    if (
+        column_index < 0
+        or column_index >= len(row)
     ):
         return ""
 
     return _text(
-        row[
-            column_index
-        ]
+        row[column_index]
     )
 
 
@@ -243,16 +240,12 @@ def _padded_row(
     """Return one row padded to an exact width."""
     if (
         row_number < 1
-        or row_number > len(
-            rows
-        )
+        or row_number > len(rows)
     ):
         return [""] * width
 
     row = list(
-        rows[
-            row_number - 1
-        ]
+        rows[row_number - 1]
     )
 
     return (
@@ -268,19 +261,13 @@ def _row_has_content(
     """Return whether a row contains any value or formula."""
     if (
         row_number < 1
-        or row_number > len(
-            rows
-        )
+        or row_number > len(rows)
     ):
         return False
 
     return any(
-        _text(
-            value
-        )
-        for value in rows[
-            row_number - 1
-        ]
+        _text(value)
+        for value in rows[row_number - 1]
     )
 
 
@@ -289,16 +276,14 @@ def _discover_master_layout(
     formula_rows: list[list[Any]],
     row_capacity: int,
 ) -> dict[str, Any]:
-    """Discover a safely appendable contiguous master table."""
+    """Discover the ticker table and its next available row."""
     header_matches: list[
         tuple[int, int, str]
     ] = []
 
     scan_limit = min(
         HEADER_SCAN_ROWS,
-        len(
-            displayed_rows
-        ),
+        len(displayed_rows),
     )
 
     for row_number in range(
@@ -322,9 +307,7 @@ def _discover_master_layout(
                     (
                         row_number,
                         column_number,
-                        _text(
-                            value
-                        ),
+                        _text(value),
                     )
                 )
 
@@ -334,14 +317,10 @@ def _discover_master_layout(
             "Stock Summary USD."
         )
 
-    if len(
-        header_matches
-    ) != 1:
+    if len(header_matches) != 1:
         raise RuntimeError(
             "Multiple possible ticker headers were found: "
-            + repr(
-                header_matches
-            )
+            + repr(header_matches)
         )
 
     (
@@ -351,12 +330,8 @@ def _discover_master_layout(
     ) = header_matches[0]
 
     total_rows = max(
-        len(
-            displayed_rows
-        ),
-        len(
-            formula_rows
-        ),
+        len(displayed_rows),
+        len(formula_rows),
     )
 
     ticker_rows = [
@@ -404,9 +379,7 @@ def _discover_master_layout(
             "Stock Summary USD is not a contiguous ticker table. "
             "Blank ticker rows were found within the data area: "
             + ", ".join(
-                str(
-                    row
-                )
+                str(row)
                 for row in missing_ticker_rows
             )
         )
@@ -433,8 +406,7 @@ def _discover_master_layout(
         raise RuntimeError(
             "Stock Summary USD contains content below the "
             "last ticker row. Automatic insertion was stopped. "
-            "First affected row: "
-            f"{content_below[0]}."
+            f"First affected row: {content_below[0]}."
         )
 
     target_row = (
@@ -442,46 +414,24 @@ def _discover_master_layout(
         + 1
     )
 
-    if target_row > row_capacity:
-        raise RuntimeError(
-            "The target master row exceeds the worksheet "
-            "row capacity."
-        )
+    capacity_rows_required = max(
+        0,
+        target_row - row_capacity,
+    )
 
     used_column_count = max(
         [
             ticker_column,
             *[
-                len(
-                    row
-                )
+                len(row)
                 for row in displayed_rows
             ],
             *[
-                len(
-                    row
-                )
+                len(row)
                 for row in formula_rows
             ],
         ]
     )
-
-    source_formula_row = _padded_row(
-        formula_rows,
-        last_data_row,
-        used_column_count,
-    )
-
-    source_formula_columns = [
-        column_number
-        for column_number, value in enumerate(
-            source_formula_row,
-            start=1,
-        )
-        if _text(
-            value
-        ).startswith("=")
-    ]
 
     return {
         "header_row": header_row,
@@ -491,9 +441,78 @@ def _discover_master_layout(
         "source_row": last_data_row,
         "target_row": target_row,
         "used_column_count": used_column_count,
-        "source_formula_columns": (
-            source_formula_columns
-        ),
+        "row_capacity_before": row_capacity,
+        "capacity_rows_required": capacity_rows_required,
+    }
+
+
+def _ensure_master_row_capacity(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_id: int,
+    current_row_count: int,
+    target_row: int,
+) -> dict[str, int]:
+    """
+    Append blank worksheet rows when the target row is outside the grid.
+
+    Rows are appended only when required. The subsequent insert operation
+    will then create the promoted data row inside the expanded grid.
+    """
+    required_rows = max(
+        0,
+        target_row - current_row_count,
+    )
+
+    if required_rows == 0:
+        return {
+            "row_capacity_before": current_row_count,
+            "rows_appended": 0,
+            "row_capacity_after_expansion": current_row_count,
+        }
+
+    (
+        service.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "appendDimension": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "length": required_rows,
+                        }
+                    }
+                ]
+            },
+        )
+        .execute()
+    )
+
+    refreshed_metadata = _sheet_metadata(
+        service,
+        spreadsheet_id,
+        MASTER_SHEET,
+    )
+
+    refreshed_row_count = int(
+        refreshed_metadata[
+            "row_count"
+        ]
+    )
+
+    if refreshed_row_count < target_row:
+        raise RuntimeError(
+            "Stock Summary USD row-capacity expansion failed. "
+            f"Target row: {target_row}; "
+            f"capacity after expansion: {refreshed_row_count}."
+        )
+
+    return {
+        "row_capacity_before": current_row_count,
+        "rows_appended": required_rows,
+        "row_capacity_after_expansion": refreshed_row_count,
     }
 
 
@@ -516,25 +535,19 @@ def _find_eligible_record(
         record
         for record in approved
         if _ticker(
-            record.get(
-                "Ticker"
-            )
+            record.get("Ticker")
         )
         == requested_ticker
     ]
 
-    if len(
-        matches
-    ) == 1:
+    if len(matches) == 1:
         return matches[0]
 
     rejected_matches = [
         record
         for record in rejected
         if _ticker(
-            record.get(
-                "Ticker"
-            )
+            record.get("Ticker")
         )
         == requested_ticker
     ]
@@ -553,9 +566,7 @@ def _find_eligible_record(
 
         raise RuntimeError(
             f"{requested_ticker} is not eligible for promotion: "
-            + " | ".join(
-                reasons
-            )
+            + " | ".join(reasons)
         )
 
     raise RuntimeError(
@@ -708,9 +719,7 @@ def _write_master_ticker(
             valueInputOption="RAW",
             body={
                 "values": [
-                    [
-                        ticker
-                    ]
+                    [ticker]
                 ]
             },
         )
@@ -724,9 +733,7 @@ def _read_pending_row(
 ) -> list[Any]:
     """Read and pad one complete pending-ticker row."""
     final_column = _column_letter(
-        len(
-            PENDING_HEADERS
-        )
+        len(PENDING_HEADERS)
     )
 
     rows = _read_values(
@@ -740,24 +747,14 @@ def _read_pending_row(
     )
 
     if not rows:
-        return [
-            ""
-        ] * len(
+        return [""] * len(
             PENDING_HEADERS
         )
 
     return (
-        list(
-            rows[0]
-        )
-        + [""] * len(
-            PENDING_HEADERS
-        )
-    )[
-        :len(
-            PENDING_HEADERS
-        )
-    ]
+        list(rows[0])
+        + [""] * len(PENDING_HEADERS)
+    )[:len(PENDING_HEADERS)]
 
 
 def _restore_pending_row(
@@ -768,9 +765,7 @@ def _restore_pending_row(
 ) -> None:
     """Restore the complete pending row during rollback."""
     final_column = _column_letter(
-        len(
-            PENDING_HEADERS
-        )
+        len(PENDING_HEADERS)
     )
 
     (
@@ -838,17 +833,13 @@ def _update_pending_record(
                     {
                         "range": approval_cell,
                         "values": [
-                            [
-                                "ADDED"
-                            ]
+                            ["ADDED"]
                         ],
                     },
                     {
                         "range": added_date_cell,
                         "values": [
-                            [
-                                added_date
-                            ]
+                            [added_date]
                         ],
                     },
                 ],
@@ -866,27 +857,19 @@ def _verify_master_row(
 ) -> dict[str, int]:
     """Verify the inserted ticker and copied formulas."""
     ticker_column = int(
-        layout[
-            "ticker_column"
-        ]
+        layout["ticker_column"]
     )
 
     source_row = int(
-        layout[
-            "source_row"
-        ]
+        layout["source_row"]
     )
 
     target_row = int(
-        layout[
-            "target_row"
-        ]
+        layout["target_row"]
     )
 
     used_column_count = int(
-        layout[
-            "used_column_count"
-        ]
+        layout["used_column_count"]
     )
 
     ticker_column_letter = _column_letter(
@@ -944,17 +927,13 @@ def _verify_master_row(
     )
 
     source_formula_row = (
-        list(
-            source_formulas[0]
-        )
+        list(source_formulas[0])
         if source_formulas
         else []
     )
 
     target_formula_row = (
-        list(
-            target_formulas[0]
-        )
+        list(target_formulas[0])
         if target_formulas
         else []
     )
@@ -969,10 +948,7 @@ def _verify_master_row(
         + [""] * used_column_count
     )[:used_column_count]
 
-    missing_formula_columns: list[
-        int
-    ] = []
-
+    missing_formula_columns: list[int] = []
     copied_formula_count = 0
 
     for column_number, source_value in enumerate(
@@ -1001,9 +977,7 @@ def _verify_master_row(
         raise RuntimeError(
             "Formula copying failed in master columns: "
             + ", ".join(
-                _column_letter(
-                    column
-                )
+                _column_letter(column)
                 for column in missing_formula_columns
             )
         )
@@ -1058,9 +1032,7 @@ def _verify_pending_record(
     }
 
     if _ticker(
-        record.get(
-            "Ticker"
-        )
+        record.get("Ticker")
     ) != ticker:
         raise RuntimeError(
             "Pending ticker changed during promotion verification."
@@ -1209,30 +1181,14 @@ def main() -> None:
 
     source_row_values = _padded_row(
         displayed_rows,
-        int(
-            layout[
-                "source_row"
-            ]
-        ),
-        int(
-            layout[
-                "used_column_count"
-            ]
-        ),
+        int(layout["source_row"]),
+        int(layout["used_column_count"]),
     )
 
     source_row_formulas = _padded_row(
         formula_rows,
-        int(
-            layout[
-                "source_row"
-            ]
-        ),
-        int(
-            layout[
-                "used_column_count"
-            ]
-        ),
+        int(layout["source_row"]),
+        int(layout["used_column_count"]),
     )
 
     original_pending_values = (
@@ -1271,14 +1227,54 @@ def main() -> None:
     inserted_master_row = False
     pending_row_changed = False
 
+    capacity_result = {
+        "row_capacity_before": int(
+            master_metadata["row_count"]
+        ),
+        "rows_appended": 0,
+        "row_capacity_after_expansion": int(
+            master_metadata["row_count"]
+        ),
+    }
+
     rollback = {
         "attempted": False,
         "master_row_deleted": False,
         "pending_row_restored": False,
+        "capacity_rows_appended": 0,
+        "capacity_rows_retained": 0,
         "errors": [],
     }
 
     try:
+        capacity_result = (
+            _ensure_master_row_capacity(
+                service,
+                spreadsheet_id,
+                int(
+                    master_metadata[
+                        "sheet_id"
+                    ]
+                ),
+                int(
+                    master_metadata[
+                        "row_count"
+                    ]
+                ),
+                int(
+                    layout[
+                        "target_row"
+                    ]
+                ),
+            )
+        )
+
+        rollback[
+            "capacity_rows_appended"
+        ] = capacity_result[
+            "rows_appended"
+        ]
+
         _insert_and_copy_master_row(
             service,
             spreadsheet_id,
@@ -1287,21 +1283,9 @@ def main() -> None:
                     "sheet_id"
                 ]
             ),
-            int(
-                layout[
-                    "source_row"
-                ]
-            ),
-            int(
-                layout[
-                    "target_row"
-                ]
-            ),
-            int(
-                layout[
-                    "used_column_count"
-                ]
-            ),
+            int(layout["source_row"]),
+            int(layout["target_row"]),
+            int(layout["used_column_count"]),
         )
 
         inserted_master_row = True
@@ -1309,16 +1293,8 @@ def main() -> None:
         _write_master_ticker(
             service,
             spreadsheet_id,
-            int(
-                layout[
-                    "ticker_column"
-                ]
-            ),
-            int(
-                layout[
-                    "target_row"
-                ]
-            ),
+            int(layout["ticker_column"]),
+            int(layout["target_row"]),
             requested_ticker,
         )
 
@@ -1331,9 +1307,7 @@ def main() -> None:
 
         pending_row_changed = True
 
-        time.sleep(
-            2
-        )
+        time.sleep(2)
 
         verification = _verify_master_row(
             service,
@@ -1351,11 +1325,12 @@ def main() -> None:
         )
 
     except Exception as exc:
-        rollback[
-            "attempted"
-        ] = bool(
+        rollback["attempted"] = bool(
             inserted_master_row
             or pending_row_changed
+            or capacity_result[
+                "rows_appended"
+            ]
         )
 
         if pending_row_changed:
@@ -1372,13 +1347,9 @@ def main() -> None:
                 ] = True
 
             except Exception as rollback_exc:
-                rollback[
-                    "errors"
-                ].append(
+                rollback["errors"].append(
                     {
-                        "operation": (
-                            "restore_pending_row"
-                        ),
+                        "operation": "restore_pending_row",
                         "error": repr(
                             rollback_exc
                         ),
@@ -1395,11 +1366,7 @@ def main() -> None:
                             "sheet_id"
                         ]
                     ),
-                    int(
-                        layout[
-                            "target_row"
-                        ]
-                    ),
+                    int(layout["target_row"]),
                 )
 
                 rollback[
@@ -1407,26 +1374,30 @@ def main() -> None:
                 ] = True
 
             except Exception as rollback_exc:
-                rollback[
-                    "errors"
-                ].append(
+                rollback["errors"].append(
                     {
-                        "operation": (
-                            "delete_master_row"
-                        ),
+                        "operation": "delete_master_row",
                         "error": repr(
                             rollback_exc
                         ),
                     }
                 )
 
+        # Any rows appended solely to expand grid capacity remain blank.
+        # Leaving blank capacity is safer than deleting dimensions after
+        # a failed transaction because a concurrent user edit could exist.
+        rollback[
+            "capacity_rows_retained"
+        ] = capacity_result[
+            "rows_appended"
+        ]
+
         failure_receipt = {
             "status": "FAILED",
             "run_id": run_id,
             "ticker": requested_ticker,
-            "error": repr(
-                exc
-            ),
+            "error": repr(exc),
+            "capacity": capacity_result,
             "rollback": rollback,
             "prewrite_backup": str(
                 backup_path
@@ -1438,18 +1409,25 @@ def main() -> None:
             failure_receipt,
         )
 
-        if rollback[
-            "errors"
-        ]:
+        if rollback["errors"]:
             raise RuntimeError(
                 "Promotion failed and rollback was not fully "
                 "successful. Review the workflow artefacts."
             ) from exc
 
         raise RuntimeError(
-            "Promotion failed. The inserted master row and "
-            "pending record were restored."
+            "Promotion failed. The inserted master data and "
+            "pending record were restored. Any appended grid "
+            "capacity remains blank."
         ) from exc
+
+    final_master_metadata = (
+        _sheet_metadata(
+            service,
+            spreadsheet_id,
+            MASTER_SHEET,
+        )
+    )
 
     receipt = {
         "status": "PASSED",
@@ -1458,18 +1436,34 @@ def main() -> None:
         "ticker": requested_ticker,
         "master_sheet": MASTER_SHEET,
         "master_row_added": int(
-            layout[
-                "target_row"
-            ]
+            layout["target_row"]
         ),
         "ticker_column": int(
-            layout[
-                "ticker_column"
-            ]
+            layout["ticker_column"]
         ),
         "ticker_header": layout[
             "ticker_header"
         ],
+        "row_capacity_before": (
+            capacity_result[
+                "row_capacity_before"
+            ]
+        ),
+        "capacity_rows_appended": (
+            capacity_result[
+                "rows_appended"
+            ]
+        ),
+        "row_capacity_after_expansion": (
+            capacity_result[
+                "row_capacity_after_expansion"
+            ]
+        ),
+        "final_grid_row_count": int(
+            final_master_metadata[
+                "row_count"
+            ]
+        ),
         "pending_sheet": PENDING_SHEET,
         "pending_row_updated": pending_row,
         "pending_status": "ADDED",
@@ -1515,6 +1509,18 @@ def main() -> None:
     print(
         "Master ticker column:        "
         f"{_column_letter(layout['ticker_column'])}"
+    )
+    print(
+        "Row capacity before:         "
+        f"{capacity_result['row_capacity_before']}"
+    )
+    print(
+        "Capacity rows appended:      "
+        f"{capacity_result['rows_appended']}"
+    )
+    print(
+        "Final grid row count:        "
+        f"{final_master_metadata['row_count']}"
     )
     print(
         "Formulas copied:             "
