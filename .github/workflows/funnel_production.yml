@@ -1,8 +1,13 @@
-# VERSION: 2026-06-23-FUNNEL-PRODUCTION-WORKFLOW-1
+# VERSION: 2026-06-23-FUNNEL-PRODUCTION-SCHEDULED-2
 
 name: Funnel - Production
 
 "on":
+  schedule:
+    # GitHub cron uses UTC.
+    # 11:00 UTC = 19:00 Singapore time.
+    - cron: "0 11 * * *"
+
   workflow_dispatch:
     inputs:
       min_conviction:
@@ -11,7 +16,7 @@ name: Funnel - Production
         default: "15"
 
       telegram_mode:
-        description: Telegram behaviour for this run
+        description: Telegram behaviour for this manual run
         required: true
         default: CHANGES_ONLY
         type: choice
@@ -32,8 +37,8 @@ name: Funnel - Production
 permissions:
   contents: read
 
-# Use the same group as Funnel - Pilot.
-# Pilot and production sheet writes cannot overlap.
+# Same group used by the pilot workflow.
+# Prevents pilot and production sheet writes from overlapping.
 concurrency:
   group: funnel-pilot
   cancel-in-progress: false
@@ -42,7 +47,7 @@ jobs:
   production-refresh:
     name: Run Funnel Production Refresh
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -52,6 +57,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
@@ -71,23 +77,54 @@ jobs:
           set -euo pipefail
           python -m unittest discover -s tests -v
 
-      - name: Reject unconfirmed production refresh
-        if: ${{ inputs.confirm_production_run != 'YES' }}
+      - name: Resolve scheduled or manual settings
+        env:
+          INPUT_MIN_CONVICTION: ${{ inputs.min_conviction }}
+          INPUT_TELEGRAM_MODE: ${{ inputs.telegram_mode }}
+          INPUT_CONFIRMATION: ${{ inputs.confirm_production_run }}
         run: |
-          echo "Production refresh requires confirm_production_run=YES."
-          exit 1
+          set -euo pipefail
 
-      - name: Run production refresh and Telegram notifier
-        if: ${{ inputs.confirm_production_run == 'YES' }}
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            echo "Scheduled production run selected."
+            echo "MIN_CONVICTION=15" >> "$GITHUB_ENV"
+            echo "TELEGRAM_MODE=CHANGES_ONLY" >> "$GITHUB_ENV"
+            echo "CONFIRM_PRODUCTION_RUN=YES" >> "$GITHUB_ENV"
+            echo "RUN_TRIGGER=SCHEDULED" >> "$GITHUB_ENV"
+          else
+            if [[ "${INPUT_CONFIRMATION}" != "YES" ]]; then
+              echo "Manual production refresh requires confirm_production_run=YES."
+              exit 1
+            fi
+
+            if [[ -z "${INPUT_MIN_CONVICTION}" ]]; then
+              INPUT_MIN_CONVICTION="15"
+            fi
+
+            if [[ -z "${INPUT_TELEGRAM_MODE}" ]]; then
+              INPUT_TELEGRAM_MODE="CHANGES_ONLY"
+            fi
+
+            echo "Manual production run selected."
+            echo "MIN_CONVICTION=${INPUT_MIN_CONVICTION}" >> "$GITHUB_ENV"
+            echo "TELEGRAM_MODE=${INPUT_TELEGRAM_MODE}" >> "$GITHUB_ENV"
+            echo "CONFIRM_PRODUCTION_RUN=YES" >> "$GITHUB_ENV"
+            echo "RUN_TRIGGER=MANUAL" >> "$GITHUB_ENV"
+          fi
+
+      - name: Show resolved settings
+        run: |
+          set -euo pipefail
+          echo "Run trigger:       ${RUN_TRIGGER}"
+          echo "Minimum conviction: ${MIN_CONVICTION}"
+          echo "Telegram mode:      ${TELEGRAM_MODE}"
+
+      - name: Run production scanner, funnel refresh and Telegram notifier
         env:
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_WORKSHEET_NAME: Stock Summary USD
 
-          MIN_CONVICTION: ${{ inputs.min_conviction }}
-          CONFIRM_PRODUCTION_RUN: ${{ inputs.confirm_production_run }}
-
-          TELEGRAM_MODE: ${{ inputs.telegram_mode }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MAX_ATTEMPTS: "3"
@@ -95,16 +132,63 @@ jobs:
 
           FUNNEL_OUTPUT_DIR: funnel_output
           PYTHONUNBUFFERED: "1"
-
         run: |
           set -euo pipefail
           python -m funnel.production_runner
 
+      - name: Notify Telegram if the production workflow fails
+        if: ${{ failure() }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+          if not token or not chat_id:
+              print("Telegram failure alert skipped: credentials unavailable.")
+              raise SystemExit(0)
+
+          repository = os.getenv("GITHUB_REPOSITORY", "")
+          run_id = os.getenv("GITHUB_RUN_ID", "")
+          server = os.getenv("GITHUB_SERVER_URL", "https://github.com")
+          event = os.getenv("GITHUB_EVENT_NAME", "unknown")
+
+          run_url = f"{server}/{repository}/actions/runs/{run_id}"
+
+          message = (
+              "❌ HX FUNNEL PRODUCTION FAILED\n\n"
+              f"Trigger: {event}\n"
+              f"Repository: {repository}\n"
+              f"Run: {run_url}"
+          )
+
+          response = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={
+                  "chat_id": chat_id,
+                  "text": message,
+                  "link_preview_options": {
+                      "is_disabled": True
+                  },
+              },
+              timeout=20,
+          )
+
+          response.raise_for_status()
+          print("Telegram failure alert sent.")
+          PY
+
       - name: Upload production artefacts
-        if: ${{ success() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: funnel-production-${{ github.run_number }}
           path: funnel_output/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
