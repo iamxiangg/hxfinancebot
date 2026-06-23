@@ -1,9 +1,11 @@
-# VERSION: 2026-06-23-PROMOTION-DRY-RUN-1
+# VERSION: 2026-06-23-PROMOTION-DRY-RUN-2
 #
 # Approval-based ticker promotion dry run:
 # - reads Pending_New_Tickers;
 # - reads Stock Summary USD;
-# - identifies explicitly approved, complete, current candidates;
+# - identifies explicitly approved, current candidates;
+# - requires only the ticker and approval controls;
+# - treats Stock Name and Google Ticker as optional reference fields;
 # - rejects duplicate, incomplete or inconsistent approvals;
 # - writes CSV and JSON artefacts only;
 # - never modifies any Google Sheet.
@@ -99,7 +101,9 @@ def _ticker(value: Any) -> str:
     if not raw_value:
         return ""
 
-    return normalise_ticker(raw_value)
+    return normalise_ticker(
+        raw_value
+    )
 
 
 def _output_directory() -> Path:
@@ -129,7 +133,9 @@ def _preview_count() -> int:
     )
 
     try:
-        value = int(raw_value)
+        value = int(
+            raw_value
+        )
     except ValueError as exc:
         raise ValueError(
             "PREVIEW_COUNT must be an integer."
@@ -144,7 +150,9 @@ def _preview_count() -> int:
     )
 
 
-def _column_letter(column_number: int) -> str:
+def _column_letter(
+    column_number: int,
+) -> str:
     """Convert a one-based column number to a Sheets column label."""
     if column_number < 1:
         raise ValueError(
@@ -161,7 +169,9 @@ def _column_letter(column_number: int) -> str:
         )
 
         result = (
-            chr(65 + remainder)
+            chr(
+                65 + remainder
+            )
             + result
         )
 
@@ -198,7 +208,9 @@ def _get_sheet_titles(
         )
 
         if title:
-            titles.add(title)
+            titles.add(
+                title
+            )
 
     return titles
 
@@ -226,10 +238,14 @@ def _read_values(
     )
 
 
-def _normalise_header(row: list[Any]) -> list[str]:
+def _normalise_header(
+    row: list[Any],
+) -> list[str]:
     """Normalise a worksheet header and remove trailing blanks."""
     values = [
-        _text(value)
+        _text(
+            value
+        )
         for value in row
     ]
 
@@ -245,7 +261,9 @@ def _read_pending_records(
 ) -> list[dict[str, str]]:
     """Read Pending_New_Tickers without modifying it."""
     final_column = _column_letter(
-        len(PENDING_HEADERS)
+        len(
+            PENDING_HEADERS
+        )
     )
 
     rows = _read_values(
@@ -273,19 +291,31 @@ def _read_pending_records(
             f"found {actual_headers}."
         )
 
-    records: list[dict[str, str]] = []
+    records: list[
+        dict[str, str]
+    ] = []
 
     for sheet_row, raw_row in enumerate(
         rows[1:],
         start=2,
     ):
         padded = (
-            list(raw_row)
-            + [""] * len(PENDING_HEADERS)
-        )[:len(PENDING_HEADERS)]
+            list(
+                raw_row
+            )
+            + [""] * len(
+                PENDING_HEADERS
+            )
+        )[
+            :len(
+                PENDING_HEADERS
+            )
+        ]
 
         if not any(
-            _text(value)
+            _text(
+                value
+            )
             for value in padded
         ):
             continue
@@ -295,18 +325,28 @@ def _read_pending_records(
                 padded[index]
             )
             for index, header
-            in enumerate(PENDING_HEADERS)
+            in enumerate(
+                PENDING_HEADERS
+            )
         }
 
-        record["Ticker"] = _ticker(
-            record.get("Ticker")
+        record[
+            "Ticker"
+        ] = _ticker(
+            record.get(
+                "Ticker"
+            )
         )
 
-        record["_Sheet Row"] = str(
+        record[
+            "_Sheet Row"
+        ] = str(
             sheet_row
         )
 
-        records.append(record)
+        records.append(
+            record
+        )
 
     return records
 
@@ -322,7 +362,9 @@ def _extract_master_ticker(
         "Symbol",
     ):
         value = _ticker(
-            record.get(key)
+            record.get(
+                key
+            )
         )
 
         if value:
@@ -335,8 +377,14 @@ def _build_master_index(
     ticker_records: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     """Create a unique ticker index for Stock Summary USD."""
-    index: dict[str, dict[str, Any]] = {}
-    duplicates: set[str] = set()
+    index: dict[
+        str,
+        dict[str, Any],
+    ] = {}
+
+    duplicates: set[
+        str
+    ] = set()
 
     for record in ticker_records:
         ticker = _extract_master_ticker(
@@ -347,25 +395,35 @@ def _build_master_index(
             continue
 
         if ticker in index:
-            duplicates.add(ticker)
+            duplicates.add(
+                ticker
+            )
             continue
 
-        index[ticker] = record
+        index[
+            ticker
+        ] = record
 
     if duplicates:
         raise RuntimeError(
             "Stock Summary USD contains duplicate tickers: "
             + ", ".join(
-                sorted(duplicates)
+                sorted(
+                    duplicates
+                )
             )
         )
 
     return index
 
 
-def _safe_csv_value(value: Any) -> str:
+def _safe_csv_value(
+    value: Any,
+) -> str:
     """Reduce spreadsheet-formula injection risk in generated CSV files."""
-    text = _text(value)
+    text = _text(
+        value
+    )
 
     if text.startswith(
         (
@@ -413,18 +471,24 @@ def _write_csv(
             )
 
 
-def _sha256(path: Path) -> str:
+def _sha256(
+    path: Path,
+) -> str:
     """Return the SHA-256 hash of a file."""
     digest = hashlib.sha256()
 
-    with path.open("rb") as file_handle:
+    with path.open(
+        "rb"
+    ) as file_handle:
         for chunk in iter(
             lambda: file_handle.read(
                 1024 * 1024
             ),
             b"",
         ):
-            digest.update(chunk)
+            digest.update(
+                chunk
+            )
 
     return digest.hexdigest()
 
@@ -459,15 +523,19 @@ def _base_export_record(
         if header != "Pending Sheet Row"
     }
 
-    output["Ticker"] = _ticker(
-        record.get("Ticker")
+    output[
+        "Ticker"
+    ] = _ticker(
+        record.get(
+            "Ticker"
+        )
     )
 
-    output["Pending Sheet Row"] = (
-        record.get(
-            "_Sheet Row",
-            "",
-        )
+    output[
+        "Pending Sheet Row"
+    ] = record.get(
+        "_Sheet Row",
+        "",
     )
 
     return output
@@ -483,21 +551,33 @@ def _evaluate_promotions(
     """
     Evaluate explicit promotion requests.
 
-    Only rows with Add to Stock Summary USD? = YES are considered
-    promotion requests. HOLD, REVIEW and blank values remain untouched.
+    Only rows with Add to Stock Summary USD? = YES are considered.
+
+    Stock Name and Google Ticker are not required because the master
+    worksheet derives its reference fields from the ticker.
     """
     ticker_counts = Counter(
         _ticker(
-            record.get("Ticker")
+            record.get(
+                "Ticker"
+            )
         )
         for record in pending_records
         if _ticker(
-            record.get("Ticker")
+            record.get(
+                "Ticker"
+            )
         )
     )
 
-    approved: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
+    approved: list[
+        dict[str, Any]
+    ] = []
+
+    rejected: list[
+        dict[str, Any]
+    ] = []
+
     approval_request_count = 0
 
     for record in pending_records:
@@ -513,7 +593,9 @@ def _evaluate_promotions(
         approval_request_count += 1
 
         ticker = _ticker(
-            record.get("Ticker")
+            record.get(
+                "Ticker"
+            )
         )
 
         validation_status = _text(
@@ -528,18 +610,6 @@ def _evaluate_promotions(
             )
         ).upper()
 
-        stock_name = _text(
-            record.get(
-                "Stock Name"
-            )
-        )
-
-        google_ticker = _text(
-            record.get(
-                "Google Ticker"
-            )
-        )
-
         signal_id = _text(
             record.get(
                 "Signal ID"
@@ -552,14 +622,21 @@ def _evaluate_promotions(
             )
         )
 
-        reasons: list[str] = []
+        reasons: list[
+            str
+        ] = []
 
         if not ticker:
             reasons.append(
                 "MISSING_TICKER"
             )
 
-        if ticker and ticker_counts[ticker] > 1:
+        if (
+            ticker
+            and ticker_counts[
+                ticker
+            ] > 1
+        ):
             reasons.append(
                 "DUPLICATE_TICKER_IN_PENDING_SHEET"
             )
@@ -572,16 +649,6 @@ def _evaluate_promotions(
         if current_run != "YES":
             reasons.append(
                 "NOT_IN_CURRENT_RUN"
-            )
-
-        if not stock_name:
-            reasons.append(
-                "MISSING_STOCK_NAME"
-            )
-
-        if not google_ticker:
-            reasons.append(
-                "MISSING_GOOGLE_TICKER"
             )
 
         if not signal_id:
@@ -599,7 +666,10 @@ def _evaluate_promotions(
                 "TICKER_ALREADY_IN_STOCK_SUMMARY_USD"
             )
 
-        if added_date and not already_in_master:
+        if (
+            added_date
+            and not already_in_master
+        ):
             reasons.append(
                 "ADDED_DATE_PRESENT_BUT_TICKER_NOT_IN_MASTER"
             )
@@ -608,19 +678,23 @@ def _evaluate_promotions(
             record
         )
 
-        export_record["Master Status"] = (
+        export_record[
+            "Master Status"
+        ] = (
             "ALREADY_PRESENT"
             if already_in_master
             else "NOT_PRESENT"
         )
 
         if reasons:
-            export_record["Dry Run Action"] = (
-                "REJECTED"
-            )
+            export_record[
+                "Dry Run Action"
+            ] = "REJECTED"
 
-            export_record["Rejection Reason"] = (
-                " | ".join(reasons)
+            export_record[
+                "Rejection Reason"
+            ] = " | ".join(
+                reasons
             )
 
             rejected.append(
@@ -628,9 +702,9 @@ def _evaluate_promotions(
             )
 
         else:
-            export_record["Dry Run Action"] = (
-                "ELIGIBLE_FOR_PROMOTION"
-            )
+            export_record[
+                "Dry Run Action"
+            ] = "ELIGIBLE_FOR_PROMOTION"
 
             approved.append(
                 export_record
@@ -638,14 +712,18 @@ def _evaluate_promotions(
 
     approved.sort(
         key=lambda item: _ticker(
-            item.get("Ticker")
+            item.get(
+                "Ticker"
+            )
         )
     )
 
     rejected.sort(
         key=lambda item: (
             _ticker(
-                item.get("Ticker")
+                item.get(
+                    "Ticker"
+                )
             ),
             _text(
                 item.get(
@@ -663,7 +741,7 @@ def _evaluate_promotions(
 
 
 def main() -> None:
-    """Run the approval-based promotion dry run."""
+    """Run the ticker-only approval promotion dry run."""
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -772,6 +850,9 @@ def main() -> None:
     receipt = {
         "status": "PASSED",
         "mode": "PROMOTION_DRY_RUN",
+        "promotion_key": "Ticker",
+        "stock_name_required": False,
+        "google_ticker_required": False,
         "pending_rows_read": len(
             pending_records
         ),
@@ -822,6 +903,15 @@ def main() -> None:
         "=" * 38
     )
     print(
+        "Promotion key:               Ticker"
+    )
+    print(
+        "Stock Name required:         NO"
+    )
+    print(
+        "Google Ticker required:      NO"
+    )
+    print(
         "Pending rows read:           "
         f"{len(pending_records)}"
     )
@@ -863,9 +953,9 @@ def main() -> None:
             print(
                 "  "
                 f"{record['Ticker']} | "
-                f"{record['Stock Name']} | "
-                f"{record['Google Ticker']} | "
-                f"row {record['Pending Sheet Row']}"
+                f"pending row "
+                f"{record['Pending Sheet Row']} | "
+                f"ticker-only promotion"
             )
 
     if rejected_records and preview_count:
@@ -878,14 +968,17 @@ def main() -> None:
             :preview_count
         ]:
             ticker = (
-                record.get("Ticker")
+                record.get(
+                    "Ticker"
+                )
                 or "<blank ticker>"
             )
 
             print(
                 "  "
                 f"{ticker} | "
-                f"row {record['Pending Sheet Row']} | "
+                f"row "
+                f"{record['Pending Sheet Row']} | "
                 f"{record['Rejection Reason']}"
             )
 
