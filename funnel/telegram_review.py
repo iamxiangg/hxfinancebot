@@ -125,6 +125,35 @@ def send_candidate_review(
     return str(payload.get("result", {}).get("message_id", ""))
 
 
+def send_telegram_text(
+    text: str,
+    *,
+    token: str | None = None,
+    chat_id: str | None = None,
+) -> bool:
+    token = token or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return bool(payload.get("ok"))
+    except requests.RequestException as exc:
+        logger.warning("Telegram confirmation message failed: %r", exc)
+        return False
+
+
 def get_updates(
     offset: int,
     *,

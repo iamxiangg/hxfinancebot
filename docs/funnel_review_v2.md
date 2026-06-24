@@ -14,7 +14,8 @@ promoted into `Stock Summary USD`.
 - `Manual_Seed_Tickers`: optional human-entered ideas. Active rows become manual
   signals.
 - `BTD_Candidates`: review queue with yfinance BTD enrichment and optional AI
-  Feroldi draft fields.
+  Feroldi draft fields. It includes an `Active?` column so open candidates can
+  be filtered separately from approved/rejected/archive history.
 - `Feroldi_AI_Drafts`: append-only log of generated AI drafts when
   `OPENAI_API_KEY` exists.
 - `Bot_State`: stores `telegram_last_update_id` so GitHub Actions polling does
@@ -28,12 +29,15 @@ promoted into `Stock Summary USD`.
   - Can also be run manually.
   - Refreshes signals, writes candidates, enriches BTD fields, optionally creates
     AI Feroldi drafts, and sends Telegram review cards.
+  - Manual runs can set `resend_telegram_reviews=true` to send review cards
+    again for candidates that were already notified.
 
 - `Funnel - Telegram Review Bot`
   - Polls every 5 minutes.
   - Processes Telegram inline buttons.
   - Approve promotes into `Stock Summary USD`; reject/archive closes the
     candidate in `BTD_Candidates`.
+  - Sends a plain Telegram confirmation message after each processed action.
 
 ## Secrets
 
@@ -50,3 +54,16 @@ Optional:
 - repository variable `OPENAI_MODEL`
 
 If `OPENAI_API_KEY` is missing, the AI draft step is skipped.
+
+## BTD Candidate Rules
+
+`BTD_Candidates` only receives tickers that are not already in `Stock Summary USD`.
+`Signal_Log` can still contain existing master-list tickers because it records
+the funnel output before the master-list exclusion.
+
+BTD scoring is lower-is-better:
+
+`EV(B) / (Revenue TTM(B) * Gross Margin(decimal) * Revenue Growth(% points))`
+
+The candidate sheet stores both the final score and the visible components used
+to calculate it.

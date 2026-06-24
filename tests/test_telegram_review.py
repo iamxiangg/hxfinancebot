@@ -10,6 +10,7 @@ from funnel.telegram_review import (
     build_callback_data,
     candidate_id_for_ticker,
     parse_callback_data,
+    send_telegram_text,
 )
 
 
@@ -47,6 +48,22 @@ class TelegramReviewTests(unittest.TestCase):
                 token="token",
             )
         )
+
+    @patch("funnel.telegram_review.requests.post")
+    def test_send_telegram_text_success(self, mock_post: Mock) -> None:
+        response = Mock()
+        response.json.return_value = {"ok": True}
+        mock_post.return_value = response
+
+        self.assertTrue(send_telegram_text("Done", token="token", chat_id="chat"))
+
+    @patch("funnel.telegram_review.requests.post")
+    def test_send_telegram_text_failure_is_non_fatal(self, mock_post: Mock) -> None:
+        response = Mock()
+        response.raise_for_status.side_effect = requests.HTTPError("bad")
+        mock_post.return_value = response
+
+        self.assertFalse(send_telegram_text("Done", token="token", chat_id="chat"))
 
 
 if __name__ == "__main__":

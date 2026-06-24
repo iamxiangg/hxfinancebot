@@ -5,6 +5,7 @@ import unittest
 from funnel.btd_enrichment import (
     BtdMetrics,
     build_btd_summary,
+    calculate_btd_components,
     calculate_btd_score,
     calculate_btd_ratio,
     compact_number,
@@ -37,6 +38,24 @@ class BtdEnrichmentTests(unittest.TestCase):
     def test_format_helpers(self) -> None:
         self.assertEqual(percent_text(0.1234), "12.3%")
         self.assertEqual(compact_number(1_250_000_000), "1.2B")
+
+    def test_btd_components_explain_formula(self) -> None:
+        metrics = BtdMetrics(
+            ticker="TEAM",
+            enterprise_value=20_750_000_000,
+            total_revenue=6_190_000_000,
+            revenue_growth=0.317,
+            gross_margin=0.8481,
+        )
+
+        components = calculate_btd_components(metrics)
+
+        self.assertEqual(components["EV (B)"], 20.75)
+        self.assertEqual(components["Revenue TTM (B)"], 6.19)
+        self.assertEqual(components["Gross Margin %"], 84.8)
+        self.assertEqual(components["Revenue Growth %"], 31.7)
+        self.assertIn("20.75 / (6.19 * 0.8481 * 31.7)", components["BTD Formula"])
+        self.assertAlmostEqual(calculate_btd_score(metrics), 0.12)
 
 
 if __name__ == "__main__":

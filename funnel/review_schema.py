@@ -81,6 +81,12 @@ BTD_CANDIDATE_HEADERS = [
     "Decision At",
     "Decision By",
     "Last Error",
+    "Active?",
+    "EV (B)",
+    "Revenue TTM (B)",
+    "Gross Margin %",
+    "Revenue Growth %",
+    "BTD Formula",
 ]
 
 
