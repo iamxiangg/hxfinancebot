@@ -57,6 +57,7 @@ BTD_CANDIDATE_HEADERS = [
     "First Seen",
     "Last Seen",
     "BTD Score",
+    "BTD Ratio",
     "BTD Summary",
     "Next Earnings Date",
     "Enterprise Value",

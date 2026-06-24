@@ -204,6 +204,19 @@ def run() -> None:
 
         if not candidate:
             answer_callback(callback_id, "Candidate was not found.")
+            decision_rows.append(
+                {
+                    "Decision ID": _decision_id(parsed.candidate_id, parsed.action, str(update_id)),
+                    "Candidate ID": parsed.candidate_id,
+                    "Ticker": "",
+                    "Action": parsed.action.upper(),
+                    "Actor": actor,
+                    "Telegram Update ID": str(update_id),
+                    "Decision At": utc_now_iso(),
+                    "Result": "Candidate was not found",
+                    "Details": "",
+                }
+            )
             continue
 
         try:
@@ -220,8 +233,22 @@ def run() -> None:
             candidates[parsed.candidate_id] = updated
             answer_callback(callback_id, result)
         except Exception as exc:
-            answer_callback(callback_id, f"Action failed: {exc!r}"[:180])
-            raise
+            message = f"Action failed: {exc!r}"[:180]
+            logger.exception("Failed to process Telegram action for %s", parsed.candidate_id)
+            decision_rows.append(
+                {
+                    "Decision ID": _decision_id(parsed.candidate_id, parsed.action, str(update_id)),
+                    "Candidate ID": parsed.candidate_id,
+                    "Ticker": str(candidate.get("Ticker") or ""),
+                    "Action": parsed.action.upper(),
+                    "Actor": actor,
+                    "Telegram Update ID": str(update_id),
+                    "Decision At": utc_now_iso(),
+                    "Result": "FAILED",
+                    "Details": message,
+                }
+            )
+            answer_callback(callback_id, message)
 
     upsert_records(
         service,
