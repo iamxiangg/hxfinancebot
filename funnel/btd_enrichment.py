@@ -19,6 +19,7 @@ class BtdMetrics:
     revenue_growth: Any = ""
     gross_margin: Any = ""
     employees: Any = ""
+    btd_ratio: float | None = None
 
 
 def to_float(value: Any) -> float | None:
@@ -49,57 +50,43 @@ def compact_number(value: Any) -> str:
     return f"{number:.0f}"
 
 
-def _score_thresholds(
-    value: float | None,
-    thresholds: list[tuple[float, int]],
-) -> int:
-    if value is None:
-        return 0
-    for threshold, score in thresholds:
-        if value >= threshold:
-            return score
-    return 0
+def calculate_btd_score(metrics: BtdMetrics) -> float:
+    ratio = calculate_btd_ratio(metrics)
+    if ratio is None:
+        return 0.0
+    return round(ratio, 2)
 
 
-def calculate_btd_score(metrics: BtdMetrics) -> int:
-    revenue_growth = to_float(metrics.revenue_growth)
-    gross_margin = to_float(metrics.gross_margin)
-    ebitda_margin = to_float(metrics.ebitda_margin)
-    total_revenue = to_float(metrics.total_revenue)
+def calculate_btd_ratio(metrics: BtdMetrics) -> float | None:
     enterprise_value = to_float(metrics.enterprise_value)
+    total_revenue = to_float(metrics.total_revenue)
+    gross_margin = to_float(metrics.gross_margin)
+    revenue_growth = to_float(metrics.revenue_growth)
 
-    score = 0
-    score += _score_thresholds(
-        revenue_growth,
-        [(0.30, 30), (0.15, 23), (0.05, 15), (0.0, 7)],
-    )
-    score += _score_thresholds(
-        gross_margin,
-        [(0.70, 25), (0.50, 18), (0.35, 10), (0.20, 5)],
-    )
-    score += _score_thresholds(
-        ebitda_margin,
-        [(0.25, 20), (0.15, 14), (0.05, 8), (0.0, 3)],
-    )
-    score += _score_thresholds(
-        total_revenue,
-        [(10_000_000_000, 10), (1_000_000_000, 7), (250_000_000, 4)],
-    )
+    if (
+        enterprise_value is None
+        or total_revenue is None
+        or gross_margin is None
+        or revenue_growth is None
+        or enterprise_value <= 0
+        or total_revenue <= 0
+        or gross_margin <= 0
+        or revenue_growth <= 0
+    ):
+        return None
 
-    if enterprise_value and total_revenue and total_revenue > 0:
-        ev_to_sales = enterprise_value / total_revenue
-        if ev_to_sales <= 5:
-            score += 10
-        elif ev_to_sales <= 10:
-            score += 6
-        elif ev_to_sales <= 20:
-            score += 3
-
-    return max(0, min(100, int(score)))
+    ev_b = enterprise_value / 1_000_000_000
+    revenue_b = total_revenue / 1_000_000_000
+    ratio = ev_b / (revenue_b * gross_margin * (revenue_growth * 100))
+    return ratio
 
 
-def build_btd_summary(metrics: BtdMetrics, score: int) -> str:
-    parts = [f"BTD {score}/100"]
+def build_btd_summary(metrics: BtdMetrics, score: float) -> str:
+    parts = [f"BTD {score}"]
+    ratio = calculate_btd_ratio(metrics)
+    if ratio is not None:
+        parts.append("Lower is better")
+        parts.append(f"Efficiency ratio {ratio:.2f}")
     if metrics.revenue_growth not in ("", None):
         parts.append(f"Revenue growth {percent_text(metrics.revenue_growth)}")
     if metrics.gross_margin not in ("", None):
@@ -154,6 +141,7 @@ def metrics_to_candidate_updates(metrics: BtdMetrics) -> dict[str, Any]:
         "Company Name": metrics.company_name,
         "Google Ticker": metrics.ticker,
         "BTD Score": score,
+        "BTD Ratio": calculate_btd_ratio(metrics) or "",
         "BTD Summary": build_btd_summary(metrics, score),
         "Next Earnings Date": metrics.next_earnings_date,
         "Enterprise Value": metrics.enterprise_value,
