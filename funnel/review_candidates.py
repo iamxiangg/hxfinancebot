@@ -238,6 +238,10 @@ def notify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if str(os.getenv("SEND_TELEGRAM_REVIEWS", "true")).strip().lower() in {"0", "false", "no", "off"}:
         return candidates
 
+    force_resend = str(
+        os.getenv("FORCE_TELEGRAM_REVIEW_RESEND", "false")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
     now = utc_now_iso()
     updated: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -245,7 +249,7 @@ def notify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not _active_for_enrichment(candidate):
             updated.append(candidate)
             continue
-        if candidate.get("Telegram Message ID"):
+        if candidate.get("Telegram Message ID") and not force_resend:
             updated.append(candidate)
             continue
 
