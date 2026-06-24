@@ -1,0 +1,52 @@
+# Funnel Review V2
+
+This is the safer candidate-review path for the stock screener.
+
+`Stock Summary USD` stays as the curated master list. New ticker ideas flow into
+`BTD_Candidates`, where they are enriched, reviewed in Telegram, and only then
+promoted into `Stock Summary USD`.
+
+## Sheets
+
+- `Stock Summary USD`: curated master list. The Telegram approval action appends
+  here only when the ticker is not already present.
+- `Signal_Log`: raw signal history from Congress and manual seeds.
+- `Manual_Seed_Tickers`: optional human-entered ideas. Active rows become manual
+  signals.
+- `BTD_Candidates`: review queue with yfinance BTD enrichment and optional AI
+  Feroldi draft fields.
+- `Feroldi_AI_Drafts`: append-only log of generated AI drafts when
+  `OPENAI_API_KEY` exists.
+- `Bot_State`: stores `telegram_last_update_id` so GitHub Actions polling does
+  not reprocess old button clicks.
+- `Decision_Log`: append-only approve/reject/archive audit log.
+
+## Workflows
+
+- `Funnel - Review Candidates`
+  - Scheduled on weekdays at 20:00 Singapore time.
+  - Can also be run manually.
+  - Refreshes signals, writes candidates, enriches BTD fields, optionally creates
+    AI Feroldi drafts, and sends Telegram review cards.
+
+- `Funnel - Telegram Review Bot`
+  - Polls every 5 minutes.
+  - Processes Telegram inline buttons.
+  - Approve promotes into `Stock Summary USD`; reject/archive closes the
+    candidate in `BTD_Candidates`.
+
+## Secrets
+
+Required:
+
+- `GCP_SERVICE_ACCOUNT_FILE`
+- `GOOGLE_SHEET_ID`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+Optional:
+
+- `OPENAI_API_KEY`
+- repository variable `OPENAI_MODEL`
+
+If `OPENAI_API_KEY` is missing, the AI draft step is skipped.
