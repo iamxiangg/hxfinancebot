@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
+
+import requests
 
 from funnel.telegram_review import (
+    answer_callback,
     build_callback_data,
     candidate_id_for_ticker,
     parse_callback_data,
@@ -28,6 +32,20 @@ class TelegramReviewTests(unittest.TestCase):
         self.assertEqual(
             candidate_id_for_ticker("msft"),
             candidate_id_for_ticker(" MSFT "),
+        )
+
+    @patch("funnel.telegram_review.requests.post")
+    def test_answer_callback_failure_is_non_fatal(self, mock_post: Mock) -> None:
+        response = Mock()
+        response.raise_for_status.side_effect = requests.HTTPError("expired")
+        mock_post.return_value = response
+
+        self.assertFalse(
+            answer_callback(
+                "callback-id",
+                "Processed",
+                token="token",
+            )
         )
 
 

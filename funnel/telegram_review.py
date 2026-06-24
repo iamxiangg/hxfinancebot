@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ import requests
 
 
 CALLBACK_PREFIX = "hxv2"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -153,12 +155,19 @@ def answer_callback(
     text: str,
     *,
     token: str | None = None,
-) -> None:
+) -> bool:
     token = token or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not callback_query_id:
-        return
-    requests.post(
-        f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-        json={"callback_query_id": callback_query_id, "text": text[:180]},
-        timeout=15,
-    ).raise_for_status()
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text[:180]},
+            timeout=15,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        logger.warning("Telegram callback acknowledgement failed: %r", exc)
+        return False
