@@ -29,6 +29,7 @@ class ReviewCandidateTests(unittest.TestCase):
         self.assertEqual(merged["First Seen"], "2026-06-01T00:00:00+00:00")
         self.assertEqual(merged["Funnel Score"], "70")
         self.assertEqual(merged["Discovery Reason"], "New signal")
+        self.assertEqual(merged["Active?"], "YES")
 
     def test_final_candidate_is_not_reopened(self) -> None:
         existing = {

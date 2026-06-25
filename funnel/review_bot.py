@@ -18,7 +18,7 @@ from funnel.review_schema import (
 from funnel.review_setup import ensure_review_sheets
 from funnel.sheet_reader import get_stock_summary_ticker_records
 from funnel.sheet_table import append_records, cell_text, column_letter, read_table, upsert_records
-from funnel.telegram_review import answer_callback, get_updates, parse_callback_data
+from funnel.telegram_review import answer_callback, get_updates, parse_callback_data, send_telegram_text
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,14 @@ def _find_header_index(headers: list[str], names: set[str]) -> int | None:
         if header.strip().lower() in normalized:
             return index
     return None
+
+
+def _set_if_header(row: list[Any], headers: list[str], names: set[str], value: Any) -> None:
+    if value in ("", None):
+        return
+    index = _find_header_index(headers, names)
+    if index is not None:
+        row[index] = value
 
 
 def _read_master_headers(service, spreadsheet_id: str) -> list[str]:
@@ -99,6 +107,19 @@ def promote_candidate_to_master(service, spreadsheet_id: str, candidate: dict[st
 
     if google_index is not None:
         row[google_index] = candidate.get("Google Ticker") or ticker
+
+    _set_if_header(row, headers, {"btd score"}, candidate.get("BTD Score"))
+    _set_if_header(row, headers, {"btd ratio"}, candidate.get("BTD Ratio"))
+    _set_if_header(row, headers, {"ev (b)", "enterprise value (b)"}, candidate.get("EV (B)"))
+    _set_if_header(row, headers, {"revenue ttm (b)", "total revenue (b)"}, candidate.get("Revenue TTM (B)"))
+    _set_if_header(row, headers, {"gross margin %"}, candidate.get("Gross Margin %"))
+    _set_if_header(row, headers, {"revenue growth %"}, candidate.get("Revenue Growth %"))
+    _set_if_header(row, headers, {"btd formula"}, candidate.get("BTD Formula"))
+    _set_if_header(row, headers, {"btd summary"}, candidate.get("BTD Summary"))
+    _set_if_header(row, headers, {"btd last updated"}, candidate.get("BTD Last Updated"))
+    _set_if_header(row, headers, {"signal source", "source"}, candidate.get("Source"))
+    _set_if_header(row, headers, {"discovery reason", "review notes"}, candidate.get("Discovery Reason"))
+    _set_if_header(row, headers, {"funnel score"}, candidate.get("Funnel Score"))
 
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
@@ -149,6 +170,7 @@ def apply_action(
     updated["Decision"] = action.upper()
     updated["Decision At"] = now
     updated["Decision By"] = actor
+    updated["Active?"] = "NO"
 
     log_row = {
         "Decision ID": _decision_id(str(candidate.get("Candidate ID", "")), action, update_id),
@@ -162,6 +184,12 @@ def apply_action(
         "Details": "",
     }
     return updated, log_row, result
+
+
+def _confirmation_text(candidate: dict[str, Any], action: str, result: str) -> str:
+    ticker = str(candidate.get("Ticker") or "").strip().upper() or "candidate"
+    action_text = action.strip().upper()
+    return f"{action_text} ${ticker}: {result}"
 
 
 def run() -> None:
@@ -232,6 +260,7 @@ def run() -> None:
             decision_rows.append(log_row)
             candidates[parsed.candidate_id] = updated
             answer_callback(callback_id, result)
+            send_telegram_text(_confirmation_text(updated, parsed.action, result))
         except Exception as exc:
             message = f"Action failed: {exc!r}"[:180]
             logger.exception("Failed to process Telegram action for %s", parsed.candidate_id)
@@ -249,6 +278,7 @@ def run() -> None:
                 }
             )
             answer_callback(callback_id, message)
+            send_telegram_text(_confirmation_text(candidate, parsed.action, message))
 
     upsert_records(
         service,

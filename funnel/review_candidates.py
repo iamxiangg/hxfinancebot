@@ -106,6 +106,7 @@ def comparison_to_candidate(record: dict[str, Any], now: str) -> dict[str, Any]:
         "Discovery Reason": record.get("discovery_reason", ""),
         "First Seen": now,
         "Last Seen": record.get("observed_at", now),
+        "Active?": "YES",
     }
 
 
@@ -131,6 +132,7 @@ def merge_candidate(
     if not merged.get("First Seen"):
         merged["First Seen"] = incoming.get("First Seen", now)
     merged["Last Seen"] = incoming.get("Last Seen", now)
+    merged["Active?"] = "YES"
     if status not in {"NOTIFIED", "REVIEW"}:
         merged["Status"] = "NEW"
     return merged

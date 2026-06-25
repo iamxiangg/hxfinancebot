@@ -81,6 +81,40 @@ def calculate_btd_ratio(metrics: BtdMetrics) -> float | None:
     return ratio
 
 
+def calculate_btd_components(metrics: BtdMetrics) -> dict[str, Any]:
+    enterprise_value = to_float(metrics.enterprise_value)
+    total_revenue = to_float(metrics.total_revenue)
+    gross_margin = to_float(metrics.gross_margin)
+    revenue_growth = to_float(metrics.revenue_growth)
+    ratio = calculate_btd_ratio(metrics)
+
+    ev_b = enterprise_value / 1_000_000_000 if enterprise_value is not None else None
+    revenue_b = total_revenue / 1_000_000_000 if total_revenue is not None else None
+    gross_margin_pct = gross_margin * 100 if gross_margin is not None else None
+    revenue_growth_pct = revenue_growth * 100 if revenue_growth is not None else None
+
+    formula = ""
+    if (
+        ratio is not None
+        and ev_b is not None
+        and revenue_b is not None
+        and gross_margin is not None
+        and revenue_growth_pct is not None
+    ):
+        formula = (
+            "EV(B) / (Revenue(B) * Gross Margin(decimal) * Revenue Growth(%pts)) = "
+            f"{ev_b:.2f} / ({revenue_b:.2f} * {gross_margin:.4f} * {revenue_growth_pct:.1f})"
+        )
+
+    return {
+        "EV (B)": round(ev_b, 2) if ev_b is not None else "",
+        "Revenue TTM (B)": round(revenue_b, 2) if revenue_b is not None else "",
+        "Gross Margin %": round(gross_margin_pct, 1) if gross_margin_pct is not None else "",
+        "Revenue Growth %": round(revenue_growth_pct, 1) if revenue_growth_pct is not None else "",
+        "BTD Formula": formula,
+    }
+
+
 def build_btd_summary(metrics: BtdMetrics, score: float) -> str:
     parts = [f"BTD {score}"]
     ratio = calculate_btd_ratio(metrics)
@@ -137,7 +171,7 @@ def fetch_yfinance_metrics(ticker: str) -> BtdMetrics:
 
 def metrics_to_candidate_updates(metrics: BtdMetrics) -> dict[str, Any]:
     score = calculate_btd_score(metrics)
-    return {
+    updates = {
         "Company Name": metrics.company_name,
         "Google Ticker": metrics.ticker,
         "BTD Score": score,
@@ -151,3 +185,5 @@ def metrics_to_candidate_updates(metrics: BtdMetrics) -> dict[str, Any]:
         "Gross Margin": metrics.gross_margin,
         "Employees": metrics.employees,
     }
+    updates.update(calculate_btd_components(metrics))
+    return updates
