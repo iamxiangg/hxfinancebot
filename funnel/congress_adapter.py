@@ -11,6 +11,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from funnel.google_client import get_sheets_service, get_spreadsheet_id
+from funnel.review_schema import CONGRESS_LEDGER_HEADERS, CONGRESS_LEDGER_SHEET
+from funnel.review_setup import ensure_review_sheets
+from funnel.sheet_table import read_table, upsert_records
 from funnel.signal_schema import Signal
 from scanners.congress.engine import (
     MODEL_VERSION,
@@ -35,6 +39,12 @@ class CongressAdapterRun:
     scan: CongressScanResult
     signals: list[Signal]
     analysed_tickers: int
+
+
+@dataclass
+class _SheetLedgerContext:
+    service: Any
+    spreadsheet_id: str
 
 
 def _normalise_datetime(value: str | date | datetime) -> datetime:
@@ -160,7 +170,56 @@ def _ledger_path() -> Path:
     return _state_directory() / "transaction_ledger.json"
 
 
-def _load_ledger() -> dict[str, dict[str, Any]]:
+def _ledger_rows_from_state(ledger: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for trade_key, payload in sorted(ledger.items()):
+        rows.append(
+            {
+                "Trade Key": trade_key,
+                "Fingerprint": payload.get("fingerprint", ""),
+                "Ticker": payload.get("ticker", ""),
+                "Transaction Date": payload.get("transaction_date", ""),
+                "Filing Date": payload.get("filing_date", ""),
+                "Last Seen At": payload.get("last_seen_at", ""),
+                "Last Seen Payload Hash": payload.get("last_seen_payload_hash", ""),
+            }
+        )
+    return rows
+
+
+def _ledger_state_from_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    ledger: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        trade_key = str(row.get("Trade Key") or "").strip()
+        if not trade_key:
+            continue
+        ledger[trade_key] = {
+            "fingerprint": str(row.get("Fingerprint") or "").strip(),
+            "ticker": str(row.get("Ticker") or "").strip(),
+            "transaction_date": str(row.get("Transaction Date") or "").strip(),
+            "filing_date": str(row.get("Filing Date") or "").strip(),
+            "last_seen_at": str(row.get("Last Seen At") or "").strip(),
+            "last_seen_payload_hash": str(row.get("Last Seen Payload Hash") or "").strip(),
+        }
+    return ledger
+
+
+def _sheet_ledger_context() -> _SheetLedgerContext | None:
+    backend = str(os.getenv("CONGRESS_LEDGER_BACKEND", "auto")).strip().lower()
+    if backend == "local":
+        return None
+    if not os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip():
+        return None
+    if not os.getenv("GOOGLE_SHEET_ID", "").strip():
+        return None
+
+    service = get_sheets_service(readonly=False)
+    spreadsheet_id = get_spreadsheet_id()
+    ensure_review_sheets(service, spreadsheet_id)
+    return _SheetLedgerContext(service=service, spreadsheet_id=spreadsheet_id)
+
+
+def _load_local_ledger() -> dict[str, dict[str, Any]]:
     path = _ledger_path()
     if not path.exists():
         return {}
@@ -172,10 +231,47 @@ def _load_ledger() -> dict[str, dict[str, Any]]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _save_ledger(ledger: dict[str, dict[str, Any]]) -> None:
+def _save_local_ledger(ledger: dict[str, dict[str, Any]]) -> None:
     _ledger_path().write_text(
         json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
+    )
+
+
+def _load_ledger() -> tuple[dict[str, dict[str, Any]], _SheetLedgerContext | None]:
+    try:
+        context = _sheet_ledger_context()
+    except Exception as exc:
+        logger.warning("Congress sheet ledger unavailable, falling back to local JSON: %r", exc)
+        context = None
+
+    if context is None:
+        return _load_local_ledger(), None
+
+    rows = read_table(
+        context.service,
+        context.spreadsheet_id,
+        CONGRESS_LEDGER_SHEET,
+        CONGRESS_LEDGER_HEADERS,
+    )
+    return _ledger_state_from_rows(rows), context
+
+
+def _save_ledger(
+    ledger: dict[str, dict[str, Any]],
+    context: _SheetLedgerContext | None,
+) -> None:
+    if context is None:
+        _save_local_ledger(ledger)
+        return
+
+    upsert_records(
+        context.service,
+        context.spreadsheet_id,
+        CONGRESS_LEDGER_SHEET,
+        CONGRESS_LEDGER_HEADERS,
+        "Trade Key",
+        _ledger_rows_from_state(ledger),
     )
 
 
@@ -212,16 +308,20 @@ def _write_audit_bundle(scan: CongressScanResult, signals: list[Signal]) -> None
 
 def run_congress_adapter_detailed(
     min_conviction: float = 15.0,
+    *,
+    persist_ledger: bool = True,
 ) -> CongressAdapterRun:
     """
     Run the shared Congress engine and convert alertable results into Signals.
 
-    The adapter persists a local transaction ledger so previously seen
-    disclosures can be suppressed on subsequent runs.
+    The adapter persists a transaction ledger so previously seen disclosures
+    can be suppressed on subsequent runs. Google Sheets is preferred when
+    credentials are available; otherwise a local JSON fallback is used.
     """
-    ledger = _load_ledger()
+    ledger, ledger_context = _load_ledger()
     scan = run_live_scan(prior_ledger=ledger)
-    _save_ledger(scan.ledger)
+    if persist_ledger:
+        _save_ledger(scan.ledger, ledger_context)
 
     observed_at = scan.metadata.fetched_at
     signals: list[Signal] = []
@@ -254,19 +354,29 @@ def run_congress_adapter_detailed(
 
 def run_congress_adapter(
     min_conviction: float = 15.0,
+    *,
+    persist_ledger: bool = True,
 ) -> tuple[list[Signal], int]:
     """
     Return standardised signals and the total analysed ticker count.
     """
-    run = run_congress_adapter_detailed(min_conviction=min_conviction)
+    run = run_congress_adapter_detailed(
+        min_conviction=min_conviction,
+        persist_ledger=persist_ledger,
+    )
     return run.signals, run.analysed_tickers
 
 
 def get_congress_signals(
     min_conviction: float = 15.0,
+    *,
+    persist_ledger: bool = True,
 ) -> list[Signal]:
     """
     Compatibility function for existing funnel callers.
     """
-    signals, _ = run_congress_adapter(min_conviction=min_conviction)
+    signals, _ = run_congress_adapter(
+        min_conviction=min_conviction,
+        persist_ledger=persist_ledger,
+    )
     return signals

@@ -10,6 +10,7 @@ FEROLDI_AI_DRAFTS_SHEET = "Feroldi_AI_Drafts"
 BOT_STATE_SHEET = "Bot_State"
 DECISION_LOG_SHEET = "Decision_Log"
 MANUAL_SEED_SHEET = "Manual_Seed_Tickers"
+CONGRESS_LEDGER_SHEET = "Congress_Ledger"
 
 
 CANDIDATE_ACTIVE_STATUSES = {
@@ -131,6 +132,17 @@ MANUAL_SEED_HEADERS = [
     "Score",
     "Status",
     "Added At",
+]
+
+
+CONGRESS_LEDGER_HEADERS = [
+    "Trade Key",
+    "Fingerprint",
+    "Ticker",
+    "Transaction Date",
+    "Filing Date",
+    "Last Seen At",
+    "Last Seen Payload Hash",
 ]
 
 

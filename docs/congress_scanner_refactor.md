@@ -80,3 +80,8 @@ Each classified transaction now carries:
 ## Residual Risk
 
 The adapter currently persists its ledger to a local JSON file under `funnel_output/congress_state`. That is enough for local runs and deterministic tests, but GitHub Actions workspaces are ephemeral, so production-grade repeat-alert suppression still wants a durable store such as a dedicated Google Sheet table or another persisted state layer.
+
+Update: the production path now prefers a dedicated Google Sheets tab,
+`Congress_Ledger`, whenever `GCP_SERVICE_ACCOUNT_FILE` and `GOOGLE_SHEET_ID`
+are available. The local JSON file remains as a fallback for local runs and
+tests, and the dry-run command explicitly avoids mutating the ledger.
