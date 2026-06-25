@@ -980,7 +980,8 @@ def main() -> None:
 
     signals, analysed_count = (
         run_congress_adapter(
-            min_conviction=minimum_conviction
+            min_conviction=minimum_conviction,
+            persist_ledger=False,
         )
     )
 

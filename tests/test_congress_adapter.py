@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 
-from funnel.congress_adapter import result_to_signal
+from funnel.congress_adapter import (
+    _ledger_rows_from_state,
+    _ledger_state_from_rows,
+    result_to_signal,
+    run_congress_adapter,
+)
 from scanners.congress.engine import CongressTickerResult
 
 
@@ -152,6 +158,46 @@ class TestCongressAdapter(unittest.TestCase):
         )
 
         self.assertIsNone(result_to_signal(result=result, observed_at=self.observed_at))
+
+    def test_ledger_rows_round_trip(self) -> None:
+        ledger = {
+            "id:123": {
+                "fingerprint": "abc",
+                "ticker": "MSFT",
+                "transaction_date": "2026-06-20",
+                "filing_date": "2026-06-22",
+                "last_seen_at": "2026-06-25T10:00:00+08:00",
+                "last_seen_payload_hash": "hash123",
+            }
+        }
+
+        rows = _ledger_rows_from_state(ledger)
+        rebuilt = _ledger_state_from_rows(rows)
+
+        self.assertEqual(rebuilt, ledger)
+
+    @patch("funnel.congress_adapter._save_ledger")
+    @patch("funnel.congress_adapter.run_live_scan")
+    @patch("funnel.congress_adapter._load_ledger")
+    def test_run_congress_adapter_can_skip_persistence(
+        self,
+        mock_load_ledger: Mock,
+        mock_run_live_scan: Mock,
+        mock_save_ledger: Mock,
+    ) -> None:
+        mock_load_ledger.return_value = ({}, None)
+        mock_run_live_scan.return_value = Mock(
+            metadata=Mock(fetched_at="2026-06-24T12:00:00+08:00", payload_sha256="hash"),
+            ticker_results=[],
+            ledger={},
+            counts={"total_raw_records": 0, "active_tickers_before_market_checks": 0, "scored_tickers": 0},
+        )
+
+        signals, analysed = run_congress_adapter(min_conviction=15.0, persist_ledger=False)
+
+        self.assertEqual(signals, [])
+        self.assertEqual(analysed, 0)
+        mock_save_ledger.assert_not_called()
 
 
 if __name__ == "__main__":
