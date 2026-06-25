@@ -41,6 +41,14 @@ class CongressAdapterRun:
     analysed_tickers: int
 
 
+@dataclass(frozen=True)
+class _SignalBreakdown:
+    alertable: int
+    already_seen_suppressed: int
+    below_threshold: int
+    retained: int
+
+
 @dataclass
 class _SheetLedgerContext:
     service: Any
@@ -60,6 +68,28 @@ def _normalise_datetime(value: str | date | datetime) -> datetime:
 
 def _remaining_validity_days(result: CongressTickerResult) -> int:
     return max(1, int(result.valid_for_days))
+
+
+def _signal_breakdown(
+    results: list[CongressTickerResult],
+    signals: list[Signal],
+    *,
+    min_conviction: float,
+) -> _SignalBreakdown:
+    alertable = sum(result.alertable for result in results)
+    already_seen_suppressed = sum(not result.alertable for result in results)
+    below_threshold = sum(
+        result.alertable
+        and result.category == "other"
+        and result.conviction < float(min_conviction)
+        for result in results
+    )
+    return _SignalBreakdown(
+        alertable=alertable,
+        already_seen_suppressed=already_seen_suppressed,
+        below_threshold=below_threshold,
+        retained=len(signals),
+    )
 
 
 def _details_from_result(result: CongressTickerResult, classification: str) -> dict[str, Any]:
@@ -335,13 +365,24 @@ def run_congress_adapter_detailed(
             signals.append(signal)
 
     _write_audit_bundle(scan, signals)
+    breakdown = _signal_breakdown(
+        scan.ticker_results,
+        signals,
+        min_conviction=min_conviction,
+    )
 
     logger.info(
-        "Congress engine scan: raw=%d active=%d scored=%d retained=%d hash=%s",
+        (
+            "Congress engine scan: raw=%d active=%d scored=%d alertable=%d "
+            "already_seen=%d below_threshold=%d retained=%d hash=%s"
+        ),
         scan.counts.get("total_raw_records", 0),
         scan.counts.get("active_tickers_before_market_checks", 0),
         scan.counts.get("scored_tickers", 0),
-        len(signals),
+        breakdown.alertable,
+        breakdown.already_seen_suppressed,
+        breakdown.below_threshold,
+        breakdown.retained,
         scan.metadata.payload_sha256,
     )
 
