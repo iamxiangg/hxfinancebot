@@ -180,6 +180,7 @@ def upsert_records(
             row_by_key[key.upper()] = row_number
 
     to_append: list[dict[str, Any]] = []
+    update_data: list[dict[str, Any]] = []
     end_col = column_letter(len(headers))
 
     for record in records:
@@ -187,13 +188,22 @@ def upsert_records(
         values = [[record.get(header, "") for header in headers]]
         if key and key in row_by_key:
             row_number = row_by_key[key]
-            service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{sheet_name}'!A{row_number}:{end_col}{row_number}",
-                valueInputOption="USER_ENTERED",
-                body={"values": values},
-            ).execute()
+            update_data.append(
+                {
+                    "range": f"'{sheet_name}'!A{row_number}:{end_col}{row_number}",
+                    "values": values,
+                }
+            )
         else:
             to_append.append(record)
+
+    if update_data:
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "valueInputOption": "USER_ENTERED",
+                "data": update_data,
+            },
+        ).execute()
 
     append_records(service, spreadsheet_id, sheet_name, headers, to_append)
