@@ -1,20 +1,97 @@
-name: Earnings IV Crush Scanner
+name: Earnings Short Volatility Scanner
 
-on:
+"on":
   repository_dispatch:
     types: [earnings_check]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Scanner mode
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - screen
+          - exit
+  schedule:
+    - cron: "35,45,55 18 * * 1-5"
+    - cron: "35,45,55 19 * * 1-5"
+    - cron: "35,40,45,50 13 * * 1-5"
+    - cron: "35,40,45,50 14 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: earnings-short-vol
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-      - run: pip install -r requirements.txt
-      - run: python scan_earnings.py
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Resolve mode
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          echo "EARNINGS_MODE=${INPUT_MODE:-auto}" >> "$GITHUB_ENV"
+
+      - name: Run earnings scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EARNINGS_REQUEST_DELAY_SECONDS: "0.25"
+          EARNINGS_MAX_TICKERS: "500"
+          EARNINGS_MAX_CANDIDATES: "10"
+          EARNINGS_LOOKAHEAD_DAYS: "3"
+          EARNINGS_MIN_STOCK_PRICE: "5"
+          EARNINGS_MIN_AVG_DOLLAR_VOLUME: "20000000"
+          EARNINGS_MIN_LEG_OPEN_INTEREST: "100"
+          EARNINGS_MIN_LEG_VOLUME: "10"
+          EARNINGS_MAX_LEG_SPREAD_PCT: "0.15"
+          EARNINGS_MAX_TOTAL_SPREAD_PCT: "0.15"
+          EARNINGS_EXIT_EARLIEST_TIME: "09:35"
+          EARNINGS_EXIT_LATEST_TIME: "09:50"
+          EARNINGS_SCREEN_EARLIEST_TIME: "14:30"
+          EARNINGS_SCREEN_LATEST_TIME: "15:00"
+          EARNINGS_STATE_RETENTION_DAYS: "45"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m tactical.earnings_runner --mode "${EARNINGS_MODE}"
+
+      - name: Commit state
+        run: |
+          set -euo pipefail
+          if [ ! -f earnings_notification_state.json ]; then
+            exit 0
+          fi
+          if git diff --quiet -- earnings_notification_state.json; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add earnings_notification_state.json
+          git commit -m "Update earnings notification state"
+          git push

@@ -250,6 +250,102 @@ class CandidateIngestorTests(
             "BIIB",
         )
 
+    def test_multi_scanner_ticker_keeps_both_sources_and_reasons(self) -> None:
+        congress_signal = self.make_signal("TEAM", "actionable", 74)
+        vpma_signal = Signal(
+            ticker="TEAM",
+            scanner="vpma",
+            classification="wait",
+            score=82,
+            observed_at="2026-06-22T20:00:00+08:00",
+            valid_until="2026-06-25T20:00:00+08:00",
+            details={
+                "setup_type": "pead_consolidation",
+                "confirmation_score": 76,
+            },
+        )
+
+        output = classify_signals([congress_signal, vpma_signal], self.records)
+        team = next(row for row in output if row["ticker"] == "TEAM")
+
+        self.assertEqual(team["all_sources"], ["congress", "vpma"])
+        self.assertEqual(team["signal_count"], 2)
+        self.assertIn("Congress:", team["discovery_reason"])
+        self.assertIn("VPMA:", team["discovery_reason"])
+
+    def test_congress_reason_shows_breadth_with_singular_and_plural(self) -> None:
+        signal = Signal(
+            ticker="NVDA",
+            scanner="congress",
+            classification="actionable",
+            score=78,
+            observed_at="2026-06-22T20:00:00+08:00",
+            valid_until="2026-07-01T20:00:00+08:00",
+            details={
+                "conviction": 78,
+                "entry_quality": 71,
+                "buyers": 4,
+                "cluster_buyers": 3,
+                "active_trade_count": 6,
+                "flow": "Accumulation",
+                "names": ["Pelosi", "Gottheimer", "Tuberville", "Moore"],
+            },
+        )
+
+        row = classify_signals([signal], self.records)[0]
+
+        self.assertIn("4 unique members", row["discovery_reason"])
+        self.assertIn("3 recent cluster members", row["discovery_reason"])
+        self.assertIn("6 active purchases", row["discovery_reason"])
+        self.assertIn("Members: Pelosi, Gottheimer, Tuberville, Moore", row["discovery_reason"])
+        self.assertEqual(row["congress_unique_members"], 4)
+        self.assertEqual(row["congress_recent_cluster_members"], 3)
+        self.assertEqual(row["congress_active_purchases"], 6)
+        self.assertEqual(row["congress_member_names"], "Pelosi, Gottheimer, Tuberville, Moore")
+
+    def test_congress_reason_handles_single_member_multiple_purchases(self) -> None:
+        signal = Signal(
+            ticker="AMD",
+            scanner="congress",
+            classification="actionable",
+            score=62,
+            observed_at="2026-06-22T20:00:00+08:00",
+            valid_until="2026-07-01T20:00:00+08:00",
+            details={
+                "conviction": 62,
+                "buyers": 1,
+                "cluster_buyers": 1,
+                "active_trade_count": 4,
+                "names": ["Tuberville"],
+            },
+        )
+
+        row = classify_signals([signal], self.records)[0]
+
+        self.assertIn("1 unique member", row["discovery_reason"])
+        self.assertIn("1 recent cluster member", row["discovery_reason"])
+        self.assertIn("4 active purchases", row["discovery_reason"])
+
+    def test_congress_reason_omits_missing_names_and_buyer_fields(self) -> None:
+        signal = Signal(
+            ticker="META",
+            scanner="congress",
+            classification="wait",
+            score=54,
+            observed_at="2026-06-22T20:00:00+08:00",
+            valid_until="2026-07-01T20:00:00+08:00",
+            details={
+                "conviction": 54,
+                "flow": "Accumulation",
+            },
+        )
+
+        row = classify_signals([signal], self.records)[0]
+
+        self.assertNotIn("Members:", row["discovery_reason"])
+        self.assertEqual(row["congress_unique_members"], "")
+        self.assertEqual(row["congress_member_names"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

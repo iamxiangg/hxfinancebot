@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install yfinance pandas requests
-      - run: python gh_bot.py
+      - run: python archive/gh_bot.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

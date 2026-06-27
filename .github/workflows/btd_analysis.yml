@@ -26,4 +26,4 @@ jobs:
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python btd_analysis.py
+        run: python archive/btd_analysis.py

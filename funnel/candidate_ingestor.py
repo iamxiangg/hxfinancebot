@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from typing import Any, Iterable
 
 from funnel.signal_schema import Signal, normalise_ticker
@@ -15,6 +16,15 @@ CLASSIFICATION_RANK = {
     "risk": 3,
     "near_miss": 2,
     "other": 1,
+}
+
+SCANNER_ORDER = {
+    "congress": 1,
+    "insider": 2,
+    "vpma": 3,
+    "manual": 4,
+    "gamma": 5,
+    "earnings": 6,
 }
 
 
@@ -162,38 +172,210 @@ def _build_reason(
         details.get("flow") or ""
     ).strip()
 
+    if signal.scanner == "congress":
+        parts: list[str] = []
+        buyers = details.get("buyers")
+        cluster_buyers = details.get("cluster_buyers")
+        active_purchases = details.get("active_trade_count")
+        member_names = _names_as_text(signal)
+
+        if buyers not in ("", None):
+            try:
+                buyers_int = int(float(buyers))
+                parts.append(_count_phrase(buyers_int, "unique member"))
+            except (TypeError, ValueError):
+                pass
+        if cluster_buyers not in ("", None):
+            try:
+                cluster_int = int(float(cluster_buyers))
+                parts.append(_count_phrase(cluster_int, "recent cluster member"))
+            except (TypeError, ValueError):
+                pass
+        if active_purchases not in ("", None):
+            try:
+                trades_int = int(float(active_purchases))
+                parts.append(_count_phrase(trades_int, "active purchase"))
+            except (TypeError, ValueError):
+                pass
+        if member_names:
+            parts.append(f"Members: {member_names}")
+        if conviction is not None:
+            try:
+                parts.append(f"Conviction {float(conviction):.1f}")
+            except (TypeError, ValueError):
+                pass
+        if entry_quality is not None:
+            try:
+                parts.append(f"Entry quality {float(entry_quality):.1f}")
+            except (TypeError, ValueError):
+                pass
+        if flow:
+            parts.append(flow)
+        return f"Congress: {', '.join(parts)}" if parts else "Congress"
+
+    if signal.scanner == "vpma":
+        setup_type = str(details.get("setup_type") or "").strip().replace("_", " ")
+        confirmation_score = details.get("confirmation_score")
+        parts = ["VPMA"]
+        summary = setup_type or signal.classification.replace("_", " ")
+        if summary:
+            parts.append(summary)
+        score_bits: list[str] = []
+        if signal.score is not None:
+            try:
+                score_bits.append(f"core {float(signal.score):.1f}")
+            except (TypeError, ValueError):
+                pass
+        if confirmation_score not in ("", None):
+            try:
+                score_bits.append(f"confirmation {float(confirmation_score):.1f}")
+            except (TypeError, ValueError):
+                pass
+        text = ", ".join(score_bits)
+        return f"VPMA: {summary}{', ' + text if text else ''}".strip()
+
+    if signal.scanner == "insider":
+        parts: list[str] = []
+        unique_insiders = details.get("unique_insiders")
+        roles = details.get("insider_roles")
+        aggregate_purchase = details.get("aggregate_purchase_value")
+        total_score = details.get("total_score") or signal.score
+        entry_state = str(details.get("entry_state") or "").strip().replace("_", " ")
+
+        if unique_insiders not in ("", None):
+            try:
+                parts.append(_count_phrase(int(float(unique_insiders)), "independent insider"))
+            except (TypeError, ValueError):
+                pass
+        if roles:
+            parts.append(f"Roles: {_csv_text(roles if isinstance(roles, (list, tuple, set)) else [roles])}")
+        if aggregate_purchase not in ("", None):
+            try:
+                parts.append(f"Aggregate purchase ${float(aggregate_purchase):,.0f}")
+            except (TypeError, ValueError):
+                pass
+        if total_score not in ("", None):
+            try:
+                parts.append(f"Score {float(total_score):.1f}")
+            except (TypeError, ValueError):
+                pass
+        if entry_state:
+            parts.append(entry_state.title())
+        return f"Insider: {', '.join(parts)}" if parts else "Insider"
+
     parts = [
         signal.classification
         .replace("_", " ")
         .title()
     ]
-
-    if conviction is not None:
-        try:
-            parts.append(
-                "Congress conviction "
-                f"{float(conviction):.1f}"
-            )
-        except (TypeError, ValueError):
-            pass
-
+    if flow:
+        parts.append(flow)
     if entry_quality is not None:
         try:
-            parts.append(
-                "entry quality "
-                f"{float(entry_quality):.1f}"
-            )
+            parts.append(f"entry quality {float(entry_quality):.1f}")
         except (TypeError, ValueError):
             pass
+    return " | ".join(parts)
 
-    if flow:
-        parts.append(
-            flow
-        )
 
-    return " | ".join(
-        parts
-    )
+def _sorted_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in sorted(
+        (str(value or "").strip() for value in values if str(value or "").strip()),
+        key=lambda item: (SCANNER_ORDER.get(item, 999), item),
+    ):
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _sorted_unique_text(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in sorted(str(value or "").strip() for value in values if str(value or "").strip()):
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _count_phrase(count: int, singular: str) -> str:
+    label = singular if count == 1 else f"{singular}s"
+    return f"{count} {label}"
+
+
+def _csv_text(values: Iterable[Any]) -> str:
+    return ", ".join(str(value).strip() for value in values if str(value).strip())
+
+
+def _jsonish_text(values: Iterable[Any]) -> str:
+    return json.dumps(list(values), sort_keys=False)
+
+
+def _congress_details(signals: Iterable[Signal]) -> dict[str, Any]:
+    congress_signal = next((signal for signal in signals if signal.scanner == "congress"), None)
+    if congress_signal is None:
+        return {}
+    return {
+        "congress_unique_members": _detail_value(congress_signal, "buyers"),
+        "congress_recent_cluster_members": _detail_value(congress_signal, "cluster_buyers"),
+        "congress_active_purchases": _detail_value(congress_signal, "active_trade_count"),
+        "congress_member_names": _names_as_text(congress_signal),
+    }
+
+
+def _insider_details(signals: Iterable[Signal]) -> dict[str, Any]:
+    insider_signal = next((signal for signal in signals if signal.scanner == "insider"), None)
+    if insider_signal is None:
+        return {}
+    details = insider_signal.details
+    return {
+        "insider_total_score": _detail_value(insider_signal, "total_score"),
+        "insider_conviction": _detail_value(insider_signal, "insider_conviction"),
+        "insider_economic_commitment": _detail_value(insider_signal, "economic_commitment"),
+        "insider_market_context": _detail_value(insider_signal, "market_context"),
+        "insider_unique_insiders": _detail_value(insider_signal, "unique_insiders"),
+        "insider_roles": _csv_text(details.get("insider_roles", [])),
+        "insider_aggregate_purchase": _detail_value(insider_signal, "aggregate_purchase_value"),
+        "insider_cluster_span_days": _detail_value(insider_signal, "cluster_span_days"),
+        "insider_weighted_purchase_price": _detail_value(insider_signal, "weighted_purchase_price"),
+        "insider_entry_state": str(details.get("entry_state") or "").strip(),
+    }
+
+
+def _source_breakdown(ticker_signals: list[Signal]) -> dict[str, Any]:
+    positive = [signal.scanner for signal in ticker_signals if signal.classification in PENDING_ELIGIBLE_CLASSIFICATIONS]
+    risk = [signal.scanner for signal in ticker_signals if signal.classification == "risk"]
+    positive_sources = _sorted_unique(positive)
+    risk_sources = _sorted_unique(risk)
+    positive_count = len(positive_sources)
+    corroboration = "NONE"
+    if positive_count == 1:
+        corroboration = "STANDARD"
+    elif positive_count == 2:
+        corroboration = "STRONG"
+    elif positive_count >= 3:
+        corroboration = "EXCEPTIONAL"
+    return {
+        "positive_sources": ", ".join(positive_sources),
+        "risk_sources": ", ".join(risk_sources),
+        "corroboration_level": corroboration,
+        "conflict_status": "MIXED" if positive_sources and risk_sources else "CLEAR",
+        "supporting_classifications": _csv_text(_sorted_unique_text(signal.classification for signal in ticker_signals)),
+        "supporting_scores": _csv_text(
+            f"{signal.scanner}:{float(signal.score):.1f}" if signal.score is not None else f"{signal.scanner}:"
+            for signal in sorted(
+                ticker_signals,
+                key=lambda item: (SCANNER_ORDER.get(item.scanner, 999), item.ticker),
+            )
+        ),
+        "supporting_reasons_text": " || ".join(_build_reason(signal) for signal in ticker_signals),
+        "supporting_signal_ids_text": _csv_text(signal.signal_id for signal in ticker_signals),
+    }
 
 
 def _names_as_text(
@@ -285,6 +467,7 @@ def classify_signals(
         primary = select_primary_signal(
             ticker_signals
         )
+        source_breakdown = _source_breakdown(ticker_signals)
 
         existing_record = ticker_index.get(
             ticker
@@ -354,6 +537,18 @@ def classify_signals(
                     )
                 ),
                 "scanner": primary.scanner,
+                "all_sources": _sorted_unique(signal.scanner for signal in ticker_signals),
+                "all_classifications": _sorted_unique_text(signal.classification for signal in ticker_signals),
+                "all_signal_ids": [signal.signal_id for signal in ticker_signals],
+                "supporting_reasons": [_build_reason(signal) for signal in ticker_signals],
+                "positive_sources": source_breakdown["positive_sources"],
+                "risk_sources": source_breakdown["risk_sources"],
+                "corroboration_level": source_breakdown["corroboration_level"],
+                "conflict_status": source_breakdown["conflict_status"],
+                "supporting_classifications_text": source_breakdown["supporting_classifications"],
+                "supporting_scores_text": source_breakdown["supporting_scores"],
+                "supporting_reasons_text": source_breakdown["supporting_reasons_text"],
+                "supporting_signal_ids_text": source_breakdown["supporting_signal_ids_text"],
                 "classification": (
                     primary.classification
                 ),
@@ -394,9 +589,15 @@ def classify_signals(
                         "MONITORING",
                     )
                 ),
-                "discovery_reason": (
-                    _build_reason(
-                        primary
+                "discovery_reason": " | ".join(
+                    _build_reason(signal)
+                    for signal in sorted(
+                        ticker_signals,
+                        key=lambda signal: (
+                            SCANNER_ORDER.get(signal.scanner, 999),
+                            -CLASSIFICATION_RANK.get(signal.classification, 0),
+                            -(signal.score if signal.score is not None else -1.0),
+                        ),
                     )
                 ),
                 "signal_count": len(
@@ -412,6 +613,8 @@ def classify_signals(
                 "signal_id": (
                     primary.signal_id
                 ),
+                **_congress_details(ticker_signals),
+                **_insider_details(ticker_signals),
             }
         )
 

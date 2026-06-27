@@ -30,6 +30,16 @@ class SignalSchemaTests(unittest.TestCase):
                 observed_at="2026-06-22T20:00:00",
             )
 
+    def test_insider_scanner_is_supported(self):
+        signal = Signal(
+            ticker="TEAM",
+            scanner="insider",
+            classification="actionable",
+            score=81,
+            observed_at="2026-06-22T20:00:00+08:00",
+        )
+        self.assertEqual(signal.scanner, "insider")
+
 
 if __name__ == "__main__":
     unittest.main()

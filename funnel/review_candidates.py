@@ -6,11 +6,12 @@ import math
 import os
 from typing import Any
 
-from funnel.btd_enrichment import fetch_yfinance_metrics, metrics_to_candidate_updates
+from funnel.btd_enrichment import fetch_yfinance_metrics, metrics_to_candidate_updates, to_float
 from funnel.candidate_ingestor import classify_signals, get_pending_new_ticker_records
 from funnel.congress_adapter import run_congress_adapter
 from funnel.feroldi_ai import draft_to_candidate_updates, request_feroldi_draft
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
+from funnel.insider_adapter import run_insider_adapter
 from funnel.review_schema import (
     BTD_CANDIDATE_HEADERS,
     BTD_CANDIDATES_SHEET,
@@ -28,6 +29,7 @@ from funnel.sheet_reader import get_stock_summary_ticker_records
 from funnel.sheet_table import append_records, read_table, upsert_records
 from funnel.signal_schema import Signal, normalise_ticker
 from funnel.telegram_review import candidate_id_for_ticker, send_candidate_review
+from funnel.vpma_adapter import run_vpma_adapter
 
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,7 @@ def signal_log_rows(signals: list[Signal], run_id: str, created_at: str) -> list
 
 def comparison_to_candidate(record: dict[str, Any], now: str) -> dict[str, Any]:
     ticker = normalise_ticker(record.get("ticker"))
+    source = ", ".join(record.get("all_sources") or []) or record.get("scanner", "")
     return {
         "Candidate ID": candidate_id_for_ticker(ticker),
         "Ticker": ticker,
@@ -99,11 +102,33 @@ def comparison_to_candidate(record: dict[str, Any], now: str) -> dict[str, Any]:
         "Google Ticker": record.get("google_ticker", "") or ticker,
         "Status": "NEW",
         "Review Priority": record.get("review_priority", ""),
-        "Source": record.get("scanner", ""),
+        "Source": source,
+        "Positive Sources": record.get("positive_sources", ""),
+        "Risk Sources": record.get("risk_sources", ""),
+        "Corroboration Level": record.get("corroboration_level", ""),
+        "Conflict Status": record.get("conflict_status", ""),
+        "Supporting Classifications": record.get("supporting_classifications_text", ""),
+        "Supporting Scores": record.get("supporting_scores_text", ""),
+        "Supporting Reasons": record.get("supporting_reasons_text", ""),
+        "Supporting Signal IDs": record.get("supporting_signal_ids_text", ""),
         "Classification": record.get("classification", ""),
         "Funnel Score": record.get("score", ""),
         "Signal Count": record.get("signal_count", ""),
         "Discovery Reason": record.get("discovery_reason", ""),
+        "Congress Unique Members": record.get("congress_unique_members", ""),
+        "Congress Recent Cluster Members": record.get("congress_recent_cluster_members", ""),
+        "Congress Active Purchases": record.get("congress_active_purchases", ""),
+        "Congress Member Names": record.get("congress_member_names", ""),
+        "Insider Total Score": record.get("insider_total_score", ""),
+        "Insider Conviction": record.get("insider_conviction", ""),
+        "Insider Economic Commitment": record.get("insider_economic_commitment", ""),
+        "Insider Market Context": record.get("insider_market_context", ""),
+        "Insider Unique Insiders": record.get("insider_unique_insiders", ""),
+        "Insider Roles": record.get("insider_roles", ""),
+        "Insider Aggregate Purchase": record.get("insider_aggregate_purchase", ""),
+        "Insider Cluster Span Days": record.get("insider_cluster_span_days", ""),
+        "Insider Weighted Purchase Price": record.get("insider_weighted_purchase_price", ""),
+        "Insider Entry State": record.get("insider_entry_state", ""),
         "First Seen": now,
         "Last Seen": record.get("observed_at", now),
         "Active?": "YES",
@@ -150,13 +175,77 @@ def _active_for_enrichment(candidate: dict[str, Any]) -> bool:
     return str(candidate.get("Status") or "").strip().upper() not in CANDIDATE_FINAL_STATUSES
 
 
+def _status_allows_reprocessing(candidate: dict[str, Any]) -> bool:
+    return str(candidate.get("Status") or "").strip().upper() not in {"NOTIFIED", "REVIEW"}
+
+
+def _source_set(candidate: dict[str, Any]) -> set[str]:
+    return {
+        part.strip().lower()
+        for part in str(candidate.get("Source") or "").split(",")
+        if part.strip()
+    }
+
+
+def _telegram_eligible(candidate: dict[str, Any]) -> bool:
+    return str(candidate.get("Telegram Eligible") or "").strip().upper() == "YES"
+
+
+def apply_btd_gate(candidate: dict[str, Any], *, manual_bypass: bool, threshold: float) -> dict[str, Any]:
+    candidate = dict(candidate)
+    source_set = _source_set(candidate)
+
+    if manual_bypass and source_set == {"manual"}:
+        candidate["BTD Gate"] = "BYPASSED_MANUAL"
+        candidate["BTD Gate Reason"] = "Manual-only candidate bypassed the automatic BTD gate."
+        candidate["Telegram Eligible"] = "YES"
+        candidate["Status"] = "BTD_PASSED"
+        return candidate
+
+    applicability = str(candidate.get("BTD Applicability") or "").strip().upper()
+    if applicability == "NOT_APPLICABLE":
+        candidate["BTD Gate"] = "NOT_APPLICABLE"
+        candidate["BTD Gate Reason"] = "BTD formula is not suitable for this business model."
+        candidate["Telegram Eligible"] = "NO"
+        candidate["Status"] = "BTD_NOT_APPLICABLE"
+        return candidate
+
+    if applicability != "APPLICABLE":
+        candidate["BTD Gate"] = "UNAVAILABLE"
+        candidate["BTD Gate Reason"] = "BTD applicability or required data is unavailable."
+        candidate["Telegram Eligible"] = "NO"
+        candidate["Status"] = "BTD_UNAVAILABLE"
+        return candidate
+
+    ratio = to_float(candidate.get("BTD Ratio"))
+    if ratio is None or ratio <= 0:
+        candidate["BTD Gate"] = "UNAVAILABLE"
+        candidate["BTD Gate Reason"] = "A valid positive BTD ratio could not be calculated."
+        candidate["Telegram Eligible"] = "NO"
+        candidate["Status"] = "BTD_UNAVAILABLE"
+        return candidate
+
+    if ratio < threshold:
+        candidate["BTD Gate"] = "PASS"
+        candidate["BTD Gate Reason"] = f"Valid BTD ratio {ratio:.2f} is below {threshold:.1f}."
+        candidate["Telegram Eligible"] = "YES"
+        candidate["Status"] = "BTD_PASSED"
+        return candidate
+
+    candidate["BTD Gate"] = "FAIL"
+    candidate["BTD Gate Reason"] = f"BTD ratio {ratio:.2f} is not below {threshold:.1f}."
+    candidate["Telegram Eligible"] = "NO"
+    candidate["Status"] = "BTD_FAILED"
+    return candidate
+
+
 def enrich_candidates(candidates: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
     count = 0
     now = utc_now_iso()
     for candidate in candidates:
         candidate = dict(candidate)
-        if not _active_for_enrichment(candidate):
+        if not _active_for_enrichment(candidate) or not _status_allows_reprocessing(candidate):
             enriched.append(candidate)
             continue
 
@@ -196,7 +285,7 @@ def add_optional_ai_drafts(
     updated: list[dict[str, Any]] = []
     for candidate in candidates:
         candidate = dict(candidate)
-        if not _active_for_enrichment(candidate) or candidate.get("AI Last Updated"):
+        if not _active_for_enrichment(candidate) or candidate.get("AI Last Updated") or not _telegram_eligible(candidate):
             updated.append(candidate)
             continue
 
@@ -251,6 +340,9 @@ def notify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not _active_for_enrichment(candidate):
             updated.append(candidate)
             continue
+        if not _telegram_eligible(candidate):
+            updated.append(candidate)
+            continue
         if candidate.get("Telegram Message ID") and not force_resend:
             updated.append(candidate)
             continue
@@ -275,18 +367,59 @@ def run() -> None:
     now = utc_now_iso()
     run_id = os.getenv("GITHUB_RUN_ID", now)
 
-    sources = {part.strip().lower() for part in os.getenv("REVIEW_SOURCES", "congress,manual").split(",")}
+    requested_sources = [
+        part.strip().lower()
+        for part in os.getenv("REVIEW_SOURCES", "congress,vpma,insider,manual").split(",")
+        if part.strip()
+    ]
     signals: list[Signal] = []
-    if "manual" in sources:
-        manual_records = read_table(service, spreadsheet_id, MANUAL_SEED_SHEET, MANUAL_SEED_HEADERS)
-        signals.extend(manual_seed_signals(manual_records, now))
+    successful_sources: list[str] = []
+    failed_sources: dict[str, str] = {}
 
-    if "congress" in sources:
-        congress_signals, analysed_count = run_congress_adapter(
-            min_conviction=_float_value(os.getenv("MIN_CONVICTION"), 15.0)
+    for source in requested_sources:
+        try:
+            if source == "manual":
+                manual_records = read_table(service, spreadsheet_id, MANUAL_SEED_SHEET, MANUAL_SEED_HEADERS)
+                source_signals = manual_seed_signals(manual_records, now)
+                signals.extend(source_signals)
+                successful_sources.append(source)
+                logger.info("Manual source returned %d signals.", len(source_signals))
+            elif source == "congress":
+                congress_signals, analysed_count = run_congress_adapter(
+                    min_conviction=_float_value(os.getenv("MIN_CONVICTION"), 15.0),
+                    observed_at=now,
+                )
+                logger.info("Congress adapter returned %d signals from %d tickers.", len(congress_signals), analysed_count)
+                signals.extend(congress_signals)
+                successful_sources.append(source)
+            elif source == "vpma":
+                vpma_signals, analysed_count = run_vpma_adapter(observed_at=now)
+                logger.info("VPMA adapter returned %d signals from %d tickers.", len(vpma_signals), analysed_count)
+                signals.extend(vpma_signals)
+                successful_sources.append(source)
+            elif source == "insider":
+                insider_signals, analysed_count = run_insider_adapter(observed_at=now)
+                logger.info("Insider adapter returned %d signals from %d tickers.", len(insider_signals), analysed_count)
+                signals.extend(insider_signals)
+                successful_sources.append(source)
+            else:
+                logger.warning("Unknown review source '%s' ignored.", source)
+        except Exception as exc:
+            failed_sources[source] = exc.__class__.__name__
+            logger.exception("Review source '%s' failed.", source)
+
+    if not successful_sources and requested_sources:
+        raise RuntimeError(
+            "All requested review sources failed: "
+            + ", ".join(f"{source}={error}" for source, error in sorted(failed_sources.items()))
         )
-        logger.info("Congress adapter returned %d signals from %d tickers.", len(congress_signals), analysed_count)
-        signals.extend(congress_signals)
+
+    if failed_sources:
+        logger.warning(
+            "Continuing with partial source success. Successful=%s Failed=%s",
+            ",".join(successful_sources),
+            ",".join(f"{source}:{error}" for source, error in sorted(failed_sources.items())),
+        )
 
     append_records(
         service,
@@ -325,6 +458,14 @@ def run() -> None:
 
     limit = int(_float_value(os.getenv("BTD_ENRICH_LIMIT"), 10.0))
     candidates = enrich_candidates(candidates, limit=limit)
+    threshold = _float_value(os.getenv("BTD_GATE_THRESHOLD"), 1.0)
+    manual_bypass = str(os.getenv("BTD_GATE_MANUAL_BYPASS", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    candidates = [
+        apply_btd_gate(candidate, manual_bypass=manual_bypass, threshold=threshold)
+        if _active_for_enrichment(candidate) and _status_allows_reprocessing(candidate)
+        else dict(candidate)
+        for candidate in candidates
+    ]
     candidates = add_optional_ai_drafts(service, spreadsheet_id, candidates)
     candidates = notify_candidates(candidates)
 

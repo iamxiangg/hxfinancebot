@@ -1,8 +1,6 @@
 name: VP_MA Scan Trigger
 
 on:
-  repository_dispatch:
-    types: [VP_MA_check]
   workflow_dispatch:
 
 jobs:
@@ -37,4 +35,4 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python scanner_vp_ma_pro.py
+        run: python archive/scanner_vp_ma_pro.py

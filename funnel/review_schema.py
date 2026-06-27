@@ -11,11 +11,16 @@ BOT_STATE_SHEET = "Bot_State"
 DECISION_LOG_SHEET = "Decision_Log"
 MANUAL_SEED_SHEET = "Manual_Seed_Tickers"
 CONGRESS_LEDGER_SHEET = "Congress_Ledger"
+INSIDER_LEDGER_SHEET = "Insider_Ledger"
 
 
 CANDIDATE_ACTIVE_STATUSES = {
     "NEW",
     "ENRICHED",
+    "BTD_PASSED",
+    "BTD_FAILED",
+    "BTD_UNAVAILABLE",
+    "BTD_NOT_APPLICABLE",
     "NOTIFIED",
     "REVIEW",
 }
@@ -51,15 +56,41 @@ BTD_CANDIDATE_HEADERS = [
     "Status",
     "Review Priority",
     "Source",
+    "Positive Sources",
+    "Risk Sources",
+    "Corroboration Level",
+    "Conflict Status",
+    "Supporting Classifications",
+    "Supporting Scores",
+    "Supporting Reasons",
+    "Supporting Signal IDs",
     "Classification",
     "Funnel Score",
     "Signal Count",
     "Discovery Reason",
+    "Congress Unique Members",
+    "Congress Recent Cluster Members",
+    "Congress Active Purchases",
+    "Congress Member Names",
+    "Insider Total Score",
+    "Insider Conviction",
+    "Insider Economic Commitment",
+    "Insider Market Context",
+    "Insider Unique Insiders",
+    "Insider Roles",
+    "Insider Aggregate Purchase",
+    "Insider Cluster Span Days",
+    "Insider Weighted Purchase Price",
+    "Insider Entry State",
     "First Seen",
     "Last Seen",
     "BTD Score",
     "BTD Ratio",
     "BTD Summary",
+    "BTD Applicability",
+    "BTD Gate",
+    "BTD Gate Reason",
+    "Telegram Eligible",
     "Next Earnings Date",
     "Enterprise Value",
     "Total Revenue",
@@ -143,6 +174,25 @@ CONGRESS_LEDGER_HEADERS = [
     "Filing Date",
     "Last Seen At",
     "Last Seen Payload Hash",
+]
+
+
+INSIDER_LEDGER_HEADERS = [
+    "Record Key",
+    "Accession",
+    "Ticker",
+    "Owner CIK",
+    "Owner Name",
+    "Transaction Date",
+    "Security Title",
+    "Shares",
+    "Price Per Share",
+    "Transaction Value",
+    "Direct Or Indirect",
+    "Decision",
+    "Reason",
+    "Confidence",
+    "Observed At",
 ]
 
 
