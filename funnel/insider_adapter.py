@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from funnel.insider_ledger import (
+    load_qualified_purchases,
     load_processed_accessions,
     persist_ledger_rows,
     save_processed_accessions,
 )
 from funnel.signal_schema import Signal
-from scanners.insider.engine import MODEL_VERSION, InsiderTickerResult, run_insider_scan
+from scanners.insider.engine import MODEL_VERSION, InsiderConfig, InsiderTickerResult, run_insider_scan
 
 
 logger = logging.getLogger(__name__)
@@ -65,12 +66,22 @@ def result_to_signal(result: InsiderTickerResult, observed_at: str) -> Signal | 
 
 
 def run_insider_adapter(*, observed_at: str | None = None, persist_ledger: bool = True) -> tuple[list[Signal], int]:
+    config = InsiderConfig.from_env()
     prior_accessions = load_processed_accessions()
-    results, receipt = run_insider_scan(observed_at=observed_at, prior_accessions=prior_accessions)
+    actual_observed_at = observed_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    observed_dt = datetime.fromisoformat(actual_observed_at.replace("Z", "+00:00"))
+    prior_purchases = load_qualified_purchases(
+        since=observed_dt.date() - timedelta(days=max(0, int(config.history_days))),
+    )
+    results, receipt = run_insider_scan(
+        config=config,
+        observed_at=actual_observed_at,
+        prior_accessions=prior_accessions,
+        prior_purchases=prior_purchases,
+    )
     updated_accessions = set(prior_accessions).union(receipt.get("processed_accessions", []))
     save_processed_accessions(updated_accessions)
 
-    actual_observed_at = observed_at or datetime.utcnow().replace(microsecond=0).isoformat() + "+00:00"
     if persist_ledger:
         persist_ledger_rows(list(receipt.get("ledger_rows", [])), observed_at=actual_observed_at)
     signals: list[Signal] = []

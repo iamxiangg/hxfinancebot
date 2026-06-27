@@ -48,12 +48,14 @@ class InsiderAdapterTests(unittest.TestCase):
 
     @patch("funnel.insider_adapter.persist_ledger_rows")
     @patch("funnel.insider_adapter.save_processed_accessions")
+    @patch("funnel.insider_adapter.load_qualified_purchases", return_value=[])
     @patch("funnel.insider_adapter.load_processed_accessions", return_value={"old"})
     @patch("funnel.insider_adapter.run_insider_scan")
     def test_run_adapter_persists_accessions_and_ledger(
         self,
         mock_scan,
         mock_load,
+        mock_load_history,
         mock_save,
         mock_persist_rows,
     ) -> None:
@@ -72,6 +74,7 @@ class InsiderAdapterTests(unittest.TestCase):
         mock_save.assert_called_once_with({"old", "new"})
         mock_persist_rows.assert_called_once()
         mock_load.assert_called_once()
+        mock_load_history.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -23,7 +24,7 @@ from scanners.insider.sec_client import SECClient
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "2026-06-26-insider-v1"
+MODEL_VERSION = "2026-06-27-insider-v2"
 
 EXCLUDED_CODES = {"A", "C", "F", "G", "M", "W", "X"}
 EXCLUDED_TEXT_TOKENS = (
@@ -100,6 +101,18 @@ class QualifyingPurchase:
     shares_owned_after: float | None
     transaction_row_count: int
     footnotes: list[str]
+    owner_is_director: bool = False
+    owner_is_officer: bool = False
+    owner_is_ten_percent_owner: bool = False
+    officer_title: str = ""
+    filing_date: date | None = None
+    qualification_decision: str = "QUALIFIED"
+    qualification_reason: str = ""
+    observed_at: str = ""
+    transaction_key: str = ""
+    transaction_group_key: str = ""
+    source_fingerprint: str = ""
+    is_current_trigger: bool = False
 
 
 @dataclass
@@ -161,6 +174,104 @@ def _to_float(value: Any) -> float | None:
     if number != number or number in {float("inf"), float("-inf")}:
         return None
     return number
+
+
+def _canonical_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().split()).lower()
+
+
+def _bool_text(value: bool) -> str:
+    return "1" if value else "0"
+
+
+def _safe_iso_date(raw: str | None) -> date | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _stable_digest(parts: list[str], *, prefix: str) -> str:
+    payload = "|".join(parts)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
+    return f"{prefix}-{digest}"
+
+
+def build_transaction_group_key(
+    *,
+    issuer_cik: str,
+    owner_cik: str,
+    transaction_date: date,
+    security_title: str,
+    direct_or_indirect: str,
+) -> str:
+    return _stable_digest(
+        [
+            str(issuer_cik or "").strip(),
+            str(owner_cik or "").strip(),
+            transaction_date.isoformat(),
+            _canonical_text(security_title),
+            str(direct_or_indirect or "").strip().upper(),
+        ],
+        prefix="grp",
+    )
+
+
+def build_transaction_key(
+    *,
+    issuer_cik: str,
+    owner_cik: str,
+    accession: str,
+    transaction_date: date,
+    security_title: str,
+    direct_or_indirect: str,
+    shares: float,
+    price_per_share: float,
+) -> str:
+    return _stable_digest(
+        [
+            str(issuer_cik or "").strip(),
+            str(owner_cik or "").strip(),
+            str(accession or "").strip(),
+            transaction_date.isoformat(),
+            _canonical_text(security_title),
+            str(direct_or_indirect or "").strip().upper(),
+            f"{float(shares):.8f}",
+            f"{float(price_per_share):.8f}",
+        ],
+        prefix="txn",
+    )
+
+
+def build_source_fingerprint(
+    *,
+    accession: str,
+    issuer_cik: str,
+    owner_cik: str,
+    transaction_date: date,
+    security_title: str,
+    shares: float,
+    price_per_share: float,
+    direct_or_indirect: str,
+    footnotes: list[str],
+) -> str:
+    return _stable_digest(
+        [
+            str(accession or "").strip(),
+            str(issuer_cik or "").strip(),
+            str(owner_cik or "").strip(),
+            transaction_date.isoformat(),
+            _canonical_text(security_title),
+            f"{float(shares):.8f}",
+            f"{float(price_per_share):.8f}",
+            str(direct_or_indirect or "").strip().upper(),
+            "|".join(_canonical_text(item) for item in footnotes),
+        ],
+        prefix="src",
+    )
 
 
 def _today() -> date:
@@ -250,17 +361,28 @@ def purchase_confidence(transaction: NonDerivativeTransaction) -> str:
     return "OPEN_MARKET_HIGH_CONFIDENCE"
 
 
-def parse_filing_purchases(filing: ParsedOwnershipFiling) -> tuple[list[QualifyingPurchase], list[dict[str, Any]]]:
+def parse_filing_purchases(
+    filing: ParsedOwnershipFiling,
+    *,
+    filing_date: date | None = None,
+    observed_at: str = "",
+) -> tuple[list[QualifyingPurchase], list[dict[str, Any]]]:
     purchases: list[QualifyingPurchase] = []
     ledger_rows: list[dict[str, Any]] = []
     owners = [owner for owner in filing.reporting_owners if owner_is_eligible(owner)]
+    fallback_filing_date = filing_date or _safe_iso_date(filing.acceptance_datetime) or _today()
     if not owners:
         ledger_rows.append(
             {
                 "accession": filing.accession,
+                "issuer_cik": filing.issuer_cik,
                 "ticker": filing.issuer_ticker,
+                "filing_date": fallback_filing_date.isoformat(),
                 "decision": "EXCLUDED",
                 "reason": "no_eligible_owner",
+                "qualification_decision": "EXCLUDED",
+                "qualification_reason": "no_eligible_owner",
+                "observed_at": observed_at,
             }
         )
         return purchases, ledger_rows
@@ -268,23 +390,97 @@ def parse_filing_purchases(filing: ParsedOwnershipFiling) -> tuple[list[Qualifyi
     for owner in owners:
         role = owner_role(owner)
         for transaction in filing.transactions:
-            transaction_value = transaction.shares * transaction.price_per_share
-            reason = transaction_exclusion_reason(transaction)
-            if reason:
+            transaction_date = _safe_iso_date(transaction.transaction_date)
+            if transaction_date is None:
                 ledger_rows.append(
                     {
                         "accession": filing.accession,
+                        "issuer_cik": filing.issuer_cik,
                         "ticker": filing.issuer_ticker,
                         "owner_cik": owner.cik,
                         "owner_name": owner.name,
+                        "owner_role": role,
+                        "officer_title": owner.officer_title,
+                        "filing_date": fallback_filing_date.isoformat(),
                         "transaction_date": transaction.transaction_date,
                         "security_title": transaction.security_title,
                         "shares": transaction.shares,
                         "price_per_share": transaction.price_per_share,
-                        "transaction_value": transaction_value,
+                        "transaction_value": transaction.shares * transaction.price_per_share,
                         "direct_or_indirect": transaction.direct_or_indirect.upper(),
                         "decision": "EXCLUDED",
+                        "reason": "invalid_transaction_date",
+                        "qualification_decision": "EXCLUDED",
+                        "qualification_reason": "invalid_transaction_date",
+                        "confidence": "",
+                        "observed_at": observed_at,
+                    }
+                )
+                continue
+            transaction_value = transaction.shares * transaction.price_per_share
+            reason = transaction_exclusion_reason(transaction)
+            transaction_group_key = build_transaction_group_key(
+                issuer_cik=filing.issuer_cik,
+                owner_cik=owner.cik,
+                transaction_date=transaction_date,
+                security_title=transaction.security_title,
+                direct_or_indirect=transaction.direct_or_indirect,
+            )
+            transaction_key = build_transaction_key(
+                issuer_cik=filing.issuer_cik,
+                owner_cik=owner.cik,
+                accession=filing.accession,
+                transaction_date=transaction_date,
+                security_title=transaction.security_title,
+                direct_or_indirect=transaction.direct_or_indirect,
+                shares=transaction.shares,
+                price_per_share=transaction.price_per_share,
+            )
+            source_fingerprint = build_source_fingerprint(
+                accession=filing.accession,
+                issuer_cik=filing.issuer_cik,
+                owner_cik=owner.cik,
+                transaction_date=transaction_date,
+                security_title=transaction.security_title,
+                shares=transaction.shares,
+                price_per_share=transaction.price_per_share,
+                direct_or_indirect=transaction.direct_or_indirect,
+                footnotes=transaction.footnotes,
+            )
+            row_base = {
+                "transaction_key": transaction_key,
+                "transaction_group_key": transaction_group_key,
+                "source_fingerprint": source_fingerprint,
+                "accession": filing.accession,
+                "issuer_cik": filing.issuer_cik,
+                "ticker": filing.issuer_ticker,
+                "owner_cik": owner.cik,
+                "owner_name": owner.name,
+                "owner_role": role,
+                "officer_title": owner.officer_title,
+                "owner_is_operating": owner_is_operating(owner),
+                "owner_is_director": owner.is_director,
+                "owner_is_officer": owner.is_officer,
+                "owner_is_ten_percent_owner": owner.is_ten_percent_owner,
+                "transaction_date": transaction_date.isoformat(),
+                "filing_date": fallback_filing_date.isoformat(),
+                "security_title": transaction.security_title,
+                "shares": transaction.shares,
+                "price_per_share": transaction.price_per_share,
+                "transaction_value": transaction_value,
+                "direct_or_indirect": transaction.direct_or_indirect.upper(),
+                "plan_10b5_1": any("10b5" in footnote.lower() for footnote in transaction.footnotes),
+                "shares_owned_after": transaction.shares_owned_after,
+                "observed_at": observed_at,
+            }
+            if reason:
+                ledger_rows.append(
+                    {
+                        **row_base,
+                        "decision": "EXCLUDED",
                         "reason": reason,
+                        "qualification_decision": "EXCLUDED",
+                        "qualification_reason": reason,
                         "confidence": "",
                     }
                 )
@@ -294,18 +490,11 @@ def parse_filing_purchases(filing: ParsedOwnershipFiling) -> tuple[list[Qualifyi
             if confidence not in {"OPEN_MARKET_HIGH_CONFIDENCE", "OPEN_MARKET_MEDIUM_CONFIDENCE"}:
                 ledger_rows.append(
                     {
-                        "accession": filing.accession,
-                        "ticker": filing.issuer_ticker,
-                        "owner_cik": owner.cik,
-                        "owner_name": owner.name,
-                        "transaction_date": transaction.transaction_date,
-                        "security_title": transaction.security_title,
-                        "shares": transaction.shares,
-                        "price_per_share": transaction.price_per_share,
-                        "transaction_value": transaction_value,
-                        "direct_or_indirect": transaction.direct_or_indirect.upper(),
+                        **row_base,
                         "decision": "EXCLUDED",
                         "reason": confidence.lower(),
+                        "qualification_decision": "EXCLUDED",
+                        "qualification_reason": confidence.lower(),
                         "confidence": confidence,
                     }
                 )
@@ -313,18 +502,11 @@ def parse_filing_purchases(filing: ParsedOwnershipFiling) -> tuple[list[Qualifyi
 
             ledger_rows.append(
                 {
-                    "accession": filing.accession,
-                    "ticker": filing.issuer_ticker,
-                    "owner_cik": owner.cik,
-                    "owner_name": owner.name,
-                    "transaction_date": transaction.transaction_date,
-                    "security_title": transaction.security_title,
-                    "shares": transaction.shares,
-                    "price_per_share": transaction.price_per_share,
-                    "transaction_value": transaction_value,
-                    "direct_or_indirect": transaction.direct_or_indirect.upper(),
+                    **row_base,
                     "decision": "QUALIFIED",
                     "reason": role,
+                    "qualification_decision": "QUALIFIED",
+                    "qualification_reason": role,
                     "confidence": confidence,
                 }
             )
@@ -338,7 +520,12 @@ def parse_filing_purchases(filing: ParsedOwnershipFiling) -> tuple[list[Qualifyi
                     owner_name=owner.name,
                     owner_role=role,
                     owner_is_operating=owner_is_operating(owner),
-                    transaction_date=date.fromisoformat(transaction.transaction_date[:10]),
+                    owner_is_director=owner.is_director,
+                    owner_is_officer=owner.is_officer,
+                    owner_is_ten_percent_owner=owner.is_ten_percent_owner,
+                    officer_title=owner.officer_title,
+                    transaction_date=transaction_date,
+                    filing_date=fallback_filing_date,
                     security_title=transaction.security_title,
                     shares=transaction.shares,
                     price_per_share=transaction.price_per_share,
@@ -349,6 +536,13 @@ def parse_filing_purchases(filing: ParsedOwnershipFiling) -> tuple[list[Qualifyi
                     shares_owned_after=transaction.shares_owned_after,
                     transaction_row_count=1,
                     footnotes=transaction.footnotes,
+                    qualification_decision="QUALIFIED",
+                    qualification_reason=role,
+                    observed_at=observed_at,
+                    transaction_key=transaction_key,
+                    transaction_group_key=transaction_group_key,
+                    source_fingerprint=source_fingerprint,
+                    is_current_trigger=True,
                 )
             )
     return purchases, ledger_rows
@@ -363,6 +557,7 @@ def consolidate_purchases(purchases: list[QualifyingPurchase]) -> list[Qualifyin
             purchase.transaction_date.isoformat(),
             purchase.security_title.lower(),
             purchase.direct_or_indirect,
+            purchase.accession,
         )
         grouped.setdefault(key, []).append(purchase)
 
@@ -380,10 +575,68 @@ def consolidate_purchases(purchases: list[QualifyingPurchase]) -> list[Qualifyin
                     "price_per_share": weighted_price,
                     "transaction_value": total_value,
                     "transaction_row_count": sum(item.transaction_row_count for item in group),
+                    "transaction_key": build_transaction_key(
+                        issuer_cik=representative.issuer_cik,
+                        owner_cik=representative.owner_cik,
+                        accession=representative.accession,
+                        transaction_date=representative.transaction_date,
+                        security_title=representative.security_title,
+                        direct_or_indirect=representative.direct_or_indirect,
+                        shares=total_shares,
+                        price_per_share=weighted_price,
+                    ),
+                    "source_fingerprint": build_source_fingerprint(
+                        accession=representative.accession,
+                        issuer_cik=representative.issuer_cik,
+                        owner_cik=representative.owner_cik,
+                        transaction_date=representative.transaction_date,
+                        security_title=representative.security_title,
+                        shares=total_shares,
+                        price_per_share=weighted_price,
+                        direct_or_indirect=representative.direct_or_indirect,
+                        footnotes=representative.footnotes,
+                    ),
                 }
             )
         )
     return consolidated
+
+
+def _purchase_priority(purchase: QualifyingPurchase) -> tuple[int, str, str, int, float, float]:
+    filing_text = purchase.filing_date.isoformat() if purchase.filing_date is not None else ""
+    return (
+        1 if purchase.qualification_decision == "QUALIFIED" else 0,
+        filing_text,
+        str(purchase.observed_at or ""),
+        1 if purchase.is_current_trigger else 0,
+        float(purchase.shares or 0.0),
+        float(purchase.price_per_share or 0.0),
+    )
+
+
+def merge_purchase_history(
+    historical: list[QualifyingPurchase],
+    current: list[QualifyingPurchase],
+    *,
+    since: date,
+) -> tuple[list[QualifyingPurchase], set[str]]:
+    trigger_group_keys = {
+        purchase.transaction_group_key
+        for purchase in current
+        if purchase.transaction_date >= since
+    }
+    grouped: dict[str, QualifyingPurchase] = {}
+    for purchase in historical + current:
+        if purchase.transaction_date < since:
+            continue
+        existing = grouped.get(purchase.transaction_group_key)
+        if existing is None or _purchase_priority(purchase) >= _purchase_priority(existing):
+            grouped[purchase.transaction_group_key] = purchase
+    merged = sorted(
+        grouped.values(),
+        key=lambda item: (item.transaction_date, item.owner_cik, item.transaction_group_key),
+    )
+    return merged, trigger_group_keys
 
 
 def _mapped_points(value: float, steps: list[tuple[float, float]]) -> float:
@@ -409,15 +662,11 @@ def _entry_state(current_price: float | None, weighted_purchase_price: float | N
     return "breakdown_risk"
 
 
-def score_cluster(ticker: str, purchases: list[QualifyingPurchase], config: InsiderConfig) -> InsiderTickerResult | None:
-    if not purchases:
-        return None
-    purchases = sorted(purchases, key=lambda item: (item.transaction_date, item.owner_cik))
-    latest_date = max(item.transaction_date for item in purchases)
-    clustered = [item for item in purchases if (latest_date - item.transaction_date).days <= config.cluster_days]
+def _score_purchase_window(ticker: str, clustered: list[QualifyingPurchase], config: InsiderConfig) -> InsiderTickerResult | None:
     if not clustered:
         return None
 
+    latest_date = max(item.transaction_date for item in clustered)
     unique_owners = {item.owner_cik: item for item in clustered}
     unique_insiders = len(unique_owners)
     operating_insiders = sum(item.owner_is_operating for item in unique_owners.values())
@@ -575,12 +824,64 @@ def score_cluster(ticker: str, purchases: list[QualifyingPurchase], config: Insi
     )
 
 
+def score_cluster(
+    ticker: str,
+    purchases: list[QualifyingPurchase],
+    config: InsiderConfig,
+    *,
+    current_trigger_group_keys: set[str] | None = None,
+) -> InsiderTickerResult | None:
+    if not purchases:
+        return None
+    ordered = sorted(purchases, key=lambda item: (item.transaction_date, item.owner_cik, item.transaction_group_key))
+    best: InsiderTickerResult | None = None
+    for end_index, end_purchase in enumerate(ordered):
+        window = [
+            item
+            for item in ordered[: end_index + 1]
+            if 0 <= (end_purchase.transaction_date - item.transaction_date).days <= config.cluster_days
+        ]
+        if not window:
+            continue
+        if current_trigger_group_keys is not None and not any(
+            item.transaction_group_key in current_trigger_group_keys
+            for item in window
+        ):
+            continue
+        candidate = _score_purchase_window(ticker, window, config)
+        if candidate is None:
+            continue
+        if best is None:
+            best = candidate
+            continue
+        candidate_rank = (
+            candidate.total_score,
+            candidate.conviction_score,
+            candidate.commitment_score,
+            candidate.market_context_score,
+            candidate.cluster_span_days,
+            candidate.aggregate_purchase_value,
+        )
+        best_rank = (
+            best.total_score,
+            best.conviction_score,
+            best.commitment_score,
+            best.market_context_score,
+            best.cluster_span_days,
+            best.aggregate_purchase_value,
+        )
+        if candidate_rank > best_rank:
+            best = candidate
+    return best
+
+
 def run_insider_scan(
     *,
     config: InsiderConfig | None = None,
     observed_at: str | None = None,
     sec_client: SECClient | None = None,
     prior_accessions: set[str] | None = None,
+    prior_purchases: list[QualifyingPurchase] | None = None,
 ) -> tuple[list[InsiderTickerResult], dict[str, Any]]:
     config = config or InsiderConfig.from_env()
     if not config.enable:
@@ -590,8 +891,15 @@ def run_insider_scan(
         max_requests_per_second=config.max_sec_requests_per_second,
     )
     observed = datetime.fromisoformat((observed_at or datetime.now(UTC).isoformat()).replace("Z", "+00:00"))
+    history_since = observed.date() - timedelta(days=max(0, config.history_days))
     seen_accessions = set(prior_accessions or set())
-    purchases_by_ticker: dict[str, list[QualifyingPurchase]] = {}
+    historical_by_ticker: dict[str, list[QualifyingPurchase]] = {}
+    for purchase in prior_purchases or []:
+        if purchase.transaction_date >= history_since:
+            historical_by_ticker.setdefault(purchase.ticker, []).append(
+                QualifyingPurchase(**{**purchase.__dict__, "is_current_trigger": False})
+            )
+    new_purchases_by_ticker: dict[str, list[QualifyingPurchase]] = {}
     processed_accessions: set[str] = set()
     ledger_rows: list[dict[str, Any]] = []
     scanned_entries = 0
@@ -607,28 +915,56 @@ def run_insider_scan(
             accession = entry.archive_path.rsplit("/", 1)[-1].replace(".txt", "")
             if accession in seen_accessions:
                 continue
-            scanned_entries += 1
-            filing_text = sec_client.fetch_filing_text(entry.archive_path)
-            xml_name = find_ownership_xml_filename(filing_text)
-            xml_text = filing_text if xml_name is None and "<ownershipDocument" in filing_text else sec_client.fetch_filing_text(
-                f"{entry.archive_path.rsplit('/', 1)[0]}/{xml_name}"
-            )
-            filing = parse_ownership_xml(xml_text, accession=accession)
-            processed_accessions.add(accession)
-            parsed_purchases, parsed_ledger_rows = parse_filing_purchases(filing)
-            ledger_rows.extend(parsed_ledger_rows)
-            for purchase in consolidate_purchases(parsed_purchases):
-                purchases_by_ticker.setdefault(purchase.ticker, []).append(purchase)
+            try:
+                scanned_entries += 1
+                filing_text = sec_client.fetch_filing_text(entry.archive_path)
+                xml_name = find_ownership_xml_filename(filing_text)
+                xml_text = filing_text if xml_name is None and "<ownershipDocument" in filing_text else sec_client.fetch_filing_text(
+                    f"{entry.archive_path.rsplit('/', 1)[0]}/{xml_name}"
+                )
+                filing = parse_ownership_xml(xml_text, accession=accession)
+                processed_accessions.add(accession)
+                parsed_purchases, parsed_ledger_rows = parse_filing_purchases(
+                    filing,
+                    filing_date=_safe_iso_date(entry.date_filed),
+                    observed_at=observed.replace(microsecond=0).isoformat(),
+                )
+                ledger_rows.extend(parsed_ledger_rows)
+                for purchase in consolidate_purchases(parsed_purchases):
+                    new_purchases_by_ticker.setdefault(purchase.ticker, []).append(purchase)
+            except Exception as exc:
+                logger.warning("Insider filing failed for %s: %s", accession, exc.__class__.__name__)
+                continue
+
+    all_tickers = sorted(set(historical_by_ticker).union(new_purchases_by_ticker))
+    merged_purchases_by_ticker: dict[str, list[QualifyingPurchase]] = {}
+    trigger_group_keys_by_ticker: dict[str, set[str]] = {}
+    for ticker in all_tickers:
+        merged, trigger_keys = merge_purchase_history(
+            historical_by_ticker.get(ticker, []),
+            new_purchases_by_ticker.get(ticker, []),
+            since=history_since,
+        )
+        if merged:
+            merged_purchases_by_ticker[ticker] = merged
+        if trigger_keys:
+            trigger_group_keys_by_ticker[ticker] = trigger_keys
 
     results = [
-        score_cluster(ticker, purchases, config)
-        for ticker, purchases in purchases_by_ticker.items()
+        score_cluster(
+            ticker,
+            purchases,
+            config,
+            current_trigger_group_keys=trigger_group_keys_by_ticker.get(ticker, set()),
+        )
+        for ticker, purchases in merged_purchases_by_ticker.items()
+        if trigger_group_keys_by_ticker.get(ticker)
     ]
     retained = [result for result in results if result is not None]
     retained.sort(key=lambda item: (item.total_score, item.conviction_score, item.commitment_score), reverse=True)
     return retained[: config.max_results], {
         "scanned_entries": scanned_entries,
-        "qualifying_purchases": sum(len(items) for items in purchases_by_ticker.values()),
+        "qualifying_purchases": sum(len(items) for items in new_purchases_by_ticker.values()),
         "processed_accessions": sorted(processed_accessions),
         "ledger_rows": ledger_rows,
     }
