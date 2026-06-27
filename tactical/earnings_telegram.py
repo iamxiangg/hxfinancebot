@@ -14,25 +14,67 @@ from scanners.earnings.models import EarningsOpportunity
 logger = logging.getLogger(__name__)
 
 NY_TZ = ZoneInfo("America/New_York")
+TELEGRAM_CHUNK_LIMIT = 3800
+
+
+def _split_telegram_text(text: str, *, limit: int = TELEGRAM_CHUNK_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(line) <= limit:
+            current = line
+            continue
+        start = 0
+        while start < len(line):
+            end = min(start + limit, len(line))
+            chunks.append(line[start:end])
+            start = end
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
 
 
 def send_telegram_text(text: str) -> bool:
     token = str(os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
     chat_id = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
     if not token or not chat_id:
+        logger.error("Telegram delivery failed: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         return False
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return bool(payload.get("ok"))
+    try:
+        for chunk in _split_telegram_text(text):
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": True,
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not bool(payload.get("ok")):
+                logger.error("Telegram delivery failed: API returned non-ok payload")
+                return False
+    except requests.RequestException as exc:
+        logger.error("Telegram delivery failed: %s", exc.__class__.__name__)
+        return False
+    except ValueError as exc:
+        logger.error("Telegram delivery failed: invalid response payload (%s)", exc.__class__.__name__)
+        return False
+    except Exception as exc:
+        logger.error("Telegram delivery failed: unexpected sender error (%s)", exc.__class__.__name__)
+        return False
+    return True
 
 
 def _pct(value: float | None) -> str:

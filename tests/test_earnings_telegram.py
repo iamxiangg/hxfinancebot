@@ -7,7 +7,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scanners.earnings.models import EarningsOpportunity
-from tactical.earnings_telegram import format_exit_reminder, format_screen_report
+from tactical.earnings_telegram import _split_telegram_text, format_exit_reminder, format_screen_report, send_telegram_text
 
 
 class EarningsTelegramTests(unittest.TestCase):
@@ -84,6 +84,38 @@ class EarningsTelegramTests(unittest.TestCase):
         )
         self.assertIn("Current option quotes could not be validated.", reminder)
         self.assertIn("This system does not execute trades.", reminder)
+
+    def test_multi_chunk_report_marks_delivery_only_when_all_chunks_succeed(self) -> None:
+        long_text = "\n".join([f"Line {index} {'x' * 200}" for index in range(60)])
+        chunks = _split_telegram_text(long_text)
+        self.assertGreater(len(chunks), 1)
+
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "chat"}, clear=False), patch(
+            "tactical.earnings_telegram.requests.post"
+        ) as mock_post:
+            responses = []
+            for _ in chunks:
+                response = unittest.mock.Mock()
+                response.raise_for_status.return_value = None
+                response.json.return_value = {"ok": True}
+                responses.append(response)
+            mock_post.side_effect = responses
+            self.assertTrue(send_telegram_text(long_text))
+            self.assertEqual(mock_post.call_count, len(chunks))
+
+    def test_failed_chunk_causes_overall_delivery_failure(self) -> None:
+        long_text = "\n".join([f"Line {index} {'x' * 200}" for index in range(60)])
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "chat"}, clear=False), patch(
+            "tactical.earnings_telegram.requests.post"
+        ) as mock_post:
+            first = unittest.mock.Mock()
+            first.raise_for_status.return_value = None
+            first.json.return_value = {"ok": True}
+            second = unittest.mock.Mock()
+            second.raise_for_status.side_effect = RuntimeError("bad chunk")
+            mock_post.side_effect = [first, second]
+            self.assertFalse(send_telegram_text(long_text))
+            self.assertEqual(mock_post.call_count, 2)
 
 
 if __name__ == "__main__":

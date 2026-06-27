@@ -64,34 +64,57 @@ def resolve_mode(requested_mode: str, *, now_ny: datetime) -> str | None:
 
 def run_screen(*, now_ny: datetime, data_source: YahooEarningsDataSource | None = None) -> int:
     result = run_earnings_scan(now_ny=now_ny, data_source=data_source, config=EarningsScannerConfig.from_env())
-    report = format_screen_report(result.opportunities, now_ny=now_ny)
-    if report is None:
-        return 0
-
     state = cleanup_state(load_state(), now_ny=now_ny, retention_days=int(float(os.getenv("EARNINGS_STATE_RETENTION_DAYS", 45))))
+    pending_delivery: list[Any] = []
     for opportunity in result.opportunities:
+        key = notification_key(opportunity.ticker, opportunity.details.get("event_date_key", ""), opportunity.earnings_timing)
         if opportunity.classification not in {"ACTIONABLE", "STRONG_ACTIONABLE"}:
             continue
-        key = notification_key(opportunity.ticker, opportunity.details.get("event_date_key", ""), opportunity.earnings_timing)
         if not should_send_pre_event(state, key):
             continue
         if opportunity.option_expiry is None or opportunity.short_strike is None or opportunity.estimated_credit is None:
             continue
-        record_pre_event_notification(
-            state,
-            key=key,
-            classification=opportunity.classification,
-            notified_at=now_ny,
-            earnings_at=opportunity.earnings_at,
-            option_expiry=opportunity.option_expiry.isoformat(),
-            short_strike=opportunity.short_strike,
-            long_put_strike=float(opportunity.long_put_strike or 0.0),
-            long_call_strike=float(opportunity.long_call_strike or 0.0),
-            entry_estimated_credit=opportunity.estimated_credit,
-            entry_spot_price=opportunity.spot_price,
-            pre_event_implied_move_pct=opportunity.implied_move_pct,
-        )
+        pending_delivery.append(opportunity)
+
+    report_opportunities = []
+    for opportunity in result.opportunities:
+        key = notification_key(opportunity.ticker, opportunity.details.get("event_date_key", ""), opportunity.earnings_timing)
+        if opportunity.classification in {"ACTIONABLE", "STRONG_ACTIONABLE"}:
+            if not any(item is opportunity for item in pending_delivery):
+                continue
+        elif opportunity.classification == "WATCH":
+            pass
+        elif opportunity.classification == "MANUAL_CONFIRMATION_REQUIRED":
+            pass
+        else:
+            continue
+        report_opportunities.append(opportunity)
+
+    report = format_screen_report(report_opportunities, now_ny=now_ny)
+    if report is None:
+        save_state(state)
+        return 0
+
     sent = send_telegram_text(report)
+    if sent:
+        for opportunity in pending_delivery:
+            key = notification_key(opportunity.ticker, opportunity.details.get("event_date_key", ""), opportunity.earnings_timing)
+            record_pre_event_notification(
+                state,
+                key=key,
+                classification=opportunity.classification,
+                notified_at=now_ny,
+                earnings_at=opportunity.earnings_at,
+                option_expiry=opportunity.option_expiry.isoformat(),
+                short_strike=opportunity.short_strike,
+                long_put_strike=float(opportunity.long_put_strike or 0.0),
+                long_call_strike=float(opportunity.long_call_strike or 0.0),
+                entry_estimated_credit=opportunity.estimated_credit,
+                entry_spot_price=opportunity.spot_price,
+                pre_event_implied_move_pct=opportunity.implied_move_pct,
+            )
+    else:
+        logger.error("Earnings screen report delivery failed; leaving opportunities retryable.")
     save_state(state)
     return 1 if sent else 0
 
@@ -137,6 +160,8 @@ def run_exit(*, now_ny: datetime, data_source: YahooEarningsDataSource | None = 
         if send_telegram_text(message):
             mark_exit_notified(state, key=key, notified_at=now_ny)
             sent_count += 1
+        else:
+            logger.error("Earnings exit reminder delivery failed for %s; will retry on next run.", ticker)
     save_state(state)
     return sent_count
 
