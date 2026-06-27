@@ -7,11 +7,25 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 dist/
 build/
+coverage/
+.coverage
 
 # CSV results (don't commit scan results)
 gamma_scan_*.csv
+config/earnings_universe_cache.csv
+funnel_output/
+pilot_output/
+*.log
+*_receipt.json
+*_backup.json
+*_results.csv
+*_rejections.csv
+*_plan.csv
 
 # OS files
 .DS_Store

@@ -12,6 +12,7 @@ from typing import Any
 
 ALLOWED_SCANNERS = {
     "congress",
+    "insider",
     "vpma",
     "gamma",
     "earnings",

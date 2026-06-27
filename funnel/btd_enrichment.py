@@ -13,6 +13,9 @@ class BtdMetrics:
     ticker: str
     company_name: str = ""
     next_earnings_date: str = ""
+    sector: str = ""
+    industry: str = ""
+    quote_type: str = ""
     enterprise_value: Any = ""
     total_revenue: Any = ""
     ebitda_margin: Any = ""
@@ -26,9 +29,12 @@ def to_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if number != number or number in {float("inf"), float("-inf")}:
+        return None
+    return number
 
 
 def percent_text(value: Any) -> str:
@@ -50,10 +56,10 @@ def compact_number(value: Any) -> str:
     return f"{number:.0f}"
 
 
-def calculate_btd_score(metrics: BtdMetrics) -> float:
+def calculate_btd_score(metrics: BtdMetrics) -> float | None:
     ratio = calculate_btd_ratio(metrics)
     if ratio is None:
-        return 0.0
+        return None
     return round(ratio, 2)
 
 
@@ -78,7 +84,54 @@ def calculate_btd_ratio(metrics: BtdMetrics) -> float | None:
     ev_b = enterprise_value / 1_000_000_000
     revenue_b = total_revenue / 1_000_000_000
     ratio = ev_b / (revenue_b * gross_margin * (revenue_growth * 100))
+    if ratio != ratio or ratio in {float("inf"), float("-inf")}:
+        return None
     return ratio
+
+
+def determine_btd_applicability(metrics: BtdMetrics) -> str:
+    quote_type = str(metrics.quote_type or "").strip().lower()
+    sector = str(metrics.sector or "").strip().lower()
+    industry = str(metrics.industry or "").strip().lower()
+    company_name = str(metrics.company_name or "").strip().lower()
+
+    haystack = " | ".join(part for part in (quote_type, sector, industry, company_name) if part)
+    if not haystack:
+        return "UNAVAILABLE"
+
+    not_applicable_tokens = (
+        "bank",
+        "insurance",
+        "reit",
+        "mortgage reit",
+        "closed-end fund",
+        "closed end fund",
+        "etf",
+        "etn",
+        "shell",
+        "blank check",
+        "spac",
+        "royalty",
+        "trust",
+        "fund",
+    )
+    if any(token in haystack for token in not_applicable_tokens):
+        return "NOT_APPLICABLE"
+
+    if "biotech" in haystack:
+        total_revenue = to_float(metrics.total_revenue)
+        if total_revenue is None or total_revenue <= 0:
+            return "NOT_APPLICABLE"
+
+    required_values = (
+        to_float(metrics.enterprise_value),
+        to_float(metrics.total_revenue),
+        to_float(metrics.gross_margin),
+        to_float(metrics.revenue_growth),
+    )
+    if any(value is None for value in required_values):
+        return "UNAVAILABLE"
+    return "APPLICABLE"
 
 
 def calculate_btd_components(metrics: BtdMetrics) -> dict[str, Any]:
@@ -115,8 +168,8 @@ def calculate_btd_components(metrics: BtdMetrics) -> dict[str, Any]:
     }
 
 
-def build_btd_summary(metrics: BtdMetrics, score: float) -> str:
-    parts = [f"BTD {score}"]
+def build_btd_summary(metrics: BtdMetrics, score: float | None) -> str:
+    parts = [f"BTD {score}" if score is not None else "BTD unavailable"]
     ratio = calculate_btd_ratio(metrics)
     if ratio is not None:
         parts.append("Lower is better")
@@ -160,6 +213,9 @@ def fetch_yfinance_metrics(ticker: str) -> BtdMetrics:
         ticker=ticker.upper(),
         company_name=str(info.get("shortName") or info.get("longName") or ""),
         next_earnings_date=next_earnings,
+        sector=str(info.get("sector") or ""),
+        industry=str(info.get("industry") or ""),
+        quote_type=str(info.get("quoteType") or ""),
         enterprise_value=info.get("enterpriseValue", ""),
         total_revenue=info.get("totalRevenue", ""),
         ebitda_margin=info.get("ebitdaMargins", ""),
@@ -171,12 +227,14 @@ def fetch_yfinance_metrics(ticker: str) -> BtdMetrics:
 
 def metrics_to_candidate_updates(metrics: BtdMetrics) -> dict[str, Any]:
     score = calculate_btd_score(metrics)
+    ratio = calculate_btd_ratio(metrics)
     updates = {
         "Company Name": metrics.company_name,
         "Google Ticker": metrics.ticker,
-        "BTD Score": score,
-        "BTD Ratio": calculate_btd_ratio(metrics) or "",
+        "BTD Score": "" if score is None else score,
+        "BTD Ratio": "" if ratio is None else ratio,
         "BTD Summary": build_btd_summary(metrics, score),
+        "BTD Applicability": determine_btd_applicability(metrics),
         "Next Earnings Date": metrics.next_earnings_date,
         "Enterprise Value": metrics.enterprise_value,
         "Total Revenue": metrics.total_revenue,

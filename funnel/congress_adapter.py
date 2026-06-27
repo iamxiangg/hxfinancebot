@@ -340,6 +340,7 @@ def run_congress_adapter_detailed(
     min_conviction: float = 15.0,
     *,
     persist_ledger: bool = True,
+    observed_at: str | None = None,
 ) -> CongressAdapterRun:
     """
     Run the shared Congress engine and convert alertable results into Signals.
@@ -353,12 +354,12 @@ def run_congress_adapter_detailed(
     if persist_ledger:
         _save_ledger(scan.ledger, ledger_context)
 
-    observed_at = scan.metadata.fetched_at
+    signal_observed_at = observed_at or scan.metadata.fetched_at
     signals: list[Signal] = []
     for result in scan.ticker_results:
         signal = result_to_signal(
             result=result,
-            observed_at=observed_at,
+            observed_at=signal_observed_at,
             min_conviction=min_conviction,
         )
         if signal is not None:
@@ -397,6 +398,7 @@ def run_congress_adapter(
     min_conviction: float = 15.0,
     *,
     persist_ledger: bool = True,
+    observed_at: str | None = None,
 ) -> tuple[list[Signal], int]:
     """
     Return standardised signals and the total analysed ticker count.
@@ -404,6 +406,7 @@ def run_congress_adapter(
     run = run_congress_adapter_detailed(
         min_conviction=min_conviction,
         persist_ledger=persist_ledger,
+        observed_at=observed_at,
     )
     return run.signals, run.analysed_tickers
 
@@ -412,6 +415,7 @@ def get_congress_signals(
     min_conviction: float = 15.0,
     *,
     persist_ledger: bool = True,
+    observed_at: str | None = None,
 ) -> list[Signal]:
     """
     Compatibility function for existing funnel callers.
@@ -419,5 +423,6 @@ def get_congress_signals(
     signals, _ = run_congress_adapter(
         min_conviction=min_conviction,
         persist_ledger=persist_ledger,
+        observed_at=observed_at,
     )
     return signals

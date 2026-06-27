@@ -17,7 +17,7 @@ name: Funnel - Review Candidates
       review_sources:
         description: Comma-separated sources to include
         required: false
-        default: "congress,manual"
+        default: "congress,vpma,insider,manual"
       send_telegram_reviews:
         description: Send Telegram review cards
         required: true
@@ -68,7 +68,7 @@ jobs:
       - name: Check Python syntax
         run: |
           set -euo pipefail
-          python -m compileall -q funnel tests
+          python -m compileall -q funnel scanners tests
 
       - name: Run unit tests
         run: |
@@ -86,9 +86,31 @@ jobs:
           set -euo pipefail
           echo "MIN_CONVICTION=${INPUT_MIN_CONVICTION:-15}" >> "$GITHUB_ENV"
           echo "BTD_ENRICH_LIMIT=${INPUT_BTD_ENRICH_LIMIT:-10}" >> "$GITHUB_ENV"
-          echo "REVIEW_SOURCES=${INPUT_REVIEW_SOURCES:-congress,manual}" >> "$GITHUB_ENV"
+          echo "REVIEW_SOURCES=${INPUT_REVIEW_SOURCES:-congress,vpma,insider,manual}" >> "$GITHUB_ENV"
           echo "SEND_TELEGRAM_REVIEWS=${INPUT_SEND_TELEGRAM_REVIEWS:-true}" >> "$GITHUB_ENV"
           echo "FORCE_TELEGRAM_REVIEW_RESEND=${INPUT_RESEND_TELEGRAM_REVIEWS:-false}" >> "$GITHUB_ENV"
+          echo "VPMA_ENABLE_ENRICHMENT=true" >> "$GITHUB_ENV"
+          echo "VPMA_MAX_ENRICH=20" >> "$GITHUB_ENV"
+          echo "VPMA_EVENT_LOOKBACK_DAYS=90" >> "$GITHUB_ENV"
+          echo "VPMA_VALID_DAYS=3" >> "$GITHUB_ENV"
+          echo "VPMA_MIN_PRICE=3" >> "$GITHUB_ENV"
+          echo "VPMA_MIN_MARKET_CAP=300000000" >> "$GITHUB_ENV"
+          echo "VPMA_MIN_SOURCE_VOLUME=200000" >> "$GITHUB_ENV"
+          echo "VPMA_MIN_MEDIAN_DOLLAR_VOLUME=5000000" >> "$GITHUB_ENV"
+          echo "VPMA_UNIVERSE_URL=https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/all.csv" >> "$GITHUB_ENV"
+          echo "INSIDER_ENABLE=true" >> "$GITHUB_ENV"
+          echo "INSIDER_LOOKBACK_DAYS=7" >> "$GITHUB_ENV"
+          echo "INSIDER_CLUSTER_DAYS=21" >> "$GITHUB_ENV"
+          echo "INSIDER_VALID_DAYS=14" >> "$GITHUB_ENV"
+          echo "INSIDER_HISTORY_DAYS=365" >> "$GITHUB_ENV"
+          echo "INSIDER_MIN_PRICE=3" >> "$GITHUB_ENV"
+          echo "INSIDER_MIN_MEDIAN_DOLLAR_VOLUME=5000000" >> "$GITHUB_ENV"
+          echo "INSIDER_MAX_SEC_REQUESTS_PER_SECOND=5" >> "$GITHUB_ENV"
+          echo "INSIDER_REQUEST_TIMEOUT=30" >> "$GITHUB_ENV"
+          echo "INSIDER_SINGLE_BUY_MIN_VALUE=250000" >> "$GITHUB_ENV"
+          echo "INSIDER_MAX_RESULTS=20" >> "$GITHUB_ENV"
+          echo "BTD_GATE_THRESHOLD=1.0" >> "$GITHUB_ENV"
+          echo "BTD_GATE_MANUAL_BYPASS=true" >> "$GITHUB_ENV"
 
       - name: Refresh candidates
         env:
@@ -98,7 +120,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ALPHA_VANTAGE_FREE: ${{ secrets.ALPHA_VANTAGE_FREE }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail

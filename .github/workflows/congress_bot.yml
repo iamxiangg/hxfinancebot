@@ -22,13 +22,22 @@ jobs:
 
       - name: Install Dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install requests yfinance python-telegram-bot
+          python -m pip install google-api-python-client google-auth
+          python -m pip install requests yfinance
+
+      - name: Check Python syntax
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel scanners tactical
 
       - name: Run Congress Bot Script
         env:
           # Injects your secure bot credentials into the runner environment
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        # Update this filename if your final script is named differently
-        run: python congress_bot.py 
+          PYTHONUNBUFFERED: "1"
+        run: python -m tactical.congress_runner

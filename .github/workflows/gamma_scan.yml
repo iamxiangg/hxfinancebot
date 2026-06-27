@@ -53,11 +53,11 @@ jobs:
           TICKERS: ${{ inputs.tickers || '' }}
         run: |
           if [ "$SCAN_TYPE" = "quick" ]; then
-            python gamma_scanner.py --quick
+            python archive/gamma_scanner.py --quick
           elif [ -n "$TICKERS" ]; then
-            python gamma_scanner.py --ticker "$TICKERS"
+            python archive/gamma_scanner.py --ticker "$TICKERS"
           else
-            python gamma_scanner.py
+            python archive/gamma_scanner.py
           fi
       
       - name: 📤 Upload results

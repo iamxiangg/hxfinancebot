@@ -67,6 +67,59 @@ class TestCongressAdapter(unittest.TestCase):
         self.assertEqual(signal.classification, "actionable")
         self.assertEqual(signal.score, 75.0)
         self.assertEqual(signal.details["trigger_type"], "fresh_transaction")
+        self.assertEqual(signal.details["buyers"], 2)
+        self.assertEqual(signal.details["cluster_buyers"], 2)
+        self.assertEqual(signal.details["active_trade_count"], 2)
+        self.assertEqual(signal.details["names"], ["Jones", "Smith"])
+
+    def test_presentation_change_does_not_alter_adapter_score_or_classification(self) -> None:
+        result = CongressTickerResult(
+            ticker="LEG",
+            category="actionable",
+            conviction=60.78,
+            entry=68.56,
+            base=55.0,
+            sale_penalty=0.0,
+            call_bonus=0.0,
+            put_penalty=0.0,
+            low=500000.0,
+            mid=500000.0,
+            high=500000.0,
+            effective=500000.0,
+            active_bullish_capital=500000.0,
+            historical_context_capital=0.0,
+            call_mid=0.0,
+            put_mid=0.0,
+            buyers=1,
+            cluster_buyers=1,
+            weighted_age=10.0,
+            weighted_return=-5.0,
+            flow="Accumulation",
+            names=["Legacy Buyer"],
+            unclear_sales=0,
+            matched_sales=0,
+            matched_full_sales=0,
+            active_trade_count=1,
+            active_fresh_trade_count=1,
+            active_late_disclosed_trade_count=0,
+            signal_trigger="fresh_transaction",
+            trigger_types=["fresh_transaction"],
+            transaction_dates=["2026-06-14"],
+            filing_dates=["2026-06-20"],
+            transaction_ages=[10],
+            filing_ages=[4],
+            alertable=True,
+            weighted_average_activity_weight=1.0,
+            valid_for_days=20,
+            source_payload_hash="legacy",
+        )
+
+        signal = result_to_signal(result=result, observed_at=self.observed_at)
+
+        assert signal is not None
+        self.assertEqual(signal.classification, "actionable")
+        self.assertAlmostEqual(signal.score or 0.0, 60.78, places=2)
+        self.assertAlmostEqual(signal.details["entry_quality"], 68.56, places=2)
 
     def test_other_above_threshold_becomes_near_miss(self) -> None:
         result = CongressTickerResult(

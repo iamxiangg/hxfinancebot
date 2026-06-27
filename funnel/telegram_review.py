@@ -43,21 +43,59 @@ def candidate_id_for_ticker(ticker: str) -> str:
     return f"cand-{normalized}-{digest}"
 
 
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _present(value: Any) -> bool:
+    return _clean_text(value) != ""
+
+
+def _source_label(value: str) -> str:
+    mapping = {
+        "congress": "Congress",
+        "insider": "Corporate Insider",
+        "vpma": "VPMA / PEAD",
+        "manual": "Manual",
+    }
+    return mapping.get(value.strip().lower(), value.strip())
+
+
+def _ratio_percent_line(label: str, value: Any) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        return f"- {label}: {float(text) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return f"- {label}: {text}"
+
+
+def _value_line(label: str, value: Any, *, prefix: str = "- ") -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    return f"{prefix}{label}: {text}"
+
+
 def build_review_message(candidate: dict[str, Any]) -> str:
-    lines = [
-        f"Review candidate: ${candidate.get('Ticker', '')}",
-        f"Status: {candidate.get('Status', '')}",
-        f"Funnel: {candidate.get('Funnel Score', '')}",
-        f"BTD: {candidate.get('BTD Score', '')}",
+    source_values = [
+        _source_label(part)
+        for part in str(candidate.get("Source") or "").split(",")
+        if part.strip()
     ]
+    lines = [f"Review candidate: {candidate.get('Ticker', '')}"]
 
     company = candidate.get("Company Name")
     if company:
         lines.insert(1, f"Company: {company}")
 
-    summary = candidate.get("BTD Summary")
-    if summary:
-        lines.append(f"BTD summary: {summary}")
+    if source_values:
+        lines.append(f"Sources: {', '.join(source_values)}")
+
+    corroboration = _clean_text(candidate.get("Corroboration Level"))
+    if corroboration:
+        lines.append(f"Corroboration: {corroboration}")
 
     ai_summary = candidate.get("AI Quality Summary")
     if ai_summary:
@@ -70,6 +108,82 @@ def build_review_message(candidate: dict[str, Any]) -> str:
     reason = candidate.get("Discovery Reason")
     if reason:
         lines.append(f"Signal: {reason}")
+
+    lines.append("")
+    lines.append("BTD BASIC GATE")
+    lines.append(f"- Status: {_clean_text(candidate.get('BTD Gate')) or _clean_text(candidate.get('Status'))}")
+    ratio = _clean_text(candidate.get("BTD Ratio")) or _clean_text(candidate.get("BTD Score"))
+    if ratio:
+        lines.append(f"- BTD ratio: {ratio}")
+    for maybe_line in (
+        _ratio_percent_line("Gross margin", candidate.get("Gross Margin")),
+        _ratio_percent_line("Revenue growth", candidate.get("Revenue Growth")),
+    ):
+        if maybe_line:
+            lines.append(maybe_line)
+    gate_reason = _clean_text(candidate.get("BTD Gate Reason"))
+    if gate_reason:
+        lines.append(f"- Note: {gate_reason}")
+
+    congress_unique_members = candidate.get("Congress Unique Members")
+    congress_recent_cluster = candidate.get("Congress Recent Cluster Members")
+    congress_active_purchases = candidate.get("Congress Active Purchases")
+    congress_member_names = candidate.get("Congress Member Names")
+    if any(
+        _present(value)
+        for value in (
+            congress_unique_members,
+            congress_recent_cluster,
+            congress_active_purchases,
+            congress_member_names,
+        )
+    ):
+        lines.append("Congress breadth:")
+        if _present(congress_unique_members):
+            lines.append(f"- Unique members represented: {congress_unique_members}")
+        if _present(congress_recent_cluster):
+            lines.append(f"- Recent cluster members: {congress_recent_cluster}")
+        if _present(congress_active_purchases):
+            lines.append(f"- Active purchases: {congress_active_purchases}")
+        if _present(congress_member_names):
+            lines.append(f"- Members represented: {congress_member_names}")
+
+    insider_fields = (
+        candidate.get("Insider Total Score"),
+        candidate.get("Insider Conviction"),
+        candidate.get("Insider Economic Commitment"),
+        candidate.get("Insider Market Context"),
+        candidate.get("Insider Unique Insiders"),
+        candidate.get("Insider Roles"),
+        candidate.get("Insider Aggregate Purchase"),
+        candidate.get("Insider Cluster Span Days"),
+        candidate.get("Insider Weighted Purchase Price"),
+        candidate.get("Insider Entry State"),
+    )
+    if any(_present(value) for value in insider_fields):
+        lines.append("Corporate insider:")
+        for maybe_line in (
+            _value_line("Total score", candidate.get("Insider Total Score")),
+            _value_line("Insider conviction", candidate.get("Insider Conviction")),
+            _value_line("Economic commitment", candidate.get("Insider Economic Commitment")),
+            _value_line("Market context", candidate.get("Insider Market Context")),
+            _value_line("Unique insiders", candidate.get("Insider Unique Insiders")),
+            _value_line("Roles", candidate.get("Insider Roles")),
+            _value_line("Aggregate purchase", candidate.get("Insider Aggregate Purchase")),
+            _value_line("Cluster span", candidate.get("Insider Cluster Span Days")),
+            _value_line("Weighted purchase price", candidate.get("Insider Weighted Purchase Price")),
+            _value_line("Entry state", candidate.get("Insider Entry State")),
+        ):
+            if maybe_line:
+                lines.append(maybe_line)
+
+    summary = candidate.get("BTD Summary")
+    if summary:
+        lines.append("")
+        lines.append(f"BTD summary: {summary}")
+
+    lines.append("")
+    lines.append("BTD basic economic gate passed. Manual long-term review remains required.")
 
     lines.append("")
     lines.append("Choose an action below. Approval adds the ticker to Stock Summary USD.")

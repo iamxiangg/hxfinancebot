@@ -7,6 +7,7 @@ import requests
 
 from funnel.telegram_review import (
     answer_callback,
+    build_review_message,
     build_callback_data,
     candidate_id_for_ticker,
     parse_callback_data,
@@ -64,6 +65,62 @@ class TelegramReviewTests(unittest.TestCase):
         mock_post.return_value = response
 
         self.assertFalse(send_telegram_text("Done", token="token", chat_id="chat"))
+
+    def test_review_message_includes_congress_breadth(self) -> None:
+        message = build_review_message(
+            {
+                "Ticker": "NVDA",
+                "Status": "ENRICHED",
+                "Funnel Score": 78,
+                "BTD Score": 0.4,
+                "BTD Ratio": 0.4,
+                "BTD Gate": "PASS",
+                "Gross Margin": 0.72,
+                "Revenue Growth": 0.24,
+                "Discovery Reason": "Congress: 4 unique members",
+                "Congress Unique Members": 4,
+                "Congress Recent Cluster Members": 3,
+                "Congress Active Purchases": 6,
+                "Congress Member Names": "Pelosi, Gottheimer, Tuberville, Moore",
+            }
+        )
+
+        self.assertIn("BTD BASIC GATE", message)
+        self.assertIn("BTD ratio: 0.4", message)
+        self.assertIn("Gross margin: 72.0%", message)
+        self.assertIn("Congress breadth:", message)
+        self.assertIn("Unique members represented: 4", message)
+        self.assertIn("Recent cluster members: 3", message)
+        self.assertIn("Active purchases: 6", message)
+        self.assertIn("Members represented: Pelosi, Gottheimer, Tuberville, Moore", message)
+
+    def test_review_message_includes_insider_block(self) -> None:
+        message = build_review_message(
+            {
+                "Ticker": "TEAM",
+                "Source": "insider, vpma",
+                "Corroboration Level": "STRONG",
+                "BTD Gate": "PASS",
+                "BTD Ratio": 0.68,
+                "Gross Margin": 0.72,
+                "Revenue Growth": 0.24,
+                "Insider Total Score": 82,
+                "Insider Conviction": 43,
+                "Insider Economic Commitment": 24,
+                "Insider Market Context": 15,
+                "Insider Unique Insiders": 3,
+                "Insider Roles": "CEO, CFO, Director",
+                "Insider Aggregate Purchase": "$1.4m",
+                "Insider Cluster Span Days": 12,
+                "Insider Weighted Purchase Price": 42.8,
+                "Insider Entry State": "trend_confirmed",
+            }
+        )
+
+        self.assertIn("Sources: Corporate Insider, VPMA / PEAD", message)
+        self.assertIn("Corroboration: STRONG", message)
+        self.assertIn("Corporate insider:", message)
+        self.assertIn("Total score: 82", message)
 
 
 if __name__ == "__main__":

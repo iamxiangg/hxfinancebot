@@ -5,7 +5,7 @@ import unittest
 import pandas as pd
 
 from funnel.congress_adapter import result_to_signal
-from scanners.congress.engine import run_scan_from_payload
+from scanners.congress.engine import cluster_score, repeat_score, run_scan_from_payload
 
 
 def market_data(
@@ -241,6 +241,60 @@ class CongressEngineTests(unittest.TestCase):
         self.assertAlmostEqual(result.entry, 68.56, places=2)
         self.assertEqual(result.signal_trigger, "fresh_transaction")
         self.assertAlmostEqual(result.weighted_average_activity_weight, 1.0, places=2)
+
+    def test_buyer_breadth_is_presentation_only_and_engine_scoring_is_unchanged(self) -> None:
+        payload = [
+            {
+                "id": "breadth-1",
+                "ticker": "BREADTH",
+                "asset_name": "Breadth Co Common Stock",
+                "asset_type": "Common Stock",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-06-14",
+                "filing_date": "2026-06-20",
+                "amount_range_low": 250000,
+                "amount_range_high": 250000,
+                "filer_name": "Same Buyer",
+                "filer_id": "S1",
+                "owner": "Spouse",
+                "branch": "Legislative",
+                "chamber": "House",
+            },
+            {
+                "id": "breadth-2",
+                "ticker": "BREADTH",
+                "asset_name": "Breadth Co Common Stock",
+                "asset_type": "Common Stock",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-06-15",
+                "filing_date": "2026-06-20",
+                "amount_range_low": 250000,
+                "amount_range_high": 250000,
+                "filer_name": "Same Buyer",
+                "filer_id": "S1",
+                "owner": "Self",
+                "branch": "Legislative",
+                "chamber": "House",
+            },
+        ]
+
+        scan = run_scan_from_payload(
+            payload,
+            observed_at="2026-06-24T12:00:00+08:00",
+            price_fetcher=price_fetcher_factory(
+                {"BREADTH": market_data([100, 98, 96, 95], [1_000_000] * 4, start="2026-06-14")}
+            ),
+        )
+
+        result = scan.ticker_results[0]
+        self.assertEqual(result.buyers, 1)
+        self.assertEqual(result.cluster_buyers, 1)
+        self.assertEqual(result.active_trade_count, 2)
+        self.assertEqual(result.category, "actionable")
+        self.assertAlmostEqual(result.conviction, 65.89, places=2)
+        self.assertAlmostEqual(result.entry, 78.78, places=2)
+        self.assertAlmostEqual(cluster_score(result.cluster_buyers), 0.0, places=2)
+        self.assertAlmostEqual(repeat_score(result.active_trade_count, result.buyers), 5.0, places=2)
 
 
 if __name__ == "__main__":
