@@ -17,6 +17,7 @@ ALLOWED_SCANNERS = {
     "gamma",
     "earnings",
     "manual",
+    "fundamental_inflection",
 }
 
 

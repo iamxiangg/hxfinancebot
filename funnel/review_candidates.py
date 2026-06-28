@@ -369,7 +369,7 @@ def run() -> None:
 
     requested_sources = [
         part.strip().lower()
-        for part in os.getenv("REVIEW_SOURCES", "congress,vpma,insider,manual").split(",")
+        for part in os.getenv("REVIEW_SOURCES", "congress,vpma,insider,fundamental_inflection,manual").split(",")
         if part.strip()
     ]
     signals: list[Signal] = []
@@ -401,6 +401,12 @@ def run() -> None:
                 insider_signals, analysed_count = run_insider_adapter(observed_at=now)
                 logger.info("Insider adapter returned %d signals from %d tickers.", len(insider_signals), analysed_count)
                 signals.extend(insider_signals)
+                successful_sources.append(source)
+            elif source == "fundamental_inflection":
+                from funnel.fundamental_inflection_adapter import run_fundamental_inflection_adapter
+                fi_signals, analysed_count = run_fundamental_inflection_adapter(observed_at=now)
+                logger.info("Fundamental inflection adapter returned %d signals from %d tickers.", len(fi_signals), analysed_count)
+                signals.extend(fi_signals)
                 successful_sources.append(source)
             else:
                 logger.warning("Unknown review source '%s' ignored.", source)

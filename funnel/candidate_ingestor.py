@@ -22,9 +22,10 @@ SCANNER_ORDER = {
     "congress": 1,
     "insider": 2,
     "vpma": 3,
-    "manual": 4,
-    "gamma": 5,
-    "earnings": 6,
+    "fundamental_inflection": 4,
+    "manual": 5,
+    "gamma": 6,
+    "earnings": 7,
 }
 
 
