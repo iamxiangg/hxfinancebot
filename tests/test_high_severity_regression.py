@@ -482,7 +482,7 @@ class PromotionFaultInjectionTests(unittest.TestCase):
     @patch("funnel.review_promotion.read_table")
     @patch("funnel.review_bot.promote_candidate_to_master")
     def test_promotion_idempotent_via_review_id(self, mock_promote, mock_read) -> None:
-        """Same review ID processed twice returns same result."""
+        """Second promotion attempt with same review returns ALREADY_EXISTS (master already has ticker)."""
         from funnel.review_promotion import promote_approved_review_request
         candidate = self._eligible_candidate()
         snapshot = compute_snapshot_hash(candidate)
@@ -494,14 +494,54 @@ class PromotionFaultInjectionTests(unittest.TestCase):
             "State": REVIEW_STATE_APPROVED_PENDING_PROMOTION,
         }
         mock_read.return_value = [candidate]
-        mock_promote.return_value = "ADDED"
         svc = self._mock_svc()
+
+        # First call: ticker not yet in master — ADDED
+        mock_promote.return_value = "ADDED"
         result1, _, _ = promote_approved_review_request(svc, "sheet-id", review)
         self.assertEqual(result1, "PROMOTED")
-        # If called again (simulating race), same outcome
-        mock_promote.return_value = "ADDED"
+
+        # Second call: ticker now already in master — ALREADY_EXISTS
+        mock_promote.return_value = "ALREADY_EXISTS"
         result2, _, _ = promote_approved_review_request(svc, "sheet-id", review)
-        self.assertEqual(result2, "PROMOTED")
+        self.assertEqual(result2, "ALREADY_EXISTS")
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_bot.promote_candidate_to_master")
+    def test_concurrent_promotion_same_ticker_produces_at_most_one_master_row(self, mock_promote, mock_read) -> None:
+        """Two concurrent promotions of the same ticker → one ADDED, one ALREADY_EXISTS."""
+        from funnel.review_promotion import promote_approved_review_request
+        candidate = self._eligible_candidate()
+        snapshot = compute_snapshot_hash(candidate)
+
+        review_a = {
+            "Review ID": "rev-A",
+            "Candidate ID": "cand-NVDA-abc",
+            "Ticker": "NVDA",
+            "Candidate Snapshot Hash": snapshot,
+            "State": REVIEW_STATE_APPROVED_PENDING_PROMOTION,
+        }
+        review_b = {
+            "Review ID": "rev-B",
+            "Candidate ID": "cand-NVDA-abc",
+            "Ticker": "NVDA",
+            "Candidate Snapshot Hash": snapshot,
+            "State": REVIEW_STATE_APPROVED_PENDING_PROMOTION,
+        }
+
+        mock_read.return_value = [candidate]
+        svc = self._mock_svc()
+
+        # Simulate concurrent execution: first wins ADDED, second gets ALREADY_EXISTS
+        mock_promote.return_value = "ADDED"
+        result_a, _, cand_a = promote_approved_review_request(svc, "sheet-id", review_a)
+        self.assertEqual(result_a, "PROMOTED")
+        self.assertEqual(cand_a["Status"], "APPROVED_ADDED")
+
+        mock_promote.return_value = "ALREADY_EXISTS"
+        result_b, _, cand_b = promote_approved_review_request(svc, "sheet-id", review_b)
+        self.assertEqual(result_b, "ALREADY_EXISTS")
+        self.assertEqual(cand_b["Status"], "APPROVED_ALREADY_EXISTS")
 
     @patch("funnel.review_promotion.read_table")
     @patch("funnel.review_bot.promote_candidate_to_master")

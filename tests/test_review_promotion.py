@@ -13,8 +13,11 @@ from funnel.review_promotion import (
 from funnel.review_schema import (
     REVIEW_STATE_ALREADY_EXISTS,
     REVIEW_STATE_APPROVED_PENDING_PROMOTION,
+    REVIEW_STATE_ARCHIVED,
+    REVIEW_STATE_EXPIRED,
     REVIEW_STATE_FAILED_RETRYABLE,
     REVIEW_STATE_PROMOTED,
+    REVIEW_STATE_REJECTED,
     REVIEW_STATE_STALE_REVIEW,
 )
 from funnel.telegram_review import compute_snapshot_hash
@@ -263,6 +266,102 @@ class PromotionWorkerTests(unittest.TestCase):
         self.assertEqual(result["pending"], 1)
         self.assertEqual(result["failed"], 1)
         self.assertEqual(result["promoted"], 0)
+
+
+class TerminalStateRejectionTests(unittest.TestCase):
+    """Verify run_promotions() skips reviews in terminal/non-pending states."""
+
+    def _make_review_in_state(self, review_id: str, state: str) -> dict[str, str]:
+        return {
+            "Review ID": review_id,
+            "Candidate ID": "cand-NVDA-abc",
+            "Ticker": "NVDA",
+            "Candidate Snapshot Hash": "hash",
+            "State": state,
+            "Issued At": "2026-01-01T00:00:00+00:00",
+            "Expires At": "2027-01-01T00:00:00+00:00",
+            "Telegram Chat ID": "123",
+            "Telegram Message ID": "456",
+            "Decision": "APPROVE",
+            "Decision At": "2026-01-02T00:00:00+00:00",
+            "Decision By User ID": "111",
+            "Decision By Username": "testuser",
+            "Telegram Update ID": "789",
+            "Promotion Result": "",
+            "Promotion At": "",
+            "Last Error": "",
+            "Created At": "2026-01-01T00:00:00+00:00",
+            "Updated At": "2026-01-01T00:00:00+00:00",
+        }
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_rejected_review_is_skipped(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
+        review = self._make_review_in_state("rev-001", REVIEW_STATE_REJECTED)
+        mock_svc.return_value = Mock()
+        mock_sid.return_value = "sheet-id"
+        mock_read.return_value = [review]
+        result = run_promotions()
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(result["promoted"], 0)
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_archived_review_is_skipped(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
+        review = self._make_review_in_state("rev-001", REVIEW_STATE_ARCHIVED)
+        mock_svc.return_value = Mock()
+        mock_sid.return_value = "sheet-id"
+        mock_read.return_value = [review]
+        result = run_promotions()
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(result["promoted"], 0)
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_expired_review_is_skipped(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
+        review = self._make_review_in_state("rev-001", REVIEW_STATE_EXPIRED)
+        mock_svc.return_value = Mock()
+        mock_sid.return_value = "sheet-id"
+        mock_read.return_value = [review]
+        result = run_promotions()
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(result["promoted"], 0)
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_already_promoted_review_is_skipped(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
+        review = self._make_review_in_state("rev-001", REVIEW_STATE_PROMOTED)
+        mock_svc.return_value = Mock()
+        mock_sid.return_value = "sheet-id"
+        mock_read.return_value = [review]
+        result = run_promotions()
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(result["promoted"], 0)
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_failed_retryable_review_not_picked_up_by_current_impl(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
+        """FAILED_RETRYABLE is not APPROVED_PENDING_PROMOTION, so run_promotions skips it.
+
+        NOTE: This is a known gap — FAILED_RETRYABLE reviews should ideally be retried.
+        Update this test when run_promotions gains FAILED_RETRYABLE retry support.
+        """
+        review = self._make_review_in_state("rev-001", REVIEW_STATE_FAILED_RETRYABLE)
+        mock_svc.return_value = Mock()
+        mock_sid.return_value = "sheet-id"
+        mock_read.return_value = [review]
+        result = run_promotions()
+        self.assertEqual(result["pending"], 0)
 
 
 if __name__ == "__main__":

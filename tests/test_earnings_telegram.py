@@ -7,7 +7,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scanners.earnings.models import EarningsOpportunity
-from tactical.earnings_telegram import _split_telegram_text, format_exit_reminder, format_screen_report, send_telegram_text
+from tactical.earnings_telegram import _split_telegram_text, format_candidate_message, format_exit_reminder, format_screen_report, send_telegram_text
 
 
 class EarningsTelegramTests(unittest.TestCase):
@@ -116,6 +116,127 @@ class EarningsTelegramTests(unittest.TestCase):
             mock_post.side_effect = [first, second]
             self.assertFalse(send_telegram_text(long_text))
             self.assertEqual(mock_post.call_count, 2)
+
+
+class CandidateMessageTests(unittest.TestCase):
+    """Tests for the per-candidate alert formatter (Follow-up F2)."""
+
+    NY = ZoneInfo("America/New_York")
+
+    def _opportunity(self, **overrides: object) -> EarningsOpportunity:
+        kwargs: dict[str, object] = {
+            "ticker": "NVDA",
+            "classification": "ACTIONABLE",
+            "total_score": 80.0,
+            "earnings_at": datetime(2026, 8, 19, 16, 5, tzinfo=self.NY),
+            "earnings_timing": "AMC",
+            "timing_source": "earnings_dates",
+            "spot_price": 180.0,
+            "option_expiry": date(2026, 8, 21),
+            "days_after_event_to_expiry": 2,
+            "event_purity": "HIGH",
+            "implied_move_pct": 0.09,
+            "implied_move_dollars": 16.2,
+            "historical_event_count": 12,
+            "historical_median_move": 0.05,
+            "historical_mean_move": 0.05,
+            "historical_p75_move": 0.07,
+            "historical_p90_move": 0.10,
+            "historical_max_move": 0.13,
+            "historical_breach_rate": 0.15,
+            "move_richness_median": 1.5,
+            "realised_move_percentile": 82,
+            "richness_score": 35,
+            "reliability_score": 18,
+            "execution_score": 16,
+            "risk_adjustment": 14,
+            "short_strike": 180.0,
+            "long_put_strike": 162.5,
+            "long_call_strike": 197.5,
+            "estimated_credit": 8.2,
+            "estimated_max_profit": 820,
+            "estimated_max_loss": 930,
+            "lower_breakeven": 171.8,
+            "upper_breakeven": 188.2,
+            "liquidity_status": "GOOD",
+            "data_confidence": "HIGH",
+            "risk_flags": [],
+            "reason": "",
+            "details": {},
+        }
+        kwargs.update(overrides)
+        return EarningsOpportunity(**kwargs)  # type: ignore[arg-type]
+
+    def test_contains_ticker_and_classification(self) -> None:
+        msg = format_candidate_message(self._opportunity(), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("NVDA", msg)
+        self.assertIn("ACTIONABLE", msg)  # classification case preserved, underscores replaced with space
+
+    def test_contains_earnings_timing_amc(self) -> None:
+        msg = format_candidate_message(self._opportunity(earnings_timing="AMC"), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("After close today", msg)
+
+    def test_contains_earnings_timing_bmo(self) -> None:
+        msg = format_candidate_message(self._opportunity(earnings_timing="BMO"), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("Before open next session", msg)
+
+    def test_contains_spot_and_move_metrics(self) -> None:
+        msg = format_candidate_message(self._opportunity(), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("$180.00", msg)
+        self.assertIn("9.0%", msg)  # implied move
+        self.assertIn("5.0%", msg)  # historical median
+        self.assertIn("7.0%", msg)  # historical p75
+
+    def test_contains_richness_metric(self) -> None:
+        msg = format_candidate_message(self._opportunity(move_richness_median=2.15), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("2.15x", msg)
+
+    def test_omits_richness_when_none(self) -> None:
+        msg = format_candidate_message(self._opportunity(move_richness_median=None), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertNotIn("richness", msg.lower())
+
+    def test_contains_option_structure(self) -> None:
+        msg = format_candidate_message(self._opportunity(), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("Proposed defined-risk structure", msg)
+        self.assertIn("$8.20", msg)  # estimated credit
+        self.assertIn("$820", msg)   # max profit
+        self.assertIn("$930", msg)   # max loss
+
+    def test_contains_risk_flags(self) -> None:
+        msg = format_candidate_message(self._opportunity(risk_flags=["FAT_TAIL_HISTORY", "LOW_LIQUIDITY"]), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("FAT_TAIL_HISTORY", msg)
+        self.assertIn("LOW_LIQUIDITY", msg)
+
+    def test_risk_flags_none(self) -> None:
+        msg = format_candidate_message(self._opportunity(risk_flags=[]), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("None", msg)
+
+    def test_contains_disclaimer(self) -> None:
+        msg = format_candidate_message(self._opportunity(), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("This system does not execute trades.", msg)
+
+    def test_no_option_structure_when_no_strikes(self) -> None:
+        msg = format_candidate_message(
+            self._opportunity(short_strike=None, long_put_strike=None, long_call_strike=None, estimated_credit=None),
+            now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY),
+        )
+        self.assertNotIn("Proposed defined-risk structure", msg)
+
+    def test_breach_rate_displayed(self) -> None:
+        msg = format_candidate_message(self._opportunity(historical_breach_rate=0.25, historical_event_count=12), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("3 of 12", msg)
+
+    def test_breach_rate_omitted_when_none(self) -> None:
+        msg = format_candidate_message(self._opportunity(historical_breach_rate=None), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertNotIn("breaches", msg.lower())
+
+    def test_score_displayed(self) -> None:
+        msg = format_candidate_message(self._opportunity(total_score=78.0), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertIn("78/100", msg)
+
+    def test_msg_fits_in_single_telegram_chunk(self) -> None:
+        msg = format_candidate_message(self._opportunity(), now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=self.NY))
+        self.assertLess(len(msg), 3800)
 
 
 if __name__ == "__main__":
