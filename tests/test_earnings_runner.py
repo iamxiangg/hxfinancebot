@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from scanners.earnings.models import EarningsOpportunity, EarningsScanResult
 from tactical.earnings_runner import run_exit, run_screen
 from tactical.earnings_state import load_state, notification_key, record_pre_event_notification, save_state
+from tactical.earnings_telegram import _split_telegram_text
 
 
 NY = ZoneInfo("America/New_York")
@@ -118,6 +119,52 @@ class EarningsRunnerTests(unittest.TestCase):
         self.assertEqual(first, 0)
         self.assertEqual(second, 1)
         self.assertIn(key, state)
+
+    def test_failed_multi_chunk_delivery_leaves_all_candidates_retryable(self) -> None:
+        first_opportunity = make_opportunity("NVDA")
+        second_opportunity = make_opportunity("MSFT")
+        long_report = "\n".join([f"Line {index} {'x' * 200}" for index in range(60)])
+        chunk_count = len(_split_telegram_text(long_report))
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ",
+            {
+                "EARNINGS_STATE_PATH": str(Path(temp_dir) / "state.json"),
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_CHAT_ID": "chat",
+            },
+            clear=False,
+        ), patch(
+            "tactical.earnings_runner.run_earnings_scan",
+            return_value=EarningsScanResult([first_opportunity, second_opportunity], counts={}),
+        ), patch("tactical.earnings_runner.format_screen_report", return_value=long_report), patch(
+            "tactical.earnings_telegram.requests.post"
+        ) as mock_post:
+            first_response = unittest.mock.Mock()
+            first_response.raise_for_status.return_value = None
+            first_response.json.return_value = {"ok": True}
+            second_response = unittest.mock.Mock()
+            second_response.raise_for_status.side_effect = RuntimeError("bad chunk")
+            mock_post.side_effect = [first_response, second_response]
+
+            first = run_screen(now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=NY))
+            self.assertEqual(load_state(), {})
+
+            successful_responses = []
+            for _ in range(chunk_count):
+                response = unittest.mock.Mock()
+                response.raise_for_status.return_value = None
+                response.json.return_value = {"ok": True}
+                successful_responses.append(response)
+            mock_post.reset_mock()
+            mock_post.side_effect = successful_responses
+
+            second = run_screen(now_ny=datetime(2026, 8, 19, 14, 40, tzinfo=NY))
+            state = load_state()
+
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 1)
+        self.assertIn(notification_key("NVDA", "2026-08-19", "AMC"), state)
+        self.assertIn(notification_key("MSFT", "2026-08-19", "AMC"), state)
 
     def test_already_delivered_actionable_candidates_excluded_from_normal_report(self) -> None:
         delivered = make_opportunity("NVDA")
