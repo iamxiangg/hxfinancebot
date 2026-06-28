@@ -8,6 +8,22 @@ FEROLDI_FIRST_CUT_MAX_POINTS = 42.0
 VALID_GATE_MODES = {"off", "observe", "enforce"}
 
 
+def _install_feroldi_telegram_renderer() -> None:
+    """Install the Feroldi-aware sender before review_candidates imports it.
+
+    This keeps the existing Telegram module unchanged while adding the first-cut
+    section breakdown to candidate review cards.
+    """
+
+    from funnel import telegram_review
+    from funnel.feroldi_telegram import send_candidate_review
+
+    telegram_review.send_candidate_review = send_candidate_review
+
+
+_install_feroldi_telegram_renderer()
+
+
 def _to_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
