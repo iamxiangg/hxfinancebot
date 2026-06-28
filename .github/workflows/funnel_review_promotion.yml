@@ -1,0 +1,95 @@
+# VERSION: 2026-06-28-REVIEW-PROMOTION-WORKFLOW-1
+
+name: Funnel - Review Promotion
+
+"on":
+  workflow_dispatch:
+    inputs:
+      promotion_mode:
+        description: Dry run or apply eligible review promotions
+        required: true
+        default: DRY_RUN
+        type: choice
+        options:
+          - DRY_RUN
+          - APPLY
+
+      confirm_apply:
+        description: Select YES only for APPLY mode
+        required: true
+        default: "NO"
+        type: choice
+        options:
+          - "NO"
+          - "YES"
+
+permissions:
+  contents: read
+
+# Prevents production, pilot and promotion workflows
+# from writing to the Google Sheet at the same time.
+concurrency:
+  group: funnel-review-v3
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  review-promotion:
+    name: Run Review Promotion Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install google-api-python-client google-auth
+          python -m pip install pandas requests yfinance python-telegram-bot
+
+      - name: Check Python syntax
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel tests
+          echo "Python syntax checks passed."
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Reject unconfirmed apply mode
+        if: ${{ inputs.promotion_mode == 'APPLY' && inputs.confirm_apply != 'YES' }}
+        run: |
+          echo "APPLY mode requires confirm_apply=YES."
+          exit 1
+
+      - name: Reject unnecessary confirmation in dry-run mode
+        if: ${{ inputs.promotion_mode == 'DRY_RUN' && inputs.confirm_apply == 'YES' }}
+        run: |
+          echo "DRY_RUN does not require confirmation."
+          echo "Set confirm_apply=NO."
+          exit 1
+
+      - name: Run review promotion worker
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: Stock Summary USD
+
+          PROMOTION_DRY_RUN: ${{ inputs.promotion_mode == 'DRY_RUN' && 'true' || 'false' }}
+
+          PYTHONUNBUFFERED: "1"
+
+        run: |
+          set -euo pipefail
+          python -m funnel.review_promotion

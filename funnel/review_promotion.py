@@ -150,8 +150,14 @@ def promote_approved_review_request(
         return REVIEW_STATE_FAILED_RETRYABLE, updated_review, {}
 
 
+_RETRYABLE_PROMOTION_STATES = frozenset({
+    REVIEW_STATE_APPROVED_PENDING_PROMOTION,
+    REVIEW_STATE_FAILED_RETRYABLE,
+})
+
+
 def run_promotions(*, service=None, spreadsheet_id: str | None = None, dry_run: bool = False) -> dict[str, Any]:
-    """Process all APPROVED_PENDING_PROMOTION reviews.
+    """Process all APPROVED_PENDING_PROMOTION and FAILED_RETRYABLE reviews.
 
     Returns a summary dict with counts of promoted, already_exists, stale, failed.
     Idempotent: Review ID is the primary key; repeated runs are safe.
@@ -167,7 +173,7 @@ def run_promotions(*, service=None, spreadsheet_id: str | None = None, dry_run: 
     review_records = read_table(service, spreadsheet_id, REVIEW_REQUESTS_SHEET, REVIEW_REQUESTS_HEADERS)
     pending = [
         r for r in review_records
-        if str(r.get("State") or "").strip() == REVIEW_STATE_APPROVED_PENDING_PROMOTION
+        if str(r.get("State") or "").strip() in _RETRYABLE_PROMOTION_STATES
     ]
 
     if not pending:

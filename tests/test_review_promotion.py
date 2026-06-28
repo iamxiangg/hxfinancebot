@@ -350,18 +350,178 @@ class TerminalStateRejectionTests(unittest.TestCase):
     @patch("funnel.review_promotion.ensure_review_sheets")
     @patch("funnel.review_promotion.get_spreadsheet_id")
     @patch("funnel.review_promotion.get_sheets_service")
-    def test_failed_retryable_review_not_picked_up_by_current_impl(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
-        """FAILED_RETRYABLE is not APPROVED_PENDING_PROMOTION, so run_promotions skips it.
-
-        NOTE: This is a known gap — FAILED_RETRYABLE reviews should ideally be retried.
-        Update this test when run_promotions gains FAILED_RETRYABLE retry support.
-        """
+    def test_failed_retryable_review_is_retried(self, mock_svc, mock_sid, mock_ens, mock_read) -> None:
+        """FAILED_RETRYABLE reviews are now picked up for retry."""
         review = self._make_review_in_state("rev-001", REVIEW_STATE_FAILED_RETRYABLE)
-        mock_svc.return_value = Mock()
+
+        # Create a proper mock sheets service that supports upsert_records
+        svc = Mock()
+        svc.spreadsheets().values().get.return_value.execute.return_value = {"values": []}
+        svc.spreadsheets().values().append.return_value.execute.return_value = {}
+        svc.spreadsheets().values().batchUpdate.return_value.execute.return_value = {}
+        mock_svc.return_value = svc
         mock_sid.return_value = "sheet-id"
-        mock_read.return_value = [review]
+
+        # read_table returns review for Review_Requests, empty for BTD_Candidates
+        def read_side_effect(svc, sid, sheet, headers):
+            if sheet == "Review_Requests":
+                return [review]
+            return []
+
+        mock_read.side_effect = read_side_effect
         result = run_promotions()
-        self.assertEqual(result["pending"], 0)
+        # FAILED_RETRYABLE is now in _RETRYABLE_PROMOTION_STATES, so pending=1
+        # Candidate not found → FAILED_RETRYABLE (counted as "failed")
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["promoted"], 0)
+
+
+class PromotionIntegrationTests(unittest.TestCase):
+    """Integration tests with a realistic in-memory mock of promote_candidate_to_master."""
+
+    def _mock_sheets_service(self):
+        svc = Mock()
+        svc.spreadsheets().values().get.return_value.execute.return_value = {"values": []}
+        svc.spreadsheets().values().append.return_value.execute.return_value = {}
+        svc.spreadsheets().values().batchUpdate.return_value.execute.return_value = {}
+        return svc
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_bot.promote_candidate_to_master")
+    @patch("funnel.review_promotion.upsert_records")
+    @patch("funnel.review_promotion.append_records")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_full_pipeline_first_promotion_succeeds(
+        self, mock_svc, mock_sid, mock_ens, mock_app, mock_up, mock_promote, mock_read,
+    ) -> None:
+        """End-to-end: one APPROVED_PENDING_PROMOTION review → promoted with correct states."""
+        candidate = _eligible_candidate()
+        snapshot = compute_snapshot_hash(candidate)
+        review = _make_review(snapshot_hash=snapshot)
+        review["Review ID"] = "rev-full-001"
+
+        mock_svc.return_value = self._mock_sheets_service()
+        mock_sid.return_value = "sheet-id"
+        mock_promote.return_value = "ADDED"
+
+        def read_side_effect(svc, sid, sheet, headers):
+            if sheet == "Review_Requests":
+                return [review]
+            return [candidate]
+
+        mock_read.side_effect = read_side_effect
+
+        result = run_promotions()
+
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["promoted"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["already_exists"], 0)
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_bot.promote_candidate_to_master")
+    @patch("funnel.review_promotion.upsert_records")
+    @patch("funnel.review_promotion.append_records")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_in_memory_master_set_prevents_duplicate_promotion(
+        self, mock_svc, mock_sid, mock_ens, mock_app, mock_up, mock_promote, mock_read,
+    ) -> None:
+        """Simulate real promote_candidate_to_master: first ADDED, second ALREADY_EXISTS."""
+        candidate = _eligible_candidate()
+
+        cand_a = {**candidate, "Candidate ID": "cand-A-abc", "Ticker": "AAA"}
+        cand_b = {**candidate, "Candidate ID": "cand-B-abc", "Ticker": "AAA"}
+        hash_a = compute_snapshot_hash(cand_a)
+        hash_b = compute_snapshot_hash(cand_b)
+
+        review_a = _make_review(candidate_id="cand-A-abc", ticker="AAA", snapshot_hash=hash_a)
+        review_a["Review ID"] = "rev-A"
+        review_a["Candidate ID"] = "cand-A-abc"
+        review_a["Ticker"] = "AAA"
+
+        review_b = _make_review(candidate_id="cand-B-abc", ticker="AAA", snapshot_hash=hash_b)
+        review_b["Review ID"] = "rev-B"
+        review_b["Candidate ID"] = "cand-B-abc"
+        review_b["Ticker"] = "AAA"
+
+        # In-memory master set: tracks which tickers have been added
+        master_set: set[str] = set()
+
+        def realistic_promote(svc, sid, cand):
+            ticker = cand["Ticker"]
+            if ticker in master_set:
+                return "ALREADY_EXISTS"
+            master_set.add(ticker)
+            return "ADDED"
+
+        mock_svc.return_value = self._mock_sheets_service()
+        mock_sid.return_value = "sheet-id"
+        mock_promote.side_effect = realistic_promote
+
+        def read_side_effect(svc, sid, sheet, headers):
+            if sheet == "Review_Requests":
+                return [review_a, review_b]
+            return [cand_a, cand_b]
+
+        mock_read.side_effect = read_side_effect
+
+        result = run_promotions()
+
+        # First review for AAA gets ADDED, second gets ALREADY_EXISTS
+        self.assertEqual(result["pending"], 2)
+        self.assertEqual(result["promoted"], 1)
+        self.assertEqual(result["already_exists"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(master_set, {"AAA"})
+
+    @patch("funnel.review_promotion.read_table")
+    @patch("funnel.review_bot.promote_candidate_to_master")
+    @patch("funnel.review_promotion.upsert_records")
+    @patch("funnel.review_promotion.append_records")
+    @patch("funnel.review_promotion.ensure_review_sheets")
+    @patch("funnel.review_promotion.get_spreadsheet_id")
+    @patch("funnel.review_promotion.get_sheets_service")
+    def test_mixed_pending_states_processed_correctly(
+        self, mock_svc, mock_sid, mock_ens, mock_app, mock_up, mock_promote, mock_read,
+    ) -> None:
+        """APPROVED_PENDING_PROMOTION and FAILED_RETRYABLE both picked up."""
+        candidate = _eligible_candidate()
+        snapshot = compute_snapshot_hash(candidate)
+
+        cand_a = {**candidate, "Candidate ID": "cand-A-abc", "Ticker": "AAA"}
+        cand_b = {**candidate, "Candidate ID": "cand-B-abc", "Ticker": "BBB"}
+        hash_a = compute_snapshot_hash(cand_a)
+        hash_b = compute_snapshot_hash(cand_b)
+
+        review_pending = _make_review(candidate_id="cand-A-abc", ticker="AAA", snapshot_hash=hash_a)
+        review_pending["Review ID"] = "rev-pending"
+        review_pending["State"] = REVIEW_STATE_APPROVED_PENDING_PROMOTION
+
+        review_retry = _make_review(candidate_id="cand-B-abc", ticker="BBB", snapshot_hash=hash_b)
+        review_retry["Review ID"] = "rev-retry"
+        review_retry["State"] = REVIEW_STATE_FAILED_RETRYABLE
+
+        mock_svc.return_value = self._mock_sheets_service()
+        mock_sid.return_value = "sheet-id"
+        mock_promote.return_value = "ADDED"
+
+        def read_side_effect(svc, sid, sheet, headers):
+            if sheet == "Review_Requests":
+                return [review_pending, review_retry]
+            return [cand_a, cand_b]
+
+        mock_read.side_effect = read_side_effect
+
+        result = run_promotions()
+
+        # Both should be picked up and promoted
+        self.assertEqual(result["pending"], 2)
+        self.assertEqual(result["promoted"], 2)
+        self.assertEqual(result["failed"], 0)
 
 
 if __name__ == "__main__":
