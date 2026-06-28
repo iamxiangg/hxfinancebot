@@ -37,8 +37,8 @@ def _to_float(value: Any) -> float | None:
 
 
 def _number_text(value: float) -> str:
-    rounded = round(value, 1)
-    if rounded.is_integer():
+    rounded = round(float(value), 1)
+    if float(rounded).is_integer():
         return str(int(rounded))
     return f"{rounded:.1f}"
 
