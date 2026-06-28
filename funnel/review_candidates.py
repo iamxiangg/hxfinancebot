@@ -10,6 +10,7 @@ from funnel.btd_enrichment import fetch_yfinance_metrics, metrics_to_candidate_u
 from funnel.candidate_ingestor import classify_signals, get_pending_new_ticker_records
 from funnel.congress_adapter import run_congress_adapter
 from funnel.feroldi_ai import draft_to_candidate_updates, request_feroldi_draft
+from funnel.feroldi_gate import apply_feroldi_gate
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.insider_adapter import run_insider_adapter
 from funnel.review_schema import (
@@ -473,6 +474,31 @@ def run() -> None:
         for candidate in candidates
     ]
     candidates = add_optional_ai_drafts(service, spreadsheet_id, candidates)
+
+    feroldi_mode = os.getenv("FEROLDI_GATE_MODE", "observe")
+    feroldi_pass_threshold = _float_value(os.getenv("FEROLDI_GATE_PASS_THRESHOLD"), 30.0)
+    feroldi_review_threshold = _float_value(os.getenv("FEROLDI_GATE_REVIEW_THRESHOLD"), 25.0)
+    feroldi_min_coverage = _float_value(os.getenv("FEROLDI_GATE_MIN_COVERAGE"), 0.75)
+    feroldi_allow_review = str(os.getenv("FEROLDI_GATE_ALLOW_REVIEW", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    candidates = [
+        apply_feroldi_gate(
+            candidate,
+            mode=feroldi_mode,
+            pass_threshold=feroldi_pass_threshold,
+            review_threshold=feroldi_review_threshold,
+            min_coverage=feroldi_min_coverage,
+            allow_review=feroldi_allow_review,
+        )
+        if _active_for_enrichment(candidate) and _status_allows_reprocessing(candidate)
+        else dict(candidate)
+        for candidate in candidates
+    ]
+
     candidates = notify_candidates(candidates)
 
     upsert_records(

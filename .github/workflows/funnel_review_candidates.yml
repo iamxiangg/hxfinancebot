@@ -34,6 +34,35 @@ name: Funnel - Review Candidates
         options:
           - "false"
           - "true"
+      feroldi_gate_mode:
+        description: Observe records the gate without blocking; enforce controls Telegram eligibility
+        required: true
+        default: "observe"
+        type: choice
+        options:
+          - "off"
+          - "observe"
+          - "enforce"
+      feroldi_pass_threshold:
+        description: Equivalent first-cut points out of 42 required to pass
+        required: false
+        default: "30"
+      feroldi_review_threshold:
+        description: Equivalent first-cut points out of 42 required for human review
+        required: false
+        default: "25"
+      feroldi_min_coverage:
+        description: Minimum share of the 42 points with available data
+        required: false
+        default: "0.75"
+      feroldi_allow_review:
+        description: Allow review-band candidates to receive Telegram cards in enforce mode
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -82,6 +111,11 @@ jobs:
           INPUT_REVIEW_SOURCES: ${{ inputs.review_sources }}
           INPUT_SEND_TELEGRAM_REVIEWS: ${{ inputs.send_telegram_reviews }}
           INPUT_RESEND_TELEGRAM_REVIEWS: ${{ inputs.resend_telegram_reviews }}
+          INPUT_FEROLDI_GATE_MODE: ${{ inputs.feroldi_gate_mode }}
+          INPUT_FEROLDI_PASS_THRESHOLD: ${{ inputs.feroldi_pass_threshold }}
+          INPUT_FEROLDI_REVIEW_THRESHOLD: ${{ inputs.feroldi_review_threshold }}
+          INPUT_FEROLDI_MIN_COVERAGE: ${{ inputs.feroldi_min_coverage }}
+          INPUT_FEROLDI_ALLOW_REVIEW: ${{ inputs.feroldi_allow_review }}
         run: |
           set -euo pipefail
           echo "MIN_CONVICTION=${INPUT_MIN_CONVICTION:-15}" >> "$GITHUB_ENV"
@@ -89,6 +123,11 @@ jobs:
           echo "REVIEW_SOURCES=${INPUT_REVIEW_SOURCES:-congress,vpma,insider,manual}" >> "$GITHUB_ENV"
           echo "SEND_TELEGRAM_REVIEWS=${INPUT_SEND_TELEGRAM_REVIEWS:-true}" >> "$GITHUB_ENV"
           echo "FORCE_TELEGRAM_REVIEW_RESEND=${INPUT_RESEND_TELEGRAM_REVIEWS:-false}" >> "$GITHUB_ENV"
+          echo "FEROLDI_GATE_MODE=${INPUT_FEROLDI_GATE_MODE:-observe}" >> "$GITHUB_ENV"
+          echo "FEROLDI_GATE_PASS_THRESHOLD=${INPUT_FEROLDI_PASS_THRESHOLD:-30}" >> "$GITHUB_ENV"
+          echo "FEROLDI_GATE_REVIEW_THRESHOLD=${INPUT_FEROLDI_REVIEW_THRESHOLD:-25}" >> "$GITHUB_ENV"
+          echo "FEROLDI_GATE_MIN_COVERAGE=${INPUT_FEROLDI_MIN_COVERAGE:-0.75}" >> "$GITHUB_ENV"
+          echo "FEROLDI_GATE_ALLOW_REVIEW=${INPUT_FEROLDI_ALLOW_REVIEW:-true}" >> "$GITHUB_ENV"
           echo "VPMA_ENABLE_ENRICHMENT=true" >> "$GITHUB_ENV"
           echo "VPMA_MAX_ENRICH=20" >> "$GITHUB_ENV"
           echo "VPMA_EVENT_LOOKBACK_DAYS=90" >> "$GITHUB_ENV"
