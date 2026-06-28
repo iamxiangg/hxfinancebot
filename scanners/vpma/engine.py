@@ -12,7 +12,16 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from providers.sec.base import SECProvider
 from scanners.vpma.alpha_vantage import AlphaVantageClient, AlphaVantageConfirmation
+from scanners.vpma.guidance_extraction import extract_confirmation
+from scanners.vpma.guidance_models import EarningsFundamentalConfirmation
+from scanners.vpma.guidance_scoring import (
+    apply_economic_overlay,
+    classify_economic_event,
+    determine_conflict_type,
+    score_economic_event,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +80,11 @@ class VpmaTickerResult:
     reason: str
     valid_for_days: int
     details: dict[str, Any] = field(default_factory=dict)
+    economic_classification: str = ""
+    economic_confirmation_score: float = 0.0
+    conflict_classification: str = ""
+    guidance_action: str = ""
+    downgrade_reason: str = ""
 
 
 @dataclass
@@ -100,6 +114,8 @@ class VpmaConfig:
     wait_core_min: float = 68.0
     near_miss_core_min: float = 58.0
     next_earnings_guard_days: int = 14
+    guidance_enable: bool = True
+    guidance_max_tickers: int = 10
 
     @classmethod
     def from_env(cls) -> "VpmaConfig":
@@ -113,6 +129,8 @@ class VpmaConfig:
             min_source_volume=_env_float("VPMA_MIN_SOURCE_VOLUME", 200_000.0),
             min_median_dollar_volume=_env_float("VPMA_MIN_MEDIAN_DOLLAR_VOLUME", 5_000_000.0),
             universe_url=str(os.getenv("VPMA_UNIVERSE_URL", DEFAULT_UNIVERSE_URL)).strip() or DEFAULT_UNIVERSE_URL,
+            guidance_enable=_env_bool("VPMA_GUIDANCE_ENABLE", True),
+            guidance_max_tickers=_env_int("VPMA_GUIDANCE_MAX_TICKERS", 10),
         )
 
 
@@ -895,6 +913,73 @@ def apply_confirmation(
     return updated
 
 
+def apply_guidance_confirmation(
+    result: VpmaTickerResult,
+    confirmation: EarningsFundamentalConfirmation,
+    *,
+    industry: str = "",
+) -> VpmaTickerResult:
+    score = score_economic_event(confirmation)
+    economic_class = classify_economic_event(score, confirmation)
+    conflict = determine_conflict_type(result.classification, economic_class)
+
+    confirmation.score = score
+    confirmation.economic_classification = economic_class
+
+    new_classification, new_reason, downgrade_flags = apply_economic_overlay(
+        classification=result.classification,
+        conflict_type=conflict,
+        economic_classification=economic_class,
+        rev_guidance_action=confirmation.revenue_guidance_action,
+        reason=result.reason,
+    )
+
+    updated = VpmaTickerResult(**{**result.__dict__})
+    updated.classification = new_classification
+    updated.reason = new_reason
+    updated.economic_classification = economic_class
+    updated.economic_confirmation_score = score
+    updated.conflict_classification = conflict
+    updated.guidance_action = confirmation.revenue_guidance_action
+    updated.downgrade_reason = "; ".join(downgrade_flags) if downgrade_flags else ""
+
+    if economic_class != "ECONOMIC_UNAVAILABLE" and result.data_confidence == "low":
+        updated.data_confidence = "medium"
+
+    updated.details = dict(result.details)
+    updated.details.update(
+        {
+            "economic_classification": economic_class,
+            "economic_confirmation_score": score,
+            "conflict_classification": conflict,
+            "guidance_action": confirmation.revenue_guidance_action,
+            "margin_guidance_action": confirmation.margin_guidance_action,
+            "revenue_guidance_midpoint": confirmation.revenue_guidance_midpoint,
+            "revenue_guidance_change_pct": confirmation.revenue_guidance_change_pct,
+            "reported_revenue": confirmation.reported_revenue,
+            "revenue_growth_yoy": confirmation.revenue_growth_yoy,
+            "gross_margin_pct": confirmation.gross_margin_pct,
+            "gross_margin_change_bps": confirmation.gross_margin_change_bps,
+            "operating_margin_pct": confirmation.operating_margin_pct,
+            "free_cash_flow": confirmation.free_cash_flow,
+            "business_kpis": confirmation.business_kpis,
+            "source_accession": confirmation.source_accession,
+            "downgrade_reason": updated.downgrade_reason,
+            "downgrade_flags": downgrade_flags,
+            "evidence_references": [
+                {
+                    "field": item.field,
+                    "accession": item.accession,
+                    "document": item.document,
+                    "confidence": item.confidence,
+                }
+                for item in confirmation.evidence
+            ],
+        }
+    )
+    return updated
+
+
 def _rank_for_enrichment(result: VpmaTickerResult) -> tuple[int, float, float, float, float]:
     classification_rank = {
         "actionable": 4,
@@ -912,6 +997,46 @@ def _rank_for_enrichment(result: VpmaTickerResult) -> tuple[int, float, float, f
     )
 
 
+def _apply_guidance_pass(
+    results: list[VpmaTickerResult],
+    eligible: list[UniverseTicker],
+    config: VpmaConfig,
+    sec_provider: SECProvider,
+    errors: list[str],
+) -> None:
+    guidance_candidates = [
+        result
+        for result in results
+        if result.classification in {"actionable", "wait", "near_miss"}
+    ]
+    guidance_candidates.sort(key=_rank_for_enrichment, reverse=True)
+    selected = guidance_candidates[: config.guidance_max_tickers]
+
+    ticker_to_industry: dict[str, str] = {
+        ticker.ticker: ticker.industry for ticker in eligible
+    }
+
+    for idx, result in enumerate(selected):
+        try:
+            event_ts_str = result.details.get("earnings_timestamp", "")
+            if not event_ts_str:
+                continue
+            earnings_ts = datetime.fromisoformat(event_ts_str.replace("Z", "+00:00"))
+            industry = ticker_to_industry.get(result.ticker, "")
+            confirmation = extract_confirmation(
+                sec_provider,
+                result.ticker,
+                industry,
+                earnings_ts,
+            )
+            confirmed = apply_guidance_confirmation(result, confirmation, industry=industry)
+            results[results.index(result)] = confirmed
+        except Exception as exc:
+            logger.warning("Guidance extraction failed for %s: %s", result.ticker, exc.__class__.__name__)
+            errors.append(f"guidance:{result.ticker}:{exc.__class__.__name__}")
+            continue
+
+
 def run_vpma_scan(
     *,
     config: VpmaConfig | None = None,
@@ -920,6 +1045,7 @@ def run_vpma_scan(
     data_source: YfinanceVpmaDataSource | None = None,
     alpha_client: AlphaVantageClient | None = None,
     http_session: requests.Session | None = None,
+    sec_provider: SECProvider | None = None,
 ) -> VpmaScanResult:
     config = config or VpmaConfig.from_env()
     observed_at = observed_at or _now_iso()
@@ -1077,6 +1203,9 @@ def run_vpma_scan(
             )
             for result in results
         ]
+
+    if config.guidance_enable and sec_provider is not None:
+        _apply_guidance_pass(results, eligible, config, sec_provider, errors)
 
     return VpmaScanResult(
         results=results,

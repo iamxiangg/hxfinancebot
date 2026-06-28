@@ -32,6 +32,11 @@ def _details_from_result(result: VpmaTickerResult) -> dict[str, Any]:
             "entry_score": result.entry_score,
             "confirmation_score": result.confirmation_score,
             "data_confidence": result.data_confidence,
+            "economic_classification": result.economic_classification,
+            "economic_confirmation_score": result.economic_confirmation_score,
+            "conflict_classification": result.conflict_classification,
+            "guidance_action": result.guidance_action,
+            "downgrade_reason": result.downgrade_reason,
         }
     )
     return details
