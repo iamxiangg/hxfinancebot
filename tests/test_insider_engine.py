@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 import unittest
 from unittest.mock import patch
 
+from providers.sec.models import FilingMetadata, SECInsiderTransaction
 from scanners.insider.engine import (
     InsiderConfig,
     QualifyingPurchase,
@@ -14,7 +15,7 @@ from scanners.insider.engine import (
     run_insider_scan,
     score_cluster,
 )
-from scanners.insider.parser import MasterIndexEntry, NonDerivativeTransaction, ParsedOwnershipFiling, ReportingOwner
+from scanners.insider.parser import NonDerivativeTransaction, ParsedOwnershipFiling, ReportingOwner
 
 
 def make_purchase(
@@ -87,18 +88,25 @@ def make_purchase(
     )
 
 
-class _FakeSECClient:
-    def __init__(self, day_to_index: dict[date, str], filing_text_by_path: dict[str, str]) -> None:
-        self.day_to_index = day_to_index
-        self.filing_text_by_path = filing_text_by_path
+class _FakeSECProvider:
+    def __init__(self, day_to_filings: dict[date, list[FilingMetadata]], transactions_by_accession: dict[str, list[SECInsiderTransaction] | Exception]) -> None:
+        self.day_to_filings = day_to_filings
+        self.transactions_by_accession = transactions_by_accession
 
-    def fetch_daily_master_index(self, day: date):
-        if day not in self.day_to_index:
+    def daily_index_filings(self, day: date, *, forms=None):
+        if day not in self.day_to_filings:
             raise FileNotFoundError(str(day))
-        return type("MasterIndexFetch", (), {"day": day, "text": self.day_to_index[day]})()
+        filings = self.day_to_filings[day]
+        if not forms:
+            return filings
+        forms_filter = {item.upper() for item in forms}
+        return [filing for filing in filings if filing.form.upper() in forms_filter]
 
-    def fetch_filing_text(self, archive_path: str) -> str:
-        return self.filing_text_by_path[archive_path]
+    def form4_transactions(self, filing: FilingMetadata) -> list[SECInsiderTransaction]:
+        value = self.transactions_by_accession[filing.accession]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 class InsiderEngineTests(unittest.TestCase):
@@ -347,54 +355,50 @@ class InsiderEngineTests(unittest.TestCase):
         self.assertEqual(result.unique_insiders, 2)
 
     @patch("scanners.insider.engine._median_dollar_volume", return_value=(45.0, 20_000_000.0, []))
-    @patch("scanners.insider.engine.parse_ownership_xml")
-    @patch("scanners.insider.engine.find_ownership_xml_filename", return_value=None)
-    def test_run_scan_isolates_filing_failures(self, _mock_find_xml, mock_parse_xml, _mock_market) -> None:
+    def test_run_scan_isolates_filing_failures(self, _mock_market) -> None:
         target_day = date(2026, 6, 27)
-        index_text = "\n".join(
-            [
-                "Description:",
-                "--------------------------------------------------------------------------------",
-                "0000001|Bad Co|4|2026-06-27|edgar/data/1/bad.txt",
-                "0000002|Good Co|4|2026-06-27|edgar/data/2/good.txt",
-            ]
-        )
-        sec_client = _FakeSECClient(
-            {target_day: index_text},
+        sec_provider = _FakeSECProvider(
             {
-                "edgar/data/1/bad.txt": "<ownershipDocument />",
-                "edgar/data/2/good.txt": "<ownershipDocument />",
+                target_day: [
+                    FilingMetadata(
+                        ticker="",
+                        cik="0000000001",
+                        accession="bad",
+                        form="4",
+                        filed_at=datetime(2026, 6, 27, tzinfo=UTC),
+                        report_date=date(2026, 6, 27),
+                        primary_document="bad.txt",
+                        is_amendment=False,
+                        source_url="https://www.sec.gov/Archives/edgar/data/1/bad.txt",
+                    ),
+                    FilingMetadata(
+                        ticker="",
+                        cik="0000000002",
+                        accession="good",
+                        form="4",
+                        filed_at=datetime(2026, 6, 27, tzinfo=UTC),
+                        report_date=date(2026, 6, 27),
+                        primary_document="good.txt",
+                        is_amendment=False,
+                        source_url="https://www.sec.gov/Archives/edgar/data/2/good.txt",
+                    ),
+                ]
             },
-        )
-        mock_parse_xml.side_effect = [
-            RuntimeError("broken"),
-            ParsedOwnershipFiling(
-                accession="good",
-                issuer_cik="1",
-                issuer_ticker="TEAM",
-                acceptance_datetime="2026-06-27",
-                reporting_owners=[
-                    ReportingOwner(
-                        cik="10",
-                        name="CEO",
-                        is_director=False,
-                        is_officer=True,
-                        is_ten_percent_owner=False,
+            {
+                "bad": RuntimeError("broken"),
+                "good": [
+                    SECInsiderTransaction(
+                        ticker="TEAM",
+                        issuer_cik="1",
+                        accession="good",
+                        owner_cik="10",
+                        owner_name="CEO",
+                        owner_is_director=False,
+                        owner_is_officer=True,
+                        owner_is_ten_percent_owner=False,
                         officer_title="CEO",
-                    ),
-                    ReportingOwner(
-                        cik="11",
-                        name="CFO",
-                        is_director=False,
-                        is_officer=True,
-                        is_ten_percent_owner=False,
-                        officer_title="CFO",
-                    ),
-                ],
-                transactions=[
-                    NonDerivativeTransaction(
                         security_title="Common Stock",
-                        transaction_date="2026-06-27",
+                        transaction_date=date(2026, 6, 27),
                         transaction_code="P",
                         acquired_disposed="A",
                         shares=10_000,
@@ -402,15 +406,35 @@ class InsiderEngineTests(unittest.TestCase):
                         shares_owned_after=200_000.0,
                         direct_or_indirect="D",
                         footnotes=[],
-                    )
+                    ),
+                    SECInsiderTransaction(
+                        ticker="TEAM",
+                        issuer_cik="1",
+                        accession="good",
+                        owner_cik="11",
+                        owner_name="CFO",
+                        owner_is_director=False,
+                        owner_is_officer=True,
+                        owner_is_ten_percent_owner=False,
+                        officer_title="CFO",
+                        security_title="Common Stock",
+                        transaction_date=date(2026, 6, 27),
+                        transaction_code="P",
+                        acquired_disposed="A",
+                        shares=10_000,
+                        price_per_share=40.0,
+                        shares_owned_after=200_000.0,
+                        direct_or_indirect="D",
+                        footnotes=[],
+                    ),
                 ],
-            ),
-        ]
+            },
+        )
 
         results, receipt = run_insider_scan(
             config=InsiderConfig(lookback_days=1),
             observed_at="2026-06-27T12:00:00+00:00",
-            sec_client=sec_client,
+            sec_provider=sec_provider,
         )
 
         self.assertEqual(receipt["scanned_entries"], 2)

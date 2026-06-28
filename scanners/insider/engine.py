@@ -10,16 +10,16 @@ from typing import Any
 import requests
 import yfinance as yf
 
+from providers.sec import get_sec_provider
+from providers.sec.base import SECProvider
+from providers.sec.models import FilingMetadata, SECInsiderTransaction
 from scanners.insider.parser import (
     MasterIndexEntry,
     NonDerivativeTransaction,
     ParsedOwnershipFiling,
     ReportingOwner,
-    find_ownership_xml_filename,
-    parse_master_index,
     parse_ownership_xml,
 )
-from scanners.insider.sec_client import SECClient
 
 
 logger = logging.getLogger(__name__)
@@ -361,6 +361,63 @@ def purchase_confidence(transaction: NonDerivativeTransaction) -> str:
     return "OPEN_MARKET_HIGH_CONFIDENCE"
 
 
+def _provider_owner_role(transaction: SECInsiderTransaction) -> str:
+    title = transaction.officer_title.strip()
+    upper = title.upper()
+    if transaction.owner_is_officer:
+        if "CEO" in upper or "CHIEF EXECUTIVE" in upper or "FOUNDER" in upper:
+            return "CEO"
+        if "CFO" in upper or "CHIEF FINANCIAL" in upper:
+            return "CFO"
+        if "COO" in upper or "CHIEF OPERATING" in upper:
+            return "COO"
+        if "PRESIDENT" in upper:
+            return "President"
+        return title or "Officer"
+    if transaction.owner_is_director:
+        return "Director"
+    if transaction.owner_is_ten_percent_owner:
+        return "10% Owner"
+    return "Other"
+
+
+def _provider_owner_is_eligible(transaction: SECInsiderTransaction) -> bool:
+    return transaction.owner_is_officer or transaction.owner_is_director
+
+
+def _provider_owner_is_operating(transaction: SECInsiderTransaction) -> bool:
+    role = _provider_owner_role(transaction).lower()
+    return transaction.owner_is_officer and ("director" not in role)
+
+
+def _provider_transaction_exclusion_reason(transaction: SECInsiderTransaction) -> str | None:
+    if transaction.transaction_code in EXCLUDED_CODES:
+        return f"excluded_code_{transaction.transaction_code}"
+    if transaction.transaction_code != "P":
+        return "unsupported_code"
+    if transaction.acquired_disposed.upper() != "A":
+        return "not_acquired"
+    if transaction.shares <= 0 or transaction.price_per_share <= 0:
+        return "invalid_shares_or_price"
+    text = " | ".join([transaction.security_title] + list(transaction.footnotes)).lower()
+    if any(token in text for token in EXCLUDED_TEXT_TOKENS):
+        return "excluded_context"
+    if not security_is_common_equity(transaction.security_title):
+        return "non_common_equity"
+    return None
+
+
+def _provider_purchase_confidence(transaction: SECInsiderTransaction) -> str:
+    text = " | ".join([transaction.security_title] + list(transaction.footnotes)).lower()
+    if any(token in text for token in ("private placement", "subscription agreement", "purchase agreement", "pipe", "registered direct")):
+        return "PRIVATE_OR_FINANCING"
+    if "10b5-1" in text or "10b5" in text:
+        return "OPEN_MARKET_MEDIUM_CONFIDENCE"
+    if transaction.direct_or_indirect.upper() == "I":
+        return "OPEN_MARKET_MEDIUM_CONFIDENCE"
+    return "OPEN_MARKET_HIGH_CONFIDENCE"
+
+
 def parse_filing_purchases(
     filing: ParsedOwnershipFiling,
     *,
@@ -545,6 +602,193 @@ def parse_filing_purchases(
                     is_current_trigger=True,
                 )
             )
+    return purchases, ledger_rows
+
+
+def parse_provider_filing_purchases(
+    filing: FilingMetadata,
+    transactions: list[SECInsiderTransaction],
+    *,
+    observed_at: str = "",
+) -> tuple[list[QualifyingPurchase], list[dict[str, Any]]]:
+    purchases: list[QualifyingPurchase] = []
+    ledger_rows: list[dict[str, Any]] = []
+    fallback_filing_date = filing.report_date or filing.filed_at.date()
+    eligible_transactions = [item for item in transactions if _provider_owner_is_eligible(item)]
+    ticker = next((item.ticker for item in transactions if item.ticker), filing.ticker).upper()
+    issuer_cik = next((item.issuer_cik for item in transactions if item.issuer_cik), filing.cik)
+    if not eligible_transactions:
+        ledger_rows.append(
+            {
+                "accession": filing.accession,
+                "issuer_cik": issuer_cik,
+                "ticker": ticker,
+                "filing_date": fallback_filing_date.isoformat(),
+                "decision": "EXCLUDED",
+                "reason": "no_eligible_owner",
+                "qualification_decision": "EXCLUDED",
+                "qualification_reason": "no_eligible_owner",
+                "observed_at": observed_at,
+            }
+        )
+        return purchases, ledger_rows
+
+    for transaction in eligible_transactions:
+        role = _provider_owner_role(transaction)
+        transaction_date = transaction.transaction_date
+        if transaction_date is None:
+            ledger_rows.append(
+                {
+                    "accession": filing.accession,
+                    "issuer_cik": issuer_cik,
+                    "ticker": ticker,
+                    "owner_cik": transaction.owner_cik,
+                    "owner_name": transaction.owner_name,
+                    "owner_role": role,
+                    "officer_title": transaction.officer_title,
+                    "filing_date": fallback_filing_date.isoformat(),
+                    "transaction_date": "",
+                    "security_title": transaction.security_title,
+                    "shares": transaction.shares,
+                    "price_per_share": transaction.price_per_share,
+                    "transaction_value": transaction.shares * transaction.price_per_share,
+                    "direct_or_indirect": transaction.direct_or_indirect.upper(),
+                    "decision": "EXCLUDED",
+                    "reason": "invalid_transaction_date",
+                    "qualification_decision": "EXCLUDED",
+                    "qualification_reason": "invalid_transaction_date",
+                    "confidence": "",
+                    "observed_at": observed_at,
+                }
+            )
+            continue
+        transaction_value = transaction.shares * transaction.price_per_share
+        reason = _provider_transaction_exclusion_reason(transaction)
+        transaction_group_key = build_transaction_group_key(
+            issuer_cik=issuer_cik,
+            owner_cik=transaction.owner_cik,
+            transaction_date=transaction_date,
+            security_title=transaction.security_title,
+            direct_or_indirect=transaction.direct_or_indirect,
+        )
+        transaction_key = build_transaction_key(
+            issuer_cik=issuer_cik,
+            owner_cik=transaction.owner_cik,
+            accession=filing.accession,
+            transaction_date=transaction_date,
+            security_title=transaction.security_title,
+            direct_or_indirect=transaction.direct_or_indirect,
+            shares=transaction.shares,
+            price_per_share=transaction.price_per_share,
+        )
+        source_fingerprint = build_source_fingerprint(
+            accession=filing.accession,
+            issuer_cik=issuer_cik,
+            owner_cik=transaction.owner_cik,
+            transaction_date=transaction_date,
+            security_title=transaction.security_title,
+            shares=transaction.shares,
+            price_per_share=transaction.price_per_share,
+            direct_or_indirect=transaction.direct_or_indirect,
+            footnotes=transaction.footnotes,
+        )
+        row_base = {
+            "transaction_key": transaction_key,
+            "transaction_group_key": transaction_group_key,
+            "source_fingerprint": source_fingerprint,
+            "accession": filing.accession,
+            "issuer_cik": issuer_cik,
+            "ticker": ticker,
+            "owner_cik": transaction.owner_cik,
+            "owner_name": transaction.owner_name,
+            "owner_role": role,
+            "officer_title": transaction.officer_title,
+            "owner_is_operating": _provider_owner_is_operating(transaction),
+            "owner_is_director": transaction.owner_is_director,
+            "owner_is_officer": transaction.owner_is_officer,
+            "owner_is_ten_percent_owner": transaction.owner_is_ten_percent_owner,
+            "transaction_date": transaction_date.isoformat(),
+            "filing_date": fallback_filing_date.isoformat(),
+            "security_title": transaction.security_title,
+            "shares": transaction.shares,
+            "price_per_share": transaction.price_per_share,
+            "transaction_value": transaction_value,
+            "direct_or_indirect": transaction.direct_or_indirect.upper(),
+            "plan_10b5_1": any("10b5" in footnote.lower() for footnote in transaction.footnotes),
+            "shares_owned_after": transaction.shares_owned_after,
+            "observed_at": observed_at,
+        }
+        if reason:
+            ledger_rows.append(
+                {
+                    **row_base,
+                    "decision": "EXCLUDED",
+                    "reason": reason,
+                    "qualification_decision": "EXCLUDED",
+                    "qualification_reason": reason,
+                    "confidence": "",
+                }
+            )
+            continue
+
+        confidence = _provider_purchase_confidence(transaction)
+        if confidence not in {"OPEN_MARKET_HIGH_CONFIDENCE", "OPEN_MARKET_MEDIUM_CONFIDENCE"}:
+            ledger_rows.append(
+                {
+                    **row_base,
+                    "decision": "EXCLUDED",
+                    "reason": confidence.lower(),
+                    "qualification_decision": "EXCLUDED",
+                    "qualification_reason": confidence.lower(),
+                    "confidence": confidence,
+                }
+            )
+            continue
+
+        ledger_rows.append(
+            {
+                **row_base,
+                "decision": "QUALIFIED",
+                "reason": role,
+                "qualification_decision": "QUALIFIED",
+                "qualification_reason": role,
+                "confidence": confidence,
+            }
+        )
+        purchases.append(
+            QualifyingPurchase(
+                ticker=ticker,
+                issuer_cik=issuer_cik,
+                accession=filing.accession,
+                owner_cik=transaction.owner_cik,
+                owner_name=transaction.owner_name,
+                owner_role=role,
+                owner_is_operating=_provider_owner_is_operating(transaction),
+                owner_is_director=transaction.owner_is_director,
+                owner_is_officer=transaction.owner_is_officer,
+                owner_is_ten_percent_owner=transaction.owner_is_ten_percent_owner,
+                officer_title=transaction.officer_title,
+                transaction_date=transaction_date,
+                filing_date=fallback_filing_date,
+                security_title=transaction.security_title,
+                shares=transaction.shares,
+                price_per_share=transaction.price_per_share,
+                transaction_value=transaction_value,
+                direct_or_indirect=transaction.direct_or_indirect.upper(),
+                plan_10b5_1=any("10b5" in footnote.lower() for footnote in transaction.footnotes),
+                confidence=confidence,
+                shares_owned_after=transaction.shares_owned_after,
+                transaction_row_count=1,
+                footnotes=transaction.footnotes,
+                qualification_decision="QUALIFIED",
+                qualification_reason=role,
+                observed_at=observed_at,
+                transaction_key=transaction_key,
+                transaction_group_key=transaction_group_key,
+                source_fingerprint=source_fingerprint,
+                is_current_trigger=True,
+            )
+        )
     return purchases, ledger_rows
 
 
@@ -879,17 +1123,14 @@ def run_insider_scan(
     *,
     config: InsiderConfig | None = None,
     observed_at: str | None = None,
-    sec_client: SECClient | None = None,
+    sec_provider: SECProvider | None = None,
     prior_accessions: set[str] | None = None,
     prior_purchases: list[QualifyingPurchase] | None = None,
 ) -> tuple[list[InsiderTickerResult], dict[str, Any]]:
     config = config or InsiderConfig.from_env()
     if not config.enable:
         return [], {"scanned_entries": 0, "qualifying_purchases": 0, "processed_accessions": []}
-    sec_client = sec_client or SECClient(
-        timeout_seconds=config.request_timeout,
-        max_requests_per_second=config.max_sec_requests_per_second,
-    )
+    sec_provider = sec_provider or get_sec_provider()
     observed = datetime.fromisoformat((observed_at or datetime.now(UTC).isoformat()).replace("Z", "+00:00"))
     history_since = observed.date() - timedelta(days=max(0, config.history_days))
     seen_accessions = set(prior_accessions or set())
@@ -907,26 +1148,20 @@ def run_insider_scan(
     for offset in range(config.lookback_days):
         day = (observed.date() - timedelta(days=offset))
         try:
-            index = sec_client.fetch_daily_master_index(day)
+            entries = sec_provider.daily_index_filings(day, forms={"4", "4/A"})
         except FileNotFoundError:
             continue
-        entries = [entry for entry in parse_master_index(index.text) if entry.form_type in {"4", "4/A"}]
-        for entry in entries:
-            accession = entry.archive_path.rsplit("/", 1)[-1].replace(".txt", "")
+        for filing_metadata in entries:
+            accession = filing_metadata.accession
             if accession in seen_accessions:
                 continue
             try:
                 scanned_entries += 1
-                filing_text = sec_client.fetch_filing_text(entry.archive_path)
-                xml_name = find_ownership_xml_filename(filing_text)
-                xml_text = filing_text if xml_name is None and "<ownershipDocument" in filing_text else sec_client.fetch_filing_text(
-                    f"{entry.archive_path.rsplit('/', 1)[0]}/{xml_name}"
-                )
-                filing = parse_ownership_xml(xml_text, accession=accession)
+                transactions = sec_provider.form4_transactions(filing_metadata)
                 processed_accessions.add(accession)
-                parsed_purchases, parsed_ledger_rows = parse_filing_purchases(
-                    filing,
-                    filing_date=_safe_iso_date(entry.date_filed),
+                parsed_purchases, parsed_ledger_rows = parse_provider_filing_purchases(
+                    filing_metadata,
+                    transactions,
                     observed_at=observed.replace(microsecond=0).isoformat(),
                 )
                 ledger_rows.extend(parsed_ledger_rows)
