@@ -99,7 +99,7 @@ def ensure_headers(
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"'{sheet_name}'!A1:{end_col}1",
-            valueInputOption="USER_ENTERED",
+            valueInputOption="RAW",
             body={"values": [headers]},
         ).execute()
 
@@ -140,7 +140,7 @@ def append_records(
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"'{sheet_name}'!A1",
-        valueInputOption="USER_ENTERED",
+        valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": values},
     ).execute()
@@ -201,7 +201,7 @@ def upsert_records(
         service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={
-                "valueInputOption": "USER_ENTERED",
+                "valueInputOption": "RAW",
                 "data": update_data,
             },
         ).execute()

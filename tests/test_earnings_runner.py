@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 from scanners.earnings.models import EarningsOpportunity, EarningsScanResult
 from tactical.earnings_runner import run_exit, run_screen
 from tactical.earnings_state import load_state, notification_key, record_pre_event_notification, save_state
-from tactical.earnings_telegram import _split_telegram_text
 
 
 NY = ZoneInfo("America/New_York")
@@ -77,11 +76,12 @@ class EarningsRunnerTests(unittest.TestCase):
         ), patch("tactical.earnings_runner.run_earnings_scan", return_value=EarningsScanResult([opportunity], counts={})), patch(
             "tactical.earnings_runner.send_telegram_text", return_value=True
         ), patch("tactical.earnings_runner.format_screen_report", return_value="report"):
-            count = run_screen(now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=NY))
+            outcome = run_screen(now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=NY))
             state = load_state()
 
         key = notification_key("NVDA", "2026-08-19", "AMC")
-        self.assertEqual(count, 1)
+        self.assertEqual(outcome.delivery_succeeded, 1)
+        self.assertEqual(outcome.exit_code, 0)
         self.assertIn(key, state)
         self.assertTrue(state[key]["pre_event_notified_at"])
 
@@ -94,10 +94,11 @@ class EarningsRunnerTests(unittest.TestCase):
         ), patch("tactical.earnings_runner.run_earnings_scan", return_value=EarningsScanResult([opportunity], counts={})), patch(
             "tactical.earnings_runner.send_telegram_text", return_value=False
         ), patch("tactical.earnings_runner.format_screen_report", return_value="report"):
-            count = run_screen(now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=NY))
+            outcome = run_screen(now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=NY))
             state = load_state()
 
-        self.assertEqual(count, 0)
+        self.assertEqual(outcome.delivery_failed, 1)
+        self.assertEqual(outcome.delivery_succeeded, 0)
         self.assertEqual(state, {})
 
     def test_failed_candidate_is_retried_on_next_run(self) -> None:
@@ -116,15 +117,15 @@ class EarningsRunnerTests(unittest.TestCase):
             state = load_state()
 
         key = notification_key("NVDA", "2026-08-19", "AMC")
-        self.assertEqual(first, 0)
-        self.assertEqual(second, 1)
+        self.assertEqual(first.delivery_failed, 1)
+        self.assertEqual(first.delivery_succeeded, 0)
+        self.assertEqual(second.delivery_succeeded, 1)
         self.assertIn(key, state)
 
-    def test_failed_multi_chunk_delivery_leaves_all_candidates_retryable(self) -> None:
+    def test_per_candidate_delivery_success_and_failure(self) -> None:
+        """Per-candidate delivery: first candidate succeeds and is persisted, second candidate fails and is retryable."""
         first_opportunity = make_opportunity("NVDA")
         second_opportunity = make_opportunity("MSFT")
-        long_report = "\n".join([f"Line {index} {'x' * 200}" for index in range(60)])
-        chunk_count = len(_split_telegram_text(long_report))
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             "os.environ",
             {
@@ -136,35 +137,42 @@ class EarningsRunnerTests(unittest.TestCase):
         ), patch(
             "tactical.earnings_runner.run_earnings_scan",
             return_value=EarningsScanResult([first_opportunity, second_opportunity], counts={}),
-        ), patch("tactical.earnings_runner.format_screen_report", return_value=long_report), patch(
-            "tactical.earnings_telegram.requests.post"
-        ) as mock_post:
-            first_response = unittest.mock.Mock()
-            first_response.raise_for_status.return_value = None
-            first_response.json.return_value = {"ok": True}
-            second_response = unittest.mock.Mock()
-            second_response.raise_for_status.side_effect = RuntimeError("bad chunk")
-            mock_post.side_effect = [first_response, second_response]
+        ), patch(
+            "tactical.earnings_runner.send_telegram_text"
+        ) as mock_send:
+            # First candidate succeeds, second fails
+            mock_send.side_effect = [True, False]
 
             first = run_screen(now_ny=datetime(2026, 8, 19, 14, 35, tzinfo=NY))
-            self.assertEqual(load_state(), {})
+            first_state = load_state()
 
-            successful_responses = []
-            for _ in range(chunk_count):
-                response = unittest.mock.Mock()
-                response.raise_for_status.return_value = None
-                response.json.return_value = {"ok": True}
-                successful_responses.append(response)
-            mock_post.reset_mock()
-            mock_post.side_effect = successful_responses
+        # NVDA delivered successfully, MSFT failed → retryable
+        self.assertEqual(first.delivery_succeeded, 1)
+        self.assertEqual(first.delivery_failed, 1)
+        nvda_key = notification_key("NVDA", "2026-08-19", "AMC")
+        msft_key = notification_key("MSFT", "2026-08-19", "AMC")
+        self.assertIn(nvda_key, first_state)
+        self.assertNotIn(msft_key, first_state)
 
+        # On next run, MSFT is retried and now succeeds
+        with tempfile.TemporaryDirectory() as temp_dir2, patch.dict(
+            "os.environ",
+            {
+                "EARNINGS_STATE_PATH": str(Path(temp_dir2) / "state.json"),
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_CHAT_ID": "chat",
+            },
+            clear=False,
+        ), patch(
+            "tactical.earnings_runner.run_earnings_scan",
+            return_value=EarningsScanResult([second_opportunity], counts={}),
+        ), patch(
+            "tactical.earnings_runner.send_telegram_text", return_value=True
+        ):
             second = run_screen(now_ny=datetime(2026, 8, 19, 14, 40, tzinfo=NY))
-            state = load_state()
 
-        self.assertEqual(first, 0)
-        self.assertEqual(second, 1)
-        self.assertIn(notification_key("NVDA", "2026-08-19", "AMC"), state)
-        self.assertIn(notification_key("MSFT", "2026-08-19", "AMC"), state)
+        self.assertEqual(second.delivery_succeeded, 1)
+        self.assertEqual(second.delivery_failed, 0)
 
     def test_already_delivered_actionable_candidates_excluded_from_normal_report(self) -> None:
         delivered = make_opportunity("NVDA")
@@ -195,11 +203,10 @@ class EarningsRunnerTests(unittest.TestCase):
             )
             save_state(state)
             run_screen(now_ny=now)
-            report_opportunities = mock_format.call_args.kwargs["now_ny"], mock_format.call_args.args[0]
+            # format_screen_report now only receives watch/non-actionable candidates (AAPL)
+            report_opportunities = mock_format.call_args.args[0]
 
-        sent_opportunities = report_opportunities[1]
-        self.assertEqual([item.ticker for item in sent_opportunities], ["MSFT", "AAPL"])
-        mock_send.assert_called_once()
+        self.assertEqual([item.ticker for item in report_opportunities], ["AAPL"])
 
     def test_only_newly_delivered_actionable_candidates_are_added_to_state(self) -> None:
         delivered = make_opportunity("NVDA")
@@ -293,10 +300,11 @@ class EarningsRunnerTests(unittest.TestCase):
                 pre_event_implied_move_pct=0.09,
             )
             save_state(state)
-            count = run_exit(now_ny=now, data_source=_FakeExitDataSource())
+            outcome = run_exit(now_ny=now, data_source=_FakeExitDataSource())
             saved = load_state()
 
-        self.assertEqual(count, 0)
+        self.assertEqual(outcome.delivery_succeeded, 0)
+        self.assertEqual(outcome.delivery_failed, 1)
         self.assertFalse(saved[key].get("exit_notified_at"))
 
     def test_no_duplicate_exit_reminder_is_sent(self) -> None:
@@ -328,8 +336,8 @@ class EarningsRunnerTests(unittest.TestCase):
             first = run_exit(now_ny=now, data_source=_FakeExitDataSource())
             second = run_exit(now_ny=now, data_source=_FakeExitDataSource())
 
-        self.assertEqual(first, 1)
-        self.assertEqual(second, 0)
+        self.assertEqual(first.delivery_succeeded, 1)
+        self.assertEqual(second.delivery_succeeded, 0)
         self.assertEqual(mock_send.call_count, 1)
 
 

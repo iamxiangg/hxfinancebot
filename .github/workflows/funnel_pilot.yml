@@ -84,7 +84,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: funnel-pilot
+  group: funnel-review-v3
+  queue: max
   cancel-in-progress: false
 
 jobs:

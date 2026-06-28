@@ -15,6 +15,8 @@ from funnel.review_schema import (
     INSIDER_LEDGER_SHEET,
     MANUAL_SEED_HEADERS,
     MANUAL_SEED_SHEET,
+    REVIEW_REQUESTS_HEADERS,
+    REVIEW_REQUESTS_SHEET,
     SIGNAL_LOG_HEADERS,
     SIGNAL_LOG_SHEET,
 )
@@ -31,6 +33,7 @@ def ensure_review_sheets(service, spreadsheet_id: str) -> None:
         (MANUAL_SEED_SHEET, MANUAL_SEED_HEADERS),
         (CONGRESS_LEDGER_SHEET, CONGRESS_LEDGER_HEADERS),
         (INSIDER_LEDGER_SHEET, INSIDER_LEDGER_HEADERS),
+        (REVIEW_REQUESTS_SHEET, REVIEW_REQUESTS_HEADERS),
     ]
     for sheet_name, headers in sheets:
         ensure_sheet(service, spreadsheet_id, sheet_name, headers)

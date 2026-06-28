@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: funnel-review-v2
+  group: funnel-review-v3
+  queue: max
   cancel-in-progress: false
 
 jobs:

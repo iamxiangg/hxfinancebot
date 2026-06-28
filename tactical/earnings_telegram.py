@@ -95,6 +95,61 @@ def _money_per_spread(value: float | None) -> str:
     return f"${value:,.0f}"
 
 
+# ---------------------------------------------------------------------------
+# Per-candidate alert (Follow-up F2: one message per actionable candidate)
+# ---------------------------------------------------------------------------
+
+def format_candidate_message(item: EarningsOpportunity, *, now_ny: datetime) -> str:
+    """Format a standalone alert for a single actionable earnings opportunity."""
+    timing_text = "After close today" if item.earnings_timing == "AMC" else "Before open next session"
+    lines = [
+        f"EARNINGS SHORT-VOL: {item.ticker}",
+        f"Date: {now_ny.strftime('%d %B %Y')}  {now_ny.strftime('%H:%M ET')}",
+        "",
+        f"Classification: {item.classification.replace('_', ' ')}",
+        f"Score: {item.total_score:.0f}/100",
+        "",
+        f"- Earnings: {timing_text}",
+        f"- Spot: {_money(item.spot_price)}",
+        f"- Implied move: +/- {_pct(item.implied_move_pct)}",
+        f"- Historical median move: {_pct(item.historical_median_move)}",
+        f"- Historical p75: {_pct(item.historical_p75_move)}",
+        f"- Historical p90: {_pct(item.historical_p90_move)}",
+    ]
+    if item.move_richness_median is not None:
+        lines.append(f"- Median richness: {item.move_richness_median:.2f}x")
+    if item.historical_breach_rate is not None:
+        lines.append(f"- Historical breaches: {int(round(item.historical_breach_rate * item.historical_event_count))} of {item.historical_event_count}")
+    lines.extend([
+        f"- Event purity: {item.event_purity.title()}",
+        f"- Liquidity: {item.liquidity_status.title()}",
+        f"- Data confidence: {item.data_confidence}",
+    ])
+    if item.short_strike is not None:
+        lines.extend([
+            "",
+            "Proposed defined-risk structure:",
+            f"- Sell {item.short_strike:.2f} call and {item.short_strike:.2f} put",
+            f"- Buy {item.long_call_strike:.2f} call and {item.long_put_strike:.2f} put",
+            f"- Estimated midpoint credit: {_money(item.estimated_credit)}",
+            f"- Estimated maximum profit: {_money_per_spread(item.estimated_max_profit)}",
+            f"- Estimated maximum loss: {_money_per_spread(item.estimated_max_loss)}",
+            f"- Estimated breakevens: {_money(item.lower_breakeven)}-{_money(item.upper_breakeven)}",
+        ])
+    risk_str = ', '.join(item.risk_flags) if item.risk_flags else 'None'
+    lines.extend([
+        "",
+        f"Risk flags: {risk_str}",
+        "",
+        "Current event pricing appears rich relative to historical realised earnings moves.",
+        "Verify earnings timing and live broker quotes before entering.",
+        "Close after the announcement during the first liquid opening quotes.",
+        "",
+        "This system does not execute trades.",
+    ])
+    return "\n".join(lines)
+
+
 def format_screen_report(opportunities: list[EarningsOpportunity], *, now_ny: datetime) -> str | None:
     send_empty = str(os.getenv("EARNINGS_SEND_EMPTY_REPORT", "false")).strip().lower() in {"1", "true", "yes", "on"}
     actionable_like = [

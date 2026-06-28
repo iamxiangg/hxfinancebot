@@ -20,7 +20,7 @@ from scanners.earnings.event_history import (
     trading_sessions_from_history,
 )
 from scanners.earnings.market_data import YahooEarningsDataSource, average_dollar_volume
-from scanners.earnings.models import EarningsOpportunity, EarningsScanResult
+from scanners.earnings.models import EarningsOpportunity, EarningsScanResult, ScanHealth
 from scanners.earnings.pricing import (
     LiquidityThresholds,
     build_iron_butterfly,
@@ -133,6 +133,19 @@ def run_earnings_scan(
         configured_tickers=_configured_tickers(),
         max_tickers=config.max_tickers,
     )
+
+    # --- Health tracking (Workstream E2) ---
+    health = ScanHealth(
+        status="HEALTHY",
+        universe_source=universe.source,
+        universe_size=len(universe.tickers),
+    )
+    if universe.source == "fallback":
+        health.status = "FAILED"
+        health.health_reasons.append("universe_fallback_used")
+    elif universe.source == "cache":
+        health.status = "DEGRADED"
+        health.health_reasons.append("universe_from_cache")
 
     thresholds = LiquidityThresholds(
         min_leg_open_interest=config.min_leg_open_interest,
@@ -338,6 +351,8 @@ def run_earnings_scan(
         except Exception as exc:
             counts["errors"] += 1
             errors.append(f"{ticker}:{exc.__class__.__name__}")
+            error_class = exc.__class__.__name__
+            health.provider_failure_categories[error_class] = health.provider_failure_categories.get(error_class, 0) + 1
             logger.exception("Earnings scanner ticker failed for %s", ticker)
 
     ranking = {
@@ -347,5 +362,30 @@ def run_earnings_scan(
         "MANUAL_CONFIRMATION_REQUIRED": 1,
         "REJECTED": 0,
     }
+    # --- Finalise health ---
+    health.history_attempts = len(universe.tickers)
+    health.earnings_attempts = counts.get("earnings_candidates", 0)
+    health.confirmed_upcoming = counts.get("timing_confirmed", 0)
+    health.history_ok = counts.get("historical_datasets_usable", 0)
+    health.option_expiry_attempts = counts.get("earnings_candidates", 0)
+    health.option_expiry_success = counts.get("option_chains_retrieved", 0)
+    health.option_chain_attempts = counts.get("option_chains_retrieved", 0)
+    health.option_chain_success = counts.get("option_chains_retrieved", 0)
+    health.history_failures = counts.get("errors", 0)
+
+    # --- Health policy (Workstream E3) ---
+    if health.status != "FAILED" and len(universe.tickers) == 0:
+        health.status = "FAILED"
+        health.health_reasons.append("empty_universe")
+
+    if health.status != "FAILED" and health.history_failures >= health.history_attempts and health.history_attempts > 0:
+        health.status = "FAILED"
+        health.health_reasons.append("total_provider_failure")
+
     opportunities.sort(key=lambda item: (ranking.get(item.classification, 0), item.total_score), reverse=True)
-    return EarningsScanResult(opportunities=opportunities[: config.max_candidates], counts=counts, errors=errors)
+    return EarningsScanResult(
+        opportunities=opportunities[: config.max_candidates],
+        counts=counts,
+        errors=errors,
+        health=health,
+    )

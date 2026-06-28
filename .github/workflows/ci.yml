@@ -1,0 +1,83 @@
+name: CI
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Check Python compilation
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel scanners tactical tests
+
+      - name: Run full test suite
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Validate workflow configurations
+        run: |
+          set -euo pipefail
+          python -c "
+import sys, glob
+issues = []
+for path in sorted(glob.glob('.github/workflows/*.yml')):
+    with open(path) as fh:
+        text = fh.read()
+    lines = text.split('\\n')
+    concurrency_section = False
+    group = ''
+    cancel = ''
+    queue_opt = ''
+    for line in lines:
+        stripped = line.strip()
+        if stripped == 'concurrency:':
+            concurrency_section = True
+            continue
+        if concurrency_section:
+            if stripped.startswith('group:'):
+                group = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('cancel-in-progress:'):
+                cancel = stripped.split(':', 1)[1].strip()
+            elif stripped.startswith('queue:'):
+                queue_opt = stripped.split(':', 1)[1].strip()
+            elif not stripped.startswith('-') and stripped and not stripped[0].isspace():
+                concurrency_section = False
+        if group.startswith('funnel-review-v3'):
+            break
+    if 'funnel-review-v3' in group:
+        if cancel and cancel != 'false':
+            issues.append(f'{path}: cancel-in-progress should be false, got {cancel}')
+        if queue_opt and queue_opt != 'max':
+            issues.append(f'{path}: queue should be max, got {queue_opt}')
+if issues:
+    print('\\n'.join(issues))
+    sys.exit(1)
+print('Workflow validation passed.')
+"

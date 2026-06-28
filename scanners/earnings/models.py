@@ -123,8 +123,32 @@ class EarningsOpportunity:
 
 
 @dataclass
+class ScanHealth:
+    """Workstream E2: typed health object for earnings scan results."""
+    status: str  # HEALTHY, DEGRADED, FAILED
+    universe_source: str
+    universe_size: int
+    history_attempts: int = 0
+    history_ok: int = 0
+    history_ok_empty: int = 0
+    history_failures: int = 0
+    earnings_attempts: int = 0
+    earnings_ok: int = 0
+    earnings_ok_empty: int = 0
+    earnings_failures: int = 0
+    confirmed_upcoming: int = 0
+    option_expiry_attempts: int = 0
+    option_expiry_success: int = 0
+    option_chain_attempts: int = 0
+    option_chain_success: int = 0
+    provider_failure_categories: dict[str, int] = field(default_factory=dict)
+    health_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
 class EarningsScanResult:
     opportunities: list[EarningsOpportunity]
     counts: dict[str, int]
     errors: list[str] = field(default_factory=list)
+    health: ScanHealth | None = None
 

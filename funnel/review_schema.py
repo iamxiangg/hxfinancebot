@@ -12,6 +12,7 @@ DECISION_LOG_SHEET = "Decision_Log"
 MANUAL_SEED_SHEET = "Manual_Seed_Tickers"
 CONGRESS_LEDGER_SHEET = "Congress_Ledger"
 INSIDER_LEDGER_SHEET = "Insider_Ledger"
+REVIEW_REQUESTS_SHEET = "Review_Requests"
 
 
 CANDIDATE_ACTIVE_STATUSES = {
@@ -31,6 +32,53 @@ CANDIDATE_FINAL_STATUSES = {
     "REJECTED",
     "ARCHIVED",
 }
+
+
+# --- Review request explicit states (Workstream A3) ---
+
+REVIEW_STATE_PENDING_SEND = "PENDING_SEND"
+REVIEW_STATE_SENT = "SENT"
+REVIEW_STATE_APPROVED_PENDING_PROMOTION = "APPROVED_PENDING_PROMOTION"
+REVIEW_STATE_REJECTED = "REJECTED"
+REVIEW_STATE_ARCHIVED = "ARCHIVED"
+REVIEW_STATE_EXPIRED = "EXPIRED"
+REVIEW_STATE_PROMOTED = "PROMOTED"
+REVIEW_STATE_ALREADY_EXISTS = "ALREADY_EXISTS"
+REVIEW_STATE_STALE_REVIEW = "STALE_REVIEW"
+REVIEW_STATE_FAILED_RETRYABLE = "FAILED_RETRYABLE"
+
+REVIEW_TERMINAL_STATES = frozenset({
+    REVIEW_STATE_REJECTED,
+    REVIEW_STATE_ARCHIVED,
+    REVIEW_STATE_EXPIRED,
+    REVIEW_STATE_PROMOTED,
+    REVIEW_STATE_ALREADY_EXISTS,
+    REVIEW_STATE_STALE_REVIEW,
+})
+
+REVIEW_PERMITTED_TRANSITIONS: dict[str, frozenset[str]] = {
+    REVIEW_STATE_PENDING_SEND: frozenset({REVIEW_STATE_SENT, REVIEW_STATE_FAILED_RETRYABLE}),
+    REVIEW_STATE_SENT: frozenset({
+        REVIEW_STATE_APPROVED_PENDING_PROMOTION,
+        REVIEW_STATE_REJECTED,
+        REVIEW_STATE_ARCHIVED,
+        REVIEW_STATE_EXPIRED,
+    }),
+    REVIEW_STATE_APPROVED_PENDING_PROMOTION: frozenset({
+        REVIEW_STATE_PROMOTED,
+        REVIEW_STATE_ALREADY_EXISTS,
+        REVIEW_STATE_STALE_REVIEW,
+        REVIEW_STATE_FAILED_RETRYABLE,
+    }),
+}
+
+
+def is_valid_review_transition(current: str, target: str) -> bool:
+    return target in REVIEW_PERMITTED_TRANSITIONS.get(current, frozenset())
+
+
+def is_terminal_review_state(state: str) -> bool:
+    return state in REVIEW_TERMINAL_STATES
 
 
 SIGNAL_LOG_HEADERS = [
@@ -140,6 +188,29 @@ FEROLDI_AI_DRAFT_HEADERS = [
 BOT_STATE_HEADERS = [
     "Key",
     "Value",
+    "Updated At",
+]
+
+
+REVIEW_REQUESTS_HEADERS = [
+    "Review ID",
+    "Candidate ID",
+    "Ticker",
+    "Candidate Snapshot Hash",
+    "State",
+    "Issued At",
+    "Expires At",
+    "Telegram Chat ID",
+    "Telegram Message ID",
+    "Decision",
+    "Decision At",
+    "Decision By User ID",
+    "Decision By Username",
+    "Telegram Update ID",
+    "Promotion Result",
+    "Promotion At",
+    "Last Error",
+    "Created At",
     "Updated At",
 ]
 
