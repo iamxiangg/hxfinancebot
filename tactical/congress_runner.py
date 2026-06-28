@@ -75,6 +75,12 @@ def rank(result) -> tuple[float, float, float]:
 
 def note(result) -> str:
     parts = []
+    if result.role_relevance_score:
+        parts.append(f"role relevance {result.role_relevance_score:.0f}/20")
+    if result.committee_names:
+        parts.append(f"top match {result.committee_names[0]}")
+    elif result.agency_keys:
+        parts.append(f"top match {result.agency_keys[0].replace('_', ' ')}")
     if result.call_mid:
         parts.append(f"Calls {money(result.call_mid)}, call bonus +{result.call_bonus:.0f}")
     if result.put_mid:
@@ -92,12 +98,13 @@ def line(result) -> str:
     prefix = "BUYER CLUSTER " if result.cluster_buyers >= 2 else ""
     extra = f" | {note(result)}" if note(result) else ""
     names = ", ".join(result.names[:4])
+    branch_mix = " + ".join(part.title() for part in result.branches) if result.branches else "Unknown"
+    intent = ", ".join(result.asset_intent_classes[:2]).replace("_", " ").title() if result.asset_intent_classes else "Unknown"
     return (
         f"{prefix}${result.ticker} | C{result.conviction:.0f}/E{result.entry:.0f} | "
-        f"Active {money(result.mid)} [{money(result.low)}-{money(result.high)}] | "
-        f"Context {money(result.historical_context_capital)} | "
-        f"{result.buyers} buyers ({result.cluster_buyers}/14d) | "
-        f"Wtd age {result.weighted_age:.0f}d | Vs activity {result.weighted_return:+.1f}% | "
+        f"Active {money(result.active_amount_mid)} [{money(result.active_amount_low)}-{money(result.active_amount_high)}] | "
+        f"{result.buyers} filers | {branch_mix} | {intent} | {result.cluster_type.replace('_', ' ').title()} | "
+        f"Wtd age {result.weighted_age:.0f}d | Since trade {result.weighted_return:+.1f}% | "
         f"{result.flow} | {names}{extra}"
     )
 
@@ -123,10 +130,10 @@ def messages(results: list) -> list[str]:
 
     if actionable or wait or risk:
         lines = [
-            "CONGRESS TRADE OPPORTUNITIES",
+            "POLITICAL DISCLOSURE OPPORTUNITIES",
             f"Model: {MODEL_VERSION}",
             f"Analysed: {len(results)} tickers | Shown: {len(actionable) + len(wait) + len(risk)}",
-            "C = conviction after sales/options | E = entry quality",
+            "C = political disclosure conviction | E = entry quality from the latest completed market session",
             "",
         ]
         for title, items in (
@@ -137,20 +144,23 @@ def messages(results: list) -> list[str]:
             if items:
                 lines += [title] + [line(item) for item in items] + [""]
         lines += [
+            "Role relevance reflects policy-access overlap, not possession of confidential information.",
             "Active capital excludes historical context and discounts late disclosures.",
-            "Historical context is preserved separately for audit and pattern reading.",
             "Screening signal only.",
         ]
         return chunks(lines)
 
-    nearest = sorted((item for item in results if item.conviction >= 15), key=rank, reverse=True)[:MAX_NEAREST]
+    context = sorted((item for item in results if item.category == "context"), key=rank, reverse=True)[:MAX_NEAREST]
+    nearest = sorted((item for item in results if item.category == "other" and item.conviction >= 15), key=rank, reverse=True)[:MAX_NEAREST]
     lines = [
-        "CONGRESS TRADE MONITOR",
+        "POLITICAL DISCLOSURE MONITOR",
         f"Model: {MODEL_VERSION}",
-        "No ticker met the strict actionable, wait or risk thresholds.",
+        "No new political disclosures met the thresholds.",
         f"Analysed: {len(results)} tickers | Qualified: 0",
         "",
     ]
+    if context:
+        lines += ["POLITICAL MARKET CONTEXT"] + [line(item) for item in context] + [""]
     if nearest:
         lines += ["NEAREST SIGNALS - NOT QUALIFIED"] + [line(item) for item in nearest] + [""]
     lines += [
@@ -180,7 +190,7 @@ def failure(text: str) -> None:
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={
                 "chat_id": CHAT_ID,
-                "text": f"Congress monitor failure\nModel: {MODEL_VERSION}\n{text}",
+                "text": f"Political disclosure monitor failure\nModel: {MODEL_VERSION}\n{text}",
                 "disable_web_page_preview": True,
             },
             timeout=20,

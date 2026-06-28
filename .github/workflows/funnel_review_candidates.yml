@@ -109,6 +109,7 @@ jobs:
           echo "INSIDER_REQUEST_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "INSIDER_SINGLE_BUY_MIN_VALUE=250000" >> "$GITHUB_ENV"
           echo "INSIDER_MAX_RESULTS=20" >> "$GITHUB_ENV"
+          echo "POLITICAL_DISCLOSURE_SCOPE=all" >> "$GITHUB_ENV"
           echo "BTD_GATE_THRESHOLD=1.0" >> "$GITHUB_ENV"
           echo "BTD_GATE_MANUAL_BYPASS=true" >> "$GITHUB_ENV"
 

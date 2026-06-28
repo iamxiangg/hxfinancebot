@@ -1,0 +1,61 @@
+{
+  "committee_sector_map": {
+    "HSAS": {
+      "organisation_name": "House Armed Services",
+      "sector_weights": {
+        "aerospace_defense": 1.0,
+        "defense": 1.0,
+        "cybersecurity": 0.75,
+        "semiconductors": 0.45,
+        "government_software": 0.7
+      }
+    },
+    "SSAS": {
+      "organisation_name": "Senate Armed Services",
+      "sector_weights": {
+        "aerospace_defense": 1.0,
+        "defense": 1.0,
+        "cybersecurity": 0.75,
+        "government_software": 0.7
+      }
+    },
+    "HSBA": {
+      "organisation_name": "House Financial Services",
+      "sector_weights": {
+        "banks": 1.0,
+        "capital_markets": 0.9,
+        "fintech": 0.85,
+        "insurance": 0.8,
+        "cryptocurrency": 0.75
+      }
+    },
+    "SSBK": {
+      "organisation_name": "Senate Banking",
+      "sector_weights": {
+        "banks": 1.0,
+        "capital_markets": 0.9,
+        "fintech": 0.85,
+        "insurance": 0.8,
+        "cryptocurrency": 0.75
+      }
+    },
+    "HSIF": {
+      "organisation_name": "House Intelligence",
+      "sector_weights": {
+        "cybersecurity": 0.9,
+        "government_software": 0.8,
+        "defense": 0.75,
+        "semiconductors": 0.6
+      }
+    },
+    "SSGA": {
+      "organisation_name": "Senate Agriculture",
+      "sector_weights": {
+        "agriculture": 1.0,
+        "fertilizers_agricultural_inputs": 0.8,
+        "food": 0.7
+      }
+    }
+  }
+}
+

@@ -91,7 +91,7 @@ class ReviewCandidateTests(unittest.TestCase):
                 "classification": "actionable",
                 "score": 82,
                 "signal_count": 2,
-                "discovery_reason": "Congress: cluster purchase | VPMA: pead consolidation, core 82.0",
+                "discovery_reason": "Political Disclosures: cluster purchase | VPMA: pead consolidation, core 82.0",
                 "observed_at": "2026-06-25T01:00:00+00:00",
             },
             "2026-06-25T02:00:00+00:00",
@@ -109,7 +109,7 @@ class ReviewCandidateTests(unittest.TestCase):
                 "classification": "actionable",
                 "score": 78,
                 "signal_count": 1,
-                "discovery_reason": "Congress: 4 unique members",
+                "discovery_reason": "Political Disclosures: 4 unique members",
                 "congress_unique_members": 4,
                 "congress_recent_cluster_members": 3,
                 "congress_active_purchases": 6,
@@ -206,7 +206,7 @@ class ReviewCandidateRunTests(unittest.TestCase):
         upsert_rows = mock_upsert_records.call_args.args[5]
         self.assertEqual(len(upsert_rows), 1)
         self.assertEqual(upsert_rows[0]["Source"], "congress, vpma")
-        self.assertIn("Congress:", upsert_rows[0]["Discovery Reason"])
+        self.assertIn("Political Disclosures:", upsert_rows[0]["Discovery Reason"])
         self.assertIn("VPMA:", upsert_rows[0]["Discovery Reason"])
         self.assertEqual(upsert_rows[0]["Congress Unique Members"], 4)
         self.assertEqual(upsert_rows[0]["Congress Recent Cluster Members"], 3)

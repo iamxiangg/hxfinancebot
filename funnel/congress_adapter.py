@@ -95,10 +95,38 @@ def _signal_breakdown(
 def _details_from_result(result: CongressTickerResult, classification: str) -> dict[str, Any]:
     return {
         "model_version": result.model_version,
+        "display_source": result.display_source,
         "original_category": result.category,
         "conviction": result.conviction,
         "entry_quality": result.entry,
         "base_conviction": result.base,
+        "intentionality_score": result.intentionality_score,
+        "materiality_score": result.materiality_score,
+        "filer_abnormality_score": result.filer_abnormality_score,
+        "accumulation_score": result.accumulation_score,
+        "timeliness_score": result.timeliness_score,
+        "role_relevance_score": result.role_relevance_score,
+        "role_relevance_status": result.role_relevance_status,
+        "role_confirmation": result.role_confirmation,
+        "high_policy_access_flag": result.high_policy_access_flag,
+        "role_evidence": result.role_evidence,
+        "seniority_classes": result.seniority_classes,
+        "seniority_multipliers": result.seniority_multipliers,
+        "committee_ids": result.committee_ids,
+        "committee_names": result.committee_names,
+        "subcommittee_ids": result.subcommittee_ids,
+        "agency_keys": result.agency_keys,
+        "branches": result.branches,
+        "chambers": result.chambers,
+        "filers": result.filers,
+        "bioguide_ids": result.bioguide_ids,
+        "company_sector": result.company_sector,
+        "company_industry": result.company_industry,
+        "company_thematic_exposures": result.company_thematic_exposures,
+        "company_classification_source": result.company_classification_source,
+        "company_classification_confidence": result.company_classification_confidence,
+        "asset_intent_classes": result.asset_intent_classes,
+        "cluster_type": result.cluster_type,
         "sale_penalty": result.sale_penalty,
         "call_bonus": result.call_bonus,
         "put_penalty": result.put_penalty,
@@ -108,6 +136,9 @@ def _details_from_result(result: CongressTickerResult, classification: str) -> d
         "effective_capital": result.effective,
         "active_bullish_capital": result.active_bullish_capital,
         "historical_context_capital": result.historical_context_capital,
+        "active_amount_low": result.active_amount_low,
+        "active_amount_mid": result.active_amount_mid,
+        "active_amount_high": result.active_amount_high,
         "call_premium_mid": result.call_mid,
         "put_premium_mid": result.put_mid,
         "buyers": result.buyers,
@@ -133,6 +164,11 @@ def _details_from_result(result: CongressTickerResult, classification: str) -> d
         "active_late_disclosed_trade_count": result.active_late_disclosed_trade_count,
         "classification_source": classification,
         "source_payload_hash": result.source_payload_hash,
+        "source_ids": result.source_ids,
+        "filing_ids": result.filing_ids,
+        "filing_types": result.filing_types,
+        "document_urls": result.document_urls,
+        "risk_flags": result.risk_flags,
     }
 
 
@@ -334,6 +370,14 @@ def _write_audit_bundle(scan: CongressScanResult, signals: list[Signal]) -> None
         json.dumps(asdict(scan.metadata), ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    (audit_dir / "audit_bundle.json").write_text(
+        json.dumps(asdict(scan.audit_bundle), ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    (audit_dir / "scope.json").write_text(
+        json.dumps({"scope_used": scan.scope_used}, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def run_congress_adapter_detailed(
@@ -350,7 +394,10 @@ def run_congress_adapter_detailed(
     credentials are available; otherwise a local JSON fallback is used.
     """
     ledger, ledger_context = _load_ledger()
-    scan = run_live_scan(prior_ledger=ledger)
+    scan = run_live_scan(
+        prior_ledger=ledger,
+        branch_scope=os.getenv("POLITICAL_DISCLOSURE_SCOPE", "all"),
+    )
     if persist_ledger:
         _save_ledger(scan.ledger, ledger_context)
 
@@ -374,7 +421,7 @@ def run_congress_adapter_detailed(
 
     logger.info(
         (
-            "Congress engine scan: raw=%d active=%d scored=%d alertable=%d "
+            "Political disclosure scan: raw=%d active=%d scored=%d alertable=%d "
             "already_seen=%d below_threshold=%d retained=%d hash=%s"
         ),
         scan.counts.get("total_raw_records", 0),

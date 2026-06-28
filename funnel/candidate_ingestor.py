@@ -211,7 +211,7 @@ def _build_reason(
                 pass
         if flow:
             parts.append(flow)
-        return f"Congress: {', '.join(parts)}" if parts else "Congress"
+        return f"Political Disclosures: {', '.join(parts)}" if parts else "Political Disclosures"
 
     if signal.scanner == "vpma":
         setup_type = str(details.get("setup_type") or "").strip().replace("_", " ")

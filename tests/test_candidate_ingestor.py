@@ -270,7 +270,7 @@ class CandidateIngestorTests(
 
         self.assertEqual(team["all_sources"], ["congress", "vpma"])
         self.assertEqual(team["signal_count"], 2)
-        self.assertIn("Congress:", team["discovery_reason"])
+        self.assertIn("Political Disclosures:", team["discovery_reason"])
         self.assertIn("VPMA:", team["discovery_reason"])
 
     def test_congress_reason_shows_breadth_with_singular_and_plural(self) -> None:

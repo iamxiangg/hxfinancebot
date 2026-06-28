@@ -53,7 +53,7 @@ def _present(value: Any) -> bool:
 
 def _source_label(value: str) -> str:
     mapping = {
-        "congress": "Congress",
+        "congress": "Political Disclosures",
         "insider": "Corporate Insider",
         "vpma": "VPMA / PEAD",
         "manual": "Manual",
@@ -138,7 +138,7 @@ def build_review_message(candidate: dict[str, Any]) -> str:
             congress_member_names,
         )
     ):
-        lines.append("Congress breadth:")
+        lines.append("Political disclosure breadth:")
         if _present(congress_unique_members):
             lines.append(f"- Unique members represented: {congress_unique_members}")
         if _present(congress_recent_cluster):

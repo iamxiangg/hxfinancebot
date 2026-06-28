@@ -1,0 +1,39 @@
+{
+  "agency_sector_map": {
+    "department_of_defense": {
+      "sector_weights": {
+        "aerospace_defense": 1.0,
+        "defense": 1.0,
+        "cybersecurity": 0.85,
+        "government_software": 0.8,
+        "semiconductors": 0.55
+      }
+    },
+    "department_of_commerce": {
+      "sector_weights": {
+        "semiconductors": 0.9,
+        "telecommunications": 0.75,
+        "trade_sensitive_industrials": 0.7,
+        "cybersecurity": 0.55
+      }
+    },
+    "department_of_energy": {
+      "sector_weights": {
+        "utilities": 0.85,
+        "nuclear_energy": 1.0,
+        "oil_gas": 0.65,
+        "renewable_energy": 0.85,
+        "energy_storage": 0.8
+      }
+    },
+    "white_house_office": {
+      "sector_weights": {
+        "broad_market": 0.0,
+        "government_software": 0.4,
+        "defense": 0.4,
+        "energy": 0.4,
+        "banks": 0.4
+      }
+    }
+  }
+}

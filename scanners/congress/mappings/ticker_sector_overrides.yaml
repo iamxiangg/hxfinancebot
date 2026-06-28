@@ -1,0 +1,28 @@
+{
+  "LMT": {
+    "sector": "industrials",
+    "industry": "aerospace_defense",
+    "thematic_exposures": ["defense", "government_contracting"]
+  },
+  "PLTR": {
+    "sector": "technology",
+    "industry": "software_infrastructure",
+    "thematic_exposures": ["government_software", "defense", "artificial_intelligence"]
+  },
+  "BWXT": {
+    "sector": "industrials",
+    "industry": "aerospace_defense",
+    "thematic_exposures": ["defense", "nuclear_energy", "government_contracting"]
+  },
+  "NVDA": {
+    "sector": "technology",
+    "industry": "semiconductors",
+    "thematic_exposures": ["semiconductors", "artificial_intelligence"]
+  },
+  "VOO": {
+    "sector": "broad_market",
+    "industry": "broad_market_etf",
+    "thematic_exposures": ["broad_market"]
+  }
+}
+

@@ -1,10 +1,8 @@
-name: Run Congress Tracker Bot
+name: Run Political Disclosure Bot
 
 on:
   schedule:
-    # 11:00 AM UTC converts directly to 7:00 PM SGT
-    # Runs *every day* (Mon-Sun) to match your "everyday" requirement
-    - cron: "0 11 * * *"
+    - cron: "10 11 * * *"
   workflow_dispatch: # Allows you to manually trigger it anytime from the GitHub UI
 
 jobs:
@@ -39,5 +37,6 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          POLITICAL_DISCLOSURE_SCOPE: "all"
           PYTHONUNBUFFERED: "1"
         run: python -m tactical.congress_runner

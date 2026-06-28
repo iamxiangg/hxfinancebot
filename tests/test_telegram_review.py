@@ -77,7 +77,7 @@ class TelegramReviewTests(unittest.TestCase):
                 "BTD Gate": "PASS",
                 "Gross Margin": 0.72,
                 "Revenue Growth": 0.24,
-                "Discovery Reason": "Congress: 4 unique members",
+                "Discovery Reason": "Political Disclosures: 4 unique members",
                 "Congress Unique Members": 4,
                 "Congress Recent Cluster Members": 3,
                 "Congress Active Purchases": 6,
@@ -88,7 +88,7 @@ class TelegramReviewTests(unittest.TestCase):
         self.assertIn("BTD BASIC GATE", message)
         self.assertIn("BTD ratio: 0.4", message)
         self.assertIn("Gross margin: 72.0%", message)
-        self.assertIn("Congress breadth:", message)
+        self.assertIn("Political disclosure breadth:", message)
         self.assertIn("Unique members represented: 4", message)
         self.assertIn("Recent cluster members: 3", message)
         self.assertIn("Active purchases: 6", message)
