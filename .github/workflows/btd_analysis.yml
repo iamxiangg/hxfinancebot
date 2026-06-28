@@ -2,8 +2,8 @@ name: BTD_Analysis
 
 on:
   schedule:
-    - cron: "0 14 * * 1-5" # Runs 30 mins after your first bot (9:00 AM EST)
-  workflow_dispatch:
+    - cron: "0 14 * * 1-5"  # Runs at 14:00 UTC (10:00 PM SGT), Monday to Friday
+  workflow_dispatch:       # Allows you to manually trigger it from the Actions tab
 
 jobs:
   run-btd:
@@ -18,12 +18,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install yfinance pandas gspread oauth2client pytz requests
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas gspread oauth2client pytz requests
 
       - name: Run BTD Script
         env:
-          # This creates the JSON file from your Secret on the fly
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # Ensure this matches the exact filename in your archive/ folder
         run: python archive/btd_analysis.py
