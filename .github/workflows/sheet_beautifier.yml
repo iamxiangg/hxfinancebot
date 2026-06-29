@@ -1,0 +1,65 @@
+name: Sheet Beautifier
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Dry run previews without writing; Apply writes formatting to sheets
+        required: true
+        default: dry_run
+        type: choice
+        options:
+          - dry_run
+          - apply
+      sheets:
+        description: Comma-separated sheet names (leave blank for all production sheets)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  beautify:
+    name: Beautify Google Sheets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install google-api-python-client google-auth
+
+      - name: Run beautifier
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          BEAUTIFY_SHEETS: ${{ inputs.sheets }}
+          FUNNEL_OUTPUT_DIR: funnel_output
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.mode }}" == "dry_run" ]]; then
+            python -m funnel.sheet_beautifier --dry-run
+          else
+            python -m funnel.sheet_beautifier
+          fi
+
+      - name: Upload receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheet-beautifier-${{ github.run_number }}
+          path: funnel_output/
+          if-no-files-found: warn
+          retention-days: 14
