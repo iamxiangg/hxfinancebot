@@ -121,7 +121,7 @@ class OfficialSECProvider(SECProvider):
     ) -> None:
         self.user_agent = str(user_agent or os.getenv("SEC_USER_AGENT", "")).strip()
         if not self.user_agent:
-            self.user_agent = "hxfinancebot/1.0 (github.com/iamxiangg/hxfinancebot)"
+            self.user_agent = "hxfinancebot/1.0 (contact@hxfinancebot.dev)"
             logger.warning(
                 "SEC_USER_AGENT not set; using default '%s'. "
                 "Set SEC_USER_AGENT to a descriptive contact string per SEC EDGAR rules.",
@@ -462,7 +462,7 @@ class OfficialSECProvider(SECProvider):
                 time.sleep(min(2 ** attempt, 5))
                 continue
             status = int(getattr(response, "status_code", 0))
-            if status == 404:
+            if status in (403, 404):
                 raise SECNotFoundError(url)
             if status == 429 or 500 <= status < 600:
                 if attempt >= self.retry_limit:

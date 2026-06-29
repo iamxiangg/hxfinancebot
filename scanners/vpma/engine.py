@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Iterable
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -460,7 +461,7 @@ def reaction_abnormal_return(
         return None
     reaction_position = history.index.get_loc(reaction_session)
     benchmark_position = benchmark_history.index.get_loc(reaction_session)
-    if isinstance(reaction_position, slice) or isinstance(benchmark_position, slice):
+    if isinstance(reaction_position, (slice, np.ndarray)) or isinstance(benchmark_position, (slice, np.ndarray)):
         return None
     if reaction_position == 0 or benchmark_position == 0:
         return None
@@ -485,7 +486,7 @@ def reaction_volume_shock(history: pd.DataFrame, reaction_session: pd.Timestamp)
     if reaction_session not in history.index:
         return None
     position = history.index.get_loc(reaction_session)
-    if isinstance(position, slice):
+    if isinstance(position, (slice, np.ndarray)):
         return None
     baseline = history["Volume"].iloc[max(0, position - 20) : position]
     if baseline.empty:
@@ -534,7 +535,15 @@ def calculate_drift_metrics(
         }
     position = history.index.get_loc(reaction_session)
     benchmark_position = benchmark_history.index.get_loc(reaction_session)
-    if isinstance(position, slice) or isinstance(benchmark_position, slice) or position == 0 or benchmark_position == 0:
+    if isinstance(position, (slice, np.ndarray)) or isinstance(benchmark_position, (slice, np.ndarray)):
+        return {
+            "move_retention": None,
+            "drawdown_from_post_high": None,
+            "relative_strength_post_event": None,
+            "earnings_avwap": None,
+            "extension_from_avwap": None,
+        }
+    if position == 0 or benchmark_position == 0:
         return {
             "move_retention": None,
             "drawdown_from_post_high": None,

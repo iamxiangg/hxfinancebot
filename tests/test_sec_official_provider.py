@@ -54,7 +54,7 @@ class OfficialSECProviderTests(unittest.TestCase):
     def test_missing_user_agent_falls_back_to_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             provider = OfficialSECProvider()
-            self.assertIn("hxfinancebot/1.0 (github.com/iamxiangg/hxfinancebot)", provider.user_agent)
+            self.assertIn("hxfinancebot/1.0 (contact@hxfinancebot.dev)", provider.user_agent)
 
     def test_company_profile_and_recent_filing_normalization(self) -> None:
         submissions_url = "https://data.sec.gov/submissions/CIK0001650372.json"
