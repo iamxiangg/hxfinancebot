@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import math
 import unittest
+from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 
 from scanners.vpma.engine import (
     EarningsEvent,
     UniverseTicker,
     VpmaConfig,
+    YfinanceVpmaDataSource,
+    _extract_finite_scalar,
+    _yahoo_valid_symbol,
     calculate_event_quality,
     classify_core_result,
     clean_universe_rows,
@@ -16,6 +22,10 @@ from scanners.vpma.engine import (
     evaluate_ticker,
     extract_recent_earnings_event,
     map_reaction_session,
+    reaction_abnormal_return,
+    reaction_closing_position,
+    reaction_volume_shock,
+    run_vpma_scan,
 )
 
 
@@ -181,6 +191,214 @@ class VpmaEngineTests(unittest.TestCase):
         self.assertIn("missing_eps_surprise", result.details["risk_flags"])
         self.assertIn("event_date_uncertain", result.details["risk_flags"])
         self.assertGreaterEqual(result.event_score, 0.0)
+
+
+class ExtractFiniteScalarTests(unittest.TestCase):
+    def test_python_float(self) -> None:
+        self.assertEqual(_extract_finite_scalar(42.0), 42.0)
+        self.assertEqual(_extract_finite_scalar(0), 0.0)
+
+    def test_numpy_scalar(self) -> None:
+        self.assertEqual(_extract_finite_scalar(np.float64(3.14)), 3.14)
+        self.assertEqual(_extract_finite_scalar(np.int64(7)), 7.0)
+
+    def test_single_element_series(self) -> None:
+        series = pd.Series([2.5])
+        self.assertEqual(_extract_finite_scalar(series), 2.5)
+
+    def test_single_element_dataframe(self) -> None:
+        df = pd.DataFrame({"a": [3.0]})
+        self.assertEqual(_extract_finite_scalar(df), 3.0)
+
+    def test_none_and_nan_return_none(self) -> None:
+        self.assertIsNone(_extract_finite_scalar(None))
+        self.assertIsNone(_extract_finite_scalar(float("nan")))
+        self.assertIsNone(_extract_finite_scalar(np.nan))
+
+    def test_inf_returns_none(self) -> None:
+        self.assertIsNone(_extract_finite_scalar(float("inf")))
+        self.assertIsNone(_extract_finite_scalar(float("-inf")))
+
+    def test_multi_element_series_rejected(self) -> None:
+        series = pd.Series([1.0, 2.0])
+        with self.assertRaises(ValueError):
+            _extract_finite_scalar(series)
+
+    def test_multi_element_dataframe_rejected(self) -> None:
+        df = pd.DataFrame({"a": [1.0, 2.0]})
+        with self.assertRaises(ValueError):
+            _extract_finite_scalar(df)
+
+    def test_empty_series_returns_none(self) -> None:
+        self.assertIsNone(_extract_finite_scalar(pd.Series([], dtype=float)))
+
+    def test_empty_dataframe_returns_none(self) -> None:
+        self.assertIsNone(_extract_finite_scalar(pd.DataFrame()))
+
+    def test_pd_na_returns_none(self) -> None:
+        self.assertIsNone(_extract_finite_scalar(pd.NA))
+
+    def test_string_numeric_parsed_as_float(self) -> None:
+        self.assertEqual(_extract_finite_scalar("42.5"), 42.5)
+
+
+class YahooSymbolValidationTests(unittest.TestCase):
+    def test_normal_symbol_valid(self) -> None:
+        self.assertTrue(_yahoo_valid_symbol("AAPL"))
+        self.assertTrue(_yahoo_valid_symbol("BRK-B"))
+
+    def test_caret_symbol_invalid(self) -> None:
+        self.assertFalse(_yahoo_valid_symbol("NEE^U"))
+        self.assertFalse(_yahoo_valid_symbol("SCE^L"))
+
+    def test_empty_string_invalid(self) -> None:
+        self.assertFalse(_yahoo_valid_symbol(""))
+
+
+class ReactionCalculationTests(unittest.TestCase):
+    def test_abnormal_return_with_normal_series(self) -> None:
+        dates = pd.bdate_range("2026-06-01", periods=5)
+        history = pd.DataFrame({"Close": [100.0, 101.0, 105.0, 103.0, 107.0]}, index=dates)
+        benchmark = pd.DataFrame({"Close": [200.0, 200.5, 201.0, 201.5, 202.0]}, index=dates)
+        abnormal = reaction_abnormal_return(history, benchmark, dates[2])
+        self.assertIsNotNone(abnormal)
+        self.assertTrue(math.isfinite(abnormal))
+
+    def test_abnormal_return_with_duplicate_index(self) -> None:
+        dates = pd.DatetimeIndex([
+            pd.Timestamp("2026-06-01"),
+            pd.Timestamp("2026-06-02"),
+            pd.Timestamp("2026-06-03"),
+            pd.Timestamp("2026-06-03"),
+            pd.Timestamp("2026-06-04"),
+        ])
+        history = pd.DataFrame({"Close": [100.0, 101.0, 105.0, 106.0, 107.0]}, index=dates)
+        benchmark = pd.DataFrame({"Close": [200.0, 200.5, 201.0, 201.5, 202.0]}, index=dates)
+        abnormal = reaction_abnormal_return(history, benchmark, pd.Timestamp("2026-06-03"))
+        self.assertIsNone(abnormal)
+
+    def test_closing_position_with_duplicate_index(self) -> None:
+        dates = pd.DatetimeIndex([
+            pd.Timestamp("2026-06-01"),
+            pd.Timestamp("2026-06-02"),
+            pd.Timestamp("2026-06-03"),
+            pd.Timestamp("2026-06-03"),
+        ])
+        history = pd.DataFrame({
+            "Close": [100.0, 101.0, 105.0, 106.0],
+            "High": [101.0, 102.0, 106.0, 107.0],
+            "Low": [99.0, 100.0, 103.0, 104.0],
+        }, index=dates)
+        result = reaction_closing_position(history, pd.Timestamp("2026-06-03"))
+        self.assertIsNone(result)
+
+    def test_volume_shock_with_duplicate_index(self) -> None:
+        dates = pd.DatetimeIndex([
+            pd.Timestamp(f"2026-06-{d:02d}") for d in range(1, 25)
+        ] + [pd.Timestamp("2026-06-24")])
+        volume = [1_000_000.0] * 24 + [5_000_000.0]
+        history = pd.DataFrame({"Volume": volume}, index=dates)
+        result = reaction_volume_shock(history, pd.Timestamp("2026-06-24"))
+        self.assertIsNone(result)
+
+    def test_missing_benchmark_session_returns_none(self) -> None:
+        dates = pd.bdate_range("2026-06-01", periods=5)
+        history = pd.DataFrame({"Close": [100.0, 101.0, 105.0, 103.0, 107.0]}, index=dates)
+        benchmark = pd.DataFrame({"Close": [200.0]}, index=pd.DatetimeIndex([pd.Timestamp("2026-05-01")]))
+        abnormal = reaction_abnormal_return(history, benchmark, dates[2])
+        self.assertIsNone(abnormal)
+
+
+class VpmaScanIsolationTests(unittest.TestCase):
+    """Verify that one ticker failure does not prevent other tickers from producing signals."""
+
+    def setUp(self) -> None:
+        dates = pd.bdate_range("2026-01-02", periods=90)
+        self.history_aapl = pd.DataFrame({
+            "Open": [150.0] * 90, "High": [152.0] * 90, "Low": [149.0] * 90,
+            "Close": [151.0] * 90, "Volume": [1_000_000] * 90,
+        }, index=dates)
+        self.history_msft = pd.DataFrame({
+            "Open": [300.0] * 90, "High": [303.0] * 90, "Low": [298.0] * 90,
+            "Close": [301.0] * 90, "Volume": [2_000_000] * 90,
+        }, index=dates)
+        self.benchmark = pd.DataFrame({
+            "Open": [500.0] * 90, "High": [502.0] * 90, "Low": [499.0] * 90,
+            "Close": [501.0] * 90, "Volume": [10_000_000] * 90,
+        }, index=dates)
+
+    def test_invalid_symbol_isolated_other_tickers_proceed(self) -> None:
+        config = VpmaConfig(enable_enrichment=False, guidance_enable=False, valid_days=3)
+        with patch.dict("os.environ", {"VPMA_TEST_TICKERS": "AAPL,NEE^U"}, clear=True):
+            with patch.object(YfinanceVpmaDataSource, "download_histories", return_value={
+                "AAPL": self.history_aapl,
+            }), patch.object(YfinanceVpmaDataSource, "benchmark_history", return_value=self.benchmark), patch.object(
+                YfinanceVpmaDataSource, "earnings_dates", return_value=pd.DataFrame()
+            ), patch.object(
+                YfinanceVpmaDataSource, "next_earnings_date", return_value=None
+            ):
+                scan = run_vpma_scan(config=config)
+                self.assertIn("NEE^U", [r.ticker for r in scan.results if r.classification == "excluded"])
+                counts = scan.counts
+                self.assertGreaterEqual(counts.get("invalid_symbol", 0), 1)
+
+    def test_calculation_failure_on_one_ticker_does_not_block_others(self) -> None:
+        """Verifies both tickers appear in results when only one has market data."""
+        config = VpmaConfig(enable_enrichment=False, guidance_enable=False, valid_days=3)
+        with patch.dict("os.environ", {"VPMA_TEST_TICKERS": "AAPL,MSFT"}, clear=True):
+            with patch.object(
+                YfinanceVpmaDataSource, "download_histories", return_value={
+                    "AAPL": self.history_aapl,
+                }
+            ), patch.object(
+                YfinanceVpmaDataSource, "benchmark_history", return_value=self.benchmark
+            ), patch.object(
+                YfinanceVpmaDataSource, "earnings_dates", return_value=pd.DataFrame()
+            ), patch.object(
+                YfinanceVpmaDataSource, "next_earnings_date", return_value=None
+            ):
+                scan = run_vpma_scan(config=config)
+                tickers = {r.ticker for r in scan.results}
+                self.assertIn("AAPL", tickers)
+                self.assertIn("MSFT", tickers)
+                self.assertGreaterEqual(scan.counts.get("missing_market_data", 0), 1)
+
+    def test_evaluate_ticker_pipeline_completes_without_error(self) -> None:
+        """Verify the full evaluation pipeline completes without raising."""
+        dates = pd.bdate_range("2026-01-02", periods=90)
+        mid = len(dates) // 2
+        history = pd.DataFrame(index=dates)
+        history["Open"] = [150.0 + i * 0.1 for i in range(len(dates))]
+        history["High"] = history["Open"] * 1.01
+        history["Low"] = history["Open"] * 0.99
+        history["Close"] = history["Open"] * 1.005
+        history["Volume"] = 1_000_000
+        history.iloc[mid, history.columns.get_loc("Volume")] = 5_000_000
+
+        benchmark = pd.DataFrame(index=dates)
+        benchmark["Close"] = [500.0 + i * 0.05 for i in range(len(dates))]
+        benchmark["Open"] = benchmark["Close"] * 0.998
+        benchmark["High"] = benchmark["Close"] * 1.004
+        benchmark["Low"] = benchmark["Close"] * 0.996
+        benchmark["Volume"] = 10_000_000
+
+        event = EarningsEvent(
+            earnings_timestamp=datetime(2026, 3, 20, 8, 0, 0),
+            release_timing="before_market",
+            reaction_session=dates[mid],
+            reaction_session_confidence="high",
+            days_since_reaction=10,
+            eps_surprise_pct=8.0,
+        )
+
+        ticker = UniverseTicker("TEST", "Test Corp", "Tech", 150.0, 10_000_000_000.0, 500_000.0)
+        result = evaluate_ticker(
+            ticker, history, benchmark, event,
+            next_earnings_date=None,
+            config=VpmaConfig(),
+        )
+        self.assertIsNotNone(result)
+        self.assertIn(result.classification, {"actionable", "wait", "near_miss", "risk", "excluded"})
 
 
 if __name__ == "__main__":

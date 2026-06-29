@@ -4,7 +4,7 @@ import os
 
 from providers.sec.base import SECProvider
 from providers.sec.edgartools_provider import EdgarToolsSECProvider
-from providers.sec.errors import SECConfigurationError
+from providers.sec.errors import SECAccessDeniedError, SECConfigurationError, SECNotFoundError, SECRequestError
 from providers.sec.official import OfficialSECProvider
 
 
@@ -17,4 +17,4 @@ def get_sec_provider() -> SECProvider:
     raise SECConfigurationError(f"Unsupported SEC provider: {provider_name}")
 
 
-__all__ = ["SECProvider", "OfficialSECProvider", "EdgarToolsSECProvider", "get_sec_provider"]
+__all__ = ["SECProvider", "OfficialSECProvider", "EdgarToolsSECProvider", "get_sec_provider", "SECAccessDeniedError", "SECNotFoundError", "SECRequestError"]

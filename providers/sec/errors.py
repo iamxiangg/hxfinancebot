@@ -18,7 +18,11 @@ class SECRequestError(SECProviderError):
 
 
 class SECNotFoundError(SECRequestError):
-    """Raised when an SEC resource is not found."""
+    """Raised when an SEC resource is not found (HTTP 404)."""
+
+
+class SECAccessDeniedError(SECRequestError):
+    """Raised when SEC access is denied (HTTP 403)."""
 
 
 class SECProviderUnavailableError(SECProviderError):

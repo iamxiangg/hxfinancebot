@@ -81,14 +81,14 @@ class InsiderSECProviderIntegrationTests(unittest.TestCase):
 
         results, receipt = run_insider_scan(
             config=InsiderConfig(lookback_days=1),
-            observed_at="2026-06-27T12:00:00+00:00",
+            observed_at="2026-06-26T12:00:00+00:00",
             sec_provider=provider,
         )
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].ticker, "TEAM")
         self.assertIsInstance(receipt["ledger_rows"], list)
-        self.assertEqual(provider.calls[0], "daily:2026-06-27")
+        self.assertEqual(provider.calls[0], "daily:2026-06-26")
         self.assertEqual(provider.calls[1], "form4:0001650372-24-000999")
 
 
