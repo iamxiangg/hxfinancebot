@@ -12,7 +12,7 @@ import requests
 
 from providers.sec.base import SECProvider
 from providers.sec.cache import JSONDiskCache
-from providers.sec.errors import MissingSECUserAgentError, SECNotFoundError, SECRequestError
+from providers.sec.errors import SECNotFoundError, SECRequestError
 from providers.sec.models import (
     CompanyFacts,
     CompanyProfile,
@@ -121,8 +121,11 @@ class OfficialSECProvider(SECProvider):
     ) -> None:
         self.user_agent = str(user_agent or os.getenv("SEC_USER_AGENT", "")).strip()
         if not self.user_agent:
-            raise MissingSECUserAgentError(
-                "SEC_USER_AGENT is required for SEC requests. Set it to a descriptive contact string."
+            self.user_agent = "hxfinancebot/1.0 (github.com/iamxiangg/hxfinancebot)"
+            logger.warning(
+                "SEC_USER_AGENT not set; using default '%s'. "
+                "Set SEC_USER_AGENT to a descriptive contact string per SEC EDGAR rules.",
+                self.user_agent,
             )
         self.session = session or requests.Session()
         if hasattr(self.session, "headers"):

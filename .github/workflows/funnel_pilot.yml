@@ -107,7 +107,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install google-api-python-client google-auth
-          python -m pip install pandas requests yfinance python-telegram-bot
+          python -m pip install pandas requests yfinance python-telegram-bot lxml
 
       - name: Check Python syntax
         run: |
@@ -230,6 +230,7 @@ jobs:
           GOOGLE_WORKSHEET_NAME: Stock Summary USD
           MIN_CONVICTION: ${{ inputs.min_conviction }}
           CONFIRM_PILOT_FULL_RUN: ${{ inputs.confirm_pilot_full_run }}
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
           FUNNEL_OUTPUT_DIR: funnel_output
           PYTHONUNBUFFERED: "1"
         run: |

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from providers.sec import get_sec_provider
 from providers.sec.cache import JSONDiskCache
-from providers.sec.errors import MissingSECUserAgentError, SECNotFoundError
+from providers.sec.errors import SECNotFoundError
 from providers.sec.official import OfficialSECProvider, TICKER_MAP_URL
 from providers.sec.models import FilingMetadata
 
@@ -51,10 +51,10 @@ class OfficialSECProviderTests(unittest.TestCase):
         )
         return provider, session
 
-    def test_missing_user_agent_is_rejected(self) -> None:
+    def test_missing_user_agent_falls_back_to_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(MissingSECUserAgentError):
-                OfficialSECProvider()
+            provider = OfficialSECProvider()
+            self.assertIn("hxfinancebot/1.0 (github.com/iamxiangg/hxfinancebot)", provider.user_agent)
 
     def test_company_profile_and_recent_filing_normalization(self) -> None:
         submissions_url = "https://data.sec.gov/submissions/CIK0001650372.json"

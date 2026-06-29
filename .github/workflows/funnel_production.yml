@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install google-api-python-client google-auth
-          python -m pip install pandas requests yfinance python-telegram-bot
+          python -m pip install pandas requests yfinance python-telegram-bot lxml
 
       - name: Check Python syntax
         run: |
@@ -170,7 +170,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MAX_ATTEMPTS: "3"
           TELEGRAM_TIMEOUT_SECONDS: "30"
-
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
           FUNNEL_OUTPUT_DIR: funnel_output
           PYTHONUNBUFFERED: "1"
 
