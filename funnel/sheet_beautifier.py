@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Colour palette
 # ---------------------------------------------------------------------------
+REVIEW_REQUESTS_SHEET = "Review_Requests"
+
 TAB_COLOURS: dict[str, dict[str, float]] = {
     MASTERLIST_SHEET: {"red": 0.051, "green": 0.502, "blue": 0.263},
     SIGNAL_LOG_SHEET: {"red": 0.102, "green": 0.451, "blue": 0.910},
@@ -70,8 +72,6 @@ ZEBRA_SECOND: dict[str, float] = {"red": 0.953, "green": 0.957, "blue": 0.965}
 # ---------------------------------------------------------------------------
 # Production sheets — (name, headers) tuples
 # ---------------------------------------------------------------------------
-REVIEW_REQUESTS_SHEET = "Review_Requests"
-
 PRODUCTION_SHEETS: list[tuple[str, list[str]]] = [
     (MASTERLIST_SHEET, []),
     (SIGNAL_LOG_SHEET, SIGNAL_LOG_HEADERS),
