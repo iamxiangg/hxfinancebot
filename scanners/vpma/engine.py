@@ -13,6 +13,11 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+
 from providers.sec.base import SECProvider
 from scanners.vpma.alpha_vantage import AlphaVantageClient, AlphaVantageConfirmation
 from scanners.vpma.guidance_extraction import extract_confirmation
@@ -252,6 +257,39 @@ def normalise_universe_ticker(value: Any) -> str:
     return text.replace("/", "-")
 
 
+def _extract_finite_scalar(value: Any) -> float | None:
+    """Extract a finite float from a Python numeric, NumPy scalar, or single-element pandas object.
+
+    Returns None for None, NaN, inf, -inf, and pd.NA.
+    Raises ValueError for multi-element Series or DataFrames.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (float, int)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    if isinstance(value, (np.floating, np.integer)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    if isinstance(value, pd.Series):
+        if value.empty:
+            return None
+        if len(value) != 1:
+            raise ValueError(f"Ambiguous scalar extraction: Series has {len(value)} elements")
+        return _extract_finite_scalar(value.iloc[0])
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return None
+        if value.size != 1:
+            raise ValueError(f"Ambiguous scalar extraction: DataFrame has {value.size} elements")
+        return _extract_finite_scalar(value.iloc[0, 0])
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def _numeric_or_none(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -259,9 +297,22 @@ def _numeric_or_none(value: Any) -> float | None:
         number = float(str(value).replace(",", ""))
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(number):
-        return None
-    return number
+    return number if math.isfinite(number) else None
+
+
+def _yahoo_valid_symbol(ticker: str) -> bool:
+    """Return False for ticker representations that Yahoo Finance cannot resolve.
+
+    Filtered patterns:
+    - Symbols containing '^' (e.g. NEE^U, SCE^L) represent preferred or
+      special securities in a format Yahoo does not recognise.
+    """
+    clean = str(ticker or "").strip().upper()
+    if not clean:
+        return False
+    if "^" in clean:
+        return False
+    return True
 
 
 def is_probably_common_stock(name: str, ticker: str) -> bool:
@@ -336,8 +387,10 @@ def median_dollar_volume(history: pd.DataFrame, *, window: int = 50) -> float | 
     series = sample["Close"] * sample["Volume"]
     if series.empty:
         return None
-    value = float(series.median())
-    return value if math.isfinite(value) else None
+    try:
+        return _extract_finite_scalar(series.median())
+    except ValueError:
+        return None
 
 
 def classify_release_timing(timestamp: datetime) -> tuple[str, str]:
@@ -444,10 +497,17 @@ def earnings_anchored_vwap(history: pd.DataFrame, reaction_session: pd.Timestamp
     if sample.empty:
         return None
     volume = sample["Volume"].astype(float)
-    if float(volume.sum()) <= 0:
+    try:
+        volume_sum = _extract_finite_scalar(volume.sum())
+    except ValueError:
+        return None
+    if volume_sum is None or volume_sum <= 0:
         return None
     typical = (sample["High"] + sample["Low"] + sample["Close"]) / 3.0
-    return float((typical * volume).sum() / volume.sum())
+    try:
+        return _extract_finite_scalar((typical * volume).sum() / volume.sum())
+    except ValueError:
+        return None
 
 
 def reaction_abnormal_return(
@@ -465,10 +525,19 @@ def reaction_abnormal_return(
         return None
     if reaction_position == 0 or benchmark_position == 0:
         return None
-    stock_return = float(history["Close"].iloc[reaction_position] / history["Close"].iloc[reaction_position - 1] - 1.0)
-    benchmark_return = float(
-        benchmark_history["Close"].iloc[benchmark_position] / benchmark_history["Close"].iloc[benchmark_position - 1] - 1.0
-    )
+    try:
+        stock_return = _extract_finite_scalar(
+            history["Close"].iloc[reaction_position] / history["Close"].iloc[reaction_position - 1] - 1.0
+        )
+        benchmark_return = _extract_finite_scalar(
+            benchmark_history["Close"].iloc[benchmark_position]
+            / benchmark_history["Close"].iloc[benchmark_position - 1]
+            - 1.0
+        )
+    except ValueError:
+        return None
+    if stock_return is None or benchmark_return is None:
+        return None
     return stock_return - benchmark_return
 
 
@@ -476,10 +545,18 @@ def reaction_closing_position(history: pd.DataFrame, reaction_session: pd.Timest
     if reaction_session not in history.index:
         return None
     row = history.loc[reaction_session]
-    day_range = float(row["High"] - row["Low"])
-    if day_range <= 0:
+    if isinstance(row, pd.DataFrame):
+        return None
+    try:
+        day_range = _extract_finite_scalar(row["High"] - row["Low"])
+    except ValueError:
+        return None
+    if day_range is None or day_range <= 0:
         return 0.5
-    return float((row["Close"] - row["Low"]) / day_range)
+    try:
+        return _extract_finite_scalar((row["Close"] - row["Low"]) / day_range)
+    except ValueError:
+        return None
 
 
 def reaction_volume_shock(history: pd.DataFrame, reaction_session: pd.Timestamp) -> float | None:
@@ -491,10 +568,16 @@ def reaction_volume_shock(history: pd.DataFrame, reaction_session: pd.Timestamp)
     baseline = history["Volume"].iloc[max(0, position - 20) : position]
     if baseline.empty:
         return None
-    median_volume = float(baseline.median())
-    if median_volume <= 0:
+    try:
+        median_volume = _extract_finite_scalar(baseline.median())
+    except ValueError:
         return None
-    return float(history["Volume"].iloc[position] / median_volume)
+    if median_volume is None or median_volume <= 0:
+        return None
+    try:
+        return _extract_finite_scalar(history["Volume"].iloc[position] / median_volume)
+    except ValueError:
+        return None
 
 
 def calculate_event_quality(
@@ -520,56 +603,62 @@ def calculate_event_quality(
     }
 
 
+def _empty_drift_metrics() -> dict[str, float | None]:
+    return {
+        "move_retention": None,
+        "drawdown_from_post_high": None,
+        "relative_strength_post_event": None,
+        "earnings_avwap": None,
+        "extension_from_avwap": None,
+    }
+
+
 def calculate_drift_metrics(
     history: pd.DataFrame,
     benchmark_history: pd.DataFrame,
     reaction_session: pd.Timestamp,
 ) -> dict[str, float | None]:
     if reaction_session not in history.index or reaction_session not in benchmark_history.index:
-        return {
-            "move_retention": None,
-            "drawdown_from_post_high": None,
-            "relative_strength_post_event": None,
-            "earnings_avwap": None,
-            "extension_from_avwap": None,
-        }
+        return _empty_drift_metrics()
     position = history.index.get_loc(reaction_session)
     benchmark_position = benchmark_history.index.get_loc(reaction_session)
     if isinstance(position, (slice, np.ndarray)) or isinstance(benchmark_position, (slice, np.ndarray)):
-        return {
-            "move_retention": None,
-            "drawdown_from_post_high": None,
-            "relative_strength_post_event": None,
-            "earnings_avwap": None,
-            "extension_from_avwap": None,
-        }
+        return _empty_drift_metrics()
     if position == 0 or benchmark_position == 0:
-        return {
-            "move_retention": None,
-            "drawdown_from_post_high": None,
-            "relative_strength_post_event": None,
-            "earnings_avwap": None,
-            "extension_from_avwap": None,
-        }
+        return _empty_drift_metrics()
 
-    pre_event_close = float(history["Close"].iloc[position - 1])
-    reaction_close = float(history["Close"].iloc[position])
-    current_close = float(history["Close"].iloc[-1])
+    try:
+        pre_event_close = _extract_finite_scalar(history["Close"].iloc[position - 1])
+        reaction_close = _extract_finite_scalar(history["Close"].iloc[position])
+        current_close = _extract_finite_scalar(history["Close"].iloc[-1])
+    except ValueError:
+        return _empty_drift_metrics()
+    if pre_event_close is None or reaction_close is None or current_close is None:
+        return _empty_drift_metrics()
     reaction_move = reaction_close - pre_event_close
     move_retention = None
     if reaction_move > 0:
         move_retention = (current_close - pre_event_close) / reaction_move
 
     post_event_sample = history.iloc[position:]
-    post_event_high = float(post_event_sample["High"].max()) if not post_event_sample.empty else current_close
+    try:
+        post_event_high = _extract_finite_scalar(post_event_sample["High"].max()) if not post_event_sample.empty else current_close
+    except ValueError:
+        post_event_high = current_close
+    if post_event_high is None:
+        post_event_high = current_close
     drawdown = None
     if post_event_high > 0:
         drawdown = (post_event_high - current_close) / post_event_high
 
-    benchmark_pre = float(benchmark_history["Close"].iloc[benchmark_position - 1])
-    benchmark_current = float(benchmark_history["Close"].iloc[-1])
+    try:
+        benchmark_pre = _extract_finite_scalar(benchmark_history["Close"].iloc[benchmark_position - 1])
+        benchmark_current = _extract_finite_scalar(benchmark_history["Close"].iloc[-1])
+    except ValueError:
+        benchmark_pre = None
+        benchmark_current = None
     stock_return = (current_close / pre_event_close) - 1.0 if pre_event_close > 0 else None
-    benchmark_return = (benchmark_current / benchmark_pre) - 1.0 if benchmark_pre > 0 else None
+    benchmark_return = (benchmark_current / benchmark_pre) - 1.0 if benchmark_pre is not None and benchmark_pre > 0 else None
     relative_strength = None
     if stock_return is not None and benchmark_return is not None:
         relative_strength = stock_return - benchmark_return
@@ -606,46 +695,70 @@ def calculate_drift_integrity(metrics: dict[str, float | None], current_close: f
     }
 
 
+def _empty_entry_quality() -> dict[str, float | None]:
+    return {
+        "entry_score": 0.0,
+        "consolidation_score": 0.0,
+        "volume_contraction_score": 0.0,
+        "support_score": 0.0,
+        "extension_score": 0.0,
+        "recent_range_pct": None,
+        "base_range_pct": None,
+        "volume_contraction_ratio": None,
+        "breakout_level": None,
+    }
+
+
 def calculate_entry_quality(history: pd.DataFrame, reaction_session: pd.Timestamp, avwap: float | None) -> dict[str, float | None]:
     post_event = history.loc[history.index >= reaction_session]
     if len(post_event) < 8:
-        return {
-            "entry_score": 0.0,
-            "consolidation_score": 0.0,
-            "volume_contraction_score": 0.0,
-            "support_score": 0.0,
-            "extension_score": 0.0,
-            "recent_range_pct": None,
-            "base_range_pct": None,
-            "volume_contraction_ratio": None,
-            "breakout_level": None,
-        }
+        return _empty_entry_quality()
 
-    current_close = float(post_event["Close"].iloc[-1])
+    try:
+        current_close = _extract_finite_scalar(post_event["Close"].iloc[-1])
+    except ValueError:
+        return _empty_entry_quality()
+    if current_close is None:
+        return _empty_entry_quality()
     recent = post_event.tail(min(10, len(post_event)))
     base = post_event.tail(min(25, len(post_event)))
 
-    recent_low = float(recent["Low"].min())
-    base_low = float(base["Low"].min())
-    recent_range_pct = (float(recent["High"].max()) - recent_low) / recent_low if recent_low > 0 else None
-    base_range_pct = (float(base["High"].max()) - base_low) / base_low if base_low > 0 else None
+    try:
+        recent_low = _extract_finite_scalar(recent["Low"].min())
+        base_low = _extract_finite_scalar(base["Low"].min())
+        recent_high = _extract_finite_scalar(recent["High"].max())
+        base_high = _extract_finite_scalar(base["High"].max())
+    except ValueError:
+        return _empty_entry_quality()
+
+    recent_range_pct = (recent_high - recent_low) / recent_low if recent_low is not None and recent_low > 0 and recent_high is not None else None
+    base_range_pct = (base_high - base_low) / base_low if base_low is not None and base_low > 0 and base_high is not None else None
 
     compression = None
     if recent_range_pct is not None and base_range_pct not in (None, 0.0):
         compression = recent_range_pct / base_range_pct
 
     prior_volumes = post_event["Volume"].tail(min(30, len(post_event)))
-    recent_volume = float(prior_volumes.tail(min(10, len(prior_volumes))).median()) if not prior_volumes.empty else None
-    base_volume = (
-        float(prior_volumes.head(max(1, len(prior_volumes) - min(10, len(prior_volumes)))).median())
-        if len(prior_volumes) > 10
-        else None
-    )
+    try:
+        recent_volume = _extract_finite_scalar(prior_volumes.tail(min(10, len(prior_volumes))).median()) if not prior_volumes.empty else None
+        base_volume = (
+            _extract_finite_scalar(prior_volumes.head(max(1, len(prior_volumes) - min(10, len(prior_volumes)))).median())
+            if len(prior_volumes) > 10
+            else None
+        )
+    except ValueError:
+        recent_volume = None
+        base_volume = None
     volume_ratio = None
     if recent_volume is not None and base_volume not in (None, 0.0):
         volume_ratio = recent_volume / base_volume
 
-    breakout_level = float(base["High"].iloc[:-1].max()) if len(base) > 1 else current_close
+    try:
+        breakout_level = _extract_finite_scalar(base["High"].iloc[:-1].max()) if len(base) > 1 else current_close
+    except ValueError:
+        breakout_level = current_close
+    if breakout_level is None:
+        breakout_level = current_close
     extension_from_avwap = None
     if avwap not in (None, 0.0):
         extension_from_avwap = (current_close - float(avwap)) / float(avwap)
@@ -689,7 +802,7 @@ def classify_setup_type(
     drawdown_from_post_high: float | None,
     extension_from_avwap: float | None,
 ) -> str:
-    if breakout_level not in (None, 0.0) and current_close >= float(breakout_level) * 0.995:
+    if breakout_level not in (None, 0.0) and current_close >= breakout_level * 0.995:
         return "pead_breakout"
     if recent_range_pct is not None and recent_range_pct <= 0.08:
         return "pead_consolidation"
@@ -716,14 +829,17 @@ def build_risk_flags(
         flags.append("negative_reaction")
     if current_close < reaction_low:
         flags.append("reaction_low_broken")
-    if drift_metrics.get("move_retention") is not None and float(drift_metrics["move_retention"]) < 0.25:
+    move_retention = drift_metrics.get("move_retention")
+    if move_retention is not None and move_retention < 0.25:
         flags.append("gap_failed")
     avwap = drift_metrics.get("earnings_avwap")
-    if avwap not in (None, 0.0) and current_close < float(avwap):
+    if avwap not in (None, 0.0) and current_close < avwap:
         flags.append("below_earnings_avwap")
-    if drift_metrics.get("drawdown_from_post_high") is not None and float(drift_metrics["drawdown_from_post_high"]) > 0.25:
+    drawdown = drift_metrics.get("drawdown_from_post_high")
+    if drawdown is not None and drawdown > 0.25:
         flags.append("excessive_drawdown")
-    if drift_metrics.get("extension_from_avwap") is not None and float(drift_metrics["extension_from_avwap"]) > 0.18:
+    extension = drift_metrics.get("extension_from_avwap")
+    if extension is not None and extension > 0.18:
         flags.append("overextended")
     if median_dollar_volume_value is not None and median_dollar_volume_value < config.min_median_dollar_volume:
         flags.append("low_liquidity")
@@ -789,8 +905,21 @@ def evaluate_ticker(
     next_earnings_date: date | None,
     config: VpmaConfig,
 ) -> VpmaTickerResult:
-    current_close = float(history["Close"].iloc[-1])
-    reaction_low = float(history.loc[event.reaction_session, "Low"])
+    try:
+        current_close = _extract_finite_scalar(history["Close"].iloc[-1])
+    except ValueError:
+        current_close = None
+    if current_close is None:
+        current_close = 0.0
+    row = history.loc[event.reaction_session]
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[0]
+    try:
+        reaction_low = _extract_finite_scalar(row["Low"])
+    except ValueError:
+        reaction_low = current_close
+    if reaction_low is None:
+        reaction_low = current_close
     abnormal = reaction_abnormal_return(history, benchmark_history, event.reaction_session)
     closing_position = reaction_closing_position(history, event.reaction_session)
     volume_shock = reaction_volume_shock(history, event.reaction_session)
@@ -1068,6 +1197,10 @@ def run_vpma_scan(
         "liquid_histories": 0,
         "recent_event_tickers": 0,
         "enriched_tickers": 0,
+        "invalid_symbol": 0,
+        "missing_market_data": 0,
+        "calculation_rejected": 0,
+        "unexpected_errors": 0,
     }
 
     requested_test_tickers = [
@@ -1109,19 +1242,12 @@ def run_vpma_scan(
     if not eligible:
         return VpmaScanResult(results=[], observed_at=observed_at, analysed_tickers=0, counts=counts, errors=errors)
 
-    benchmark_history = data_source.benchmark_history(DEFAULT_BENCHMARK)
-    histories = data_source.download_histories([ticker.ticker for ticker in eligible])
-
     results: list[VpmaTickerResult] = []
+    invalid_tickers: set[str] = set()
     for ticker in eligible:
-        history = histories.get(ticker.ticker)
-        if history is None or history.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(history.columns):
-            continue
-        history = history.dropna(subset=["Close", "Volume"]).copy()
-        if history.empty:
-            continue
-        mdv = median_dollar_volume(history)
-        if mdv is None or mdv < config.min_median_dollar_volume:
+        if not _yahoo_valid_symbol(ticker.ticker):
+            invalid_tickers.add(ticker.ticker)
+            counts["invalid_symbol"] += 1
             results.append(
                 VpmaTickerResult(
                     ticker=ticker.ticker,
@@ -1133,50 +1259,211 @@ def run_vpma_scan(
                     confirmation_score=None,
                     data_confidence="low",
                     setup_type="pead_deteriorating",
-                    reason="Excluded: insufficient liquidity.",
+                    reason="Excluded: unsupported Yahoo symbol.",
                     valid_for_days=config.valid_days,
-                    details={"risk_flags": ["low_liquidity"], "median_dollar_volume": mdv, "model_version": MODEL_VERSION},
+                    details={"risk_flags": ["invalid_symbol"], "model_version": MODEL_VERSION},
                 )
             )
-            continue
-        counts["liquid_histories"] += 1
-        event_frame = data_source.earnings_dates(ticker.ticker)
-        event = extract_recent_earnings_event(
-            event_frame,
-            history.index,
-            lookback_days=config.event_lookback_days,
-        )
-        if event is None or event.days_since_reaction > 60:
-            results.append(
-                VpmaTickerResult(
-                    ticker=ticker.ticker,
-                    classification="excluded",
-                    core_score=0.0,
-                    event_score=0.0,
-                    drift_score=0.0,
-                    entry_score=0.0,
-                    confirmation_score=None,
-                    data_confidence="low",
-                    setup_type="pead_deteriorating",
-                    reason="Excluded: stale or missing recent earnings event.",
-                    valid_for_days=config.valid_days,
-                    details={"risk_flags": ["insufficient_history"], "model_version": MODEL_VERSION},
-                )
-            )
-            continue
-        counts["recent_event_tickers"] += 1
-        next_earnings = data_source.next_earnings_date(ticker.ticker)
-        results.append(
-            evaluate_ticker(
-                ticker,
-                history,
-                benchmark_history,
-                event,
-                next_earnings_date=next_earnings,
-                config=config,
-            )
-        )
 
+    valid_eligible = [t for t in eligible if t.ticker not in invalid_tickers]
+
+    benchmark_history = data_source.benchmark_history(DEFAULT_BENCHMARK)
+    histories = data_source.download_histories([ticker.ticker for ticker in valid_eligible])
+
+    for ticker in valid_eligible:
+        try:
+            _evaluate_single_ticker(
+                ticker,
+                histories,
+                benchmark_history,
+                data_source,
+                config,
+                results,
+                counts,
+            )
+        except Exception as exc:
+            counts["unexpected_errors"] += 1
+            logger.warning("VPMA evaluation failed for %s: %s", ticker.ticker, exc.__class__.__name__)
+            errors.append(f"evaluate:{ticker.ticker}:{exc.__class__.__name__}")
+            results.append(
+                VpmaTickerResult(
+                    ticker=ticker.ticker,
+                    classification="excluded",
+                    core_score=0.0,
+                    event_score=0.0,
+                    drift_score=0.0,
+                    entry_score=0.0,
+                    confirmation_score=None,
+                    data_confidence="low",
+                    setup_type="pead_deteriorating",
+                    reason=f"Excluded: unexpected error ({exc.__class__.__name__}).",
+                    valid_for_days=config.valid_days,
+                    details={"risk_flags": ["unexpected_error"], "model_version": MODEL_VERSION},
+                )
+            )
+
+    _apply_enrichment_pass(results, config, alpha_client, counts)
+
+    if config.guidance_enable and sec_provider is not None:
+        _apply_guidance_pass(results, eligible, config, sec_provider, errors)
+
+    retained = [r for r in results if r.classification != "excluded"]
+    logger.info(
+        "VPMA scan summary: universe=%d evaluated=%d retained=%d "
+        "invalid_symbol=%d missing_market_data=%d calculation_rejected=%d unexpected_errors=%d",
+        counts["eligible_universe_tickers"],
+        counts.get("recent_event_tickers", 0),
+        len(retained),
+        counts.get("invalid_symbol", 0),
+        counts.get("missing_market_data", 0),
+        counts.get("calculation_rejected", 0),
+        counts.get("unexpected_errors", 0),
+    )
+
+    return VpmaScanResult(
+        results=results,
+        observed_at=observed_at,
+        analysed_tickers=counts["recent_event_tickers"],
+        counts=counts,
+        errors=errors,
+    )
+
+
+def _evaluate_single_ticker(
+    ticker: UniverseTicker,
+    histories: dict[str, pd.DataFrame],
+    benchmark_history: pd.DataFrame,
+    data_source: YfinanceVpmaDataSource,
+    config: VpmaConfig,
+    results: list[VpmaTickerResult],
+    counts: dict[str, int],
+) -> None:
+    history = histories.get(ticker.ticker)
+    if history is None or history.empty or not {"Open", "High", "Low", "Close", "Volume"}.issubset(history.columns):
+        counts["missing_market_data"] += 1
+        results.append(
+            VpmaTickerResult(
+                ticker=ticker.ticker,
+                classification="excluded",
+                core_score=0.0,
+                event_score=0.0,
+                drift_score=0.0,
+                entry_score=0.0,
+                confirmation_score=None,
+                data_confidence="low",
+                setup_type="pead_deteriorating",
+                reason="Excluded: market data unavailable.",
+                valid_for_days=config.valid_days,
+                details={"risk_flags": ["missing_market_data"], "model_version": MODEL_VERSION},
+            )
+        )
+        return
+    history = history.dropna(subset=["Close", "Volume"]).copy()
+    if history.empty:
+        counts["missing_market_data"] += 1
+        results.append(
+            VpmaTickerResult(
+                ticker=ticker.ticker,
+                classification="excluded",
+                core_score=0.0,
+                event_score=0.0,
+                drift_score=0.0,
+                entry_score=0.0,
+                confirmation_score=None,
+                data_confidence="low",
+                setup_type="pead_deteriorating",
+                reason="Excluded: market data unavailable after cleaning.",
+                valid_for_days=config.valid_days,
+                details={"risk_flags": ["missing_market_data"], "model_version": MODEL_VERSION},
+            )
+        )
+        return
+    try:
+        mdv = median_dollar_volume(history)
+    except ValueError:
+        mdv = None
+    if mdv is None or mdv < config.min_median_dollar_volume:
+        results.append(
+            VpmaTickerResult(
+                ticker=ticker.ticker,
+                classification="excluded",
+                core_score=0.0,
+                event_score=0.0,
+                drift_score=0.0,
+                entry_score=0.0,
+                confirmation_score=None,
+                data_confidence="low",
+                setup_type="pead_deteriorating",
+                reason="Excluded: insufficient liquidity.",
+                valid_for_days=config.valid_days,
+                details={"risk_flags": ["low_liquidity"], "median_dollar_volume": mdv, "model_version": MODEL_VERSION},
+            )
+        )
+        return
+    counts["liquid_histories"] += 1
+    event_frame = data_source.earnings_dates(ticker.ticker)
+    event = extract_recent_earnings_event(
+        event_frame,
+        history.index,
+        lookback_days=config.event_lookback_days,
+    )
+    if event is None or event.days_since_reaction > 60:
+        results.append(
+            VpmaTickerResult(
+                ticker=ticker.ticker,
+                classification="excluded",
+                core_score=0.0,
+                event_score=0.0,
+                drift_score=0.0,
+                entry_score=0.0,
+                confirmation_score=None,
+                data_confidence="low",
+                setup_type="pead_deteriorating",
+                reason="Excluded: stale or missing recent earnings event.",
+                valid_for_days=config.valid_days,
+                details={"risk_flags": ["insufficient_history"], "model_version": MODEL_VERSION},
+            )
+        )
+        return
+    counts["recent_event_tickers"] += 1
+    next_earnings = data_source.next_earnings_date(ticker.ticker)
+    try:
+        result = evaluate_ticker(
+            ticker,
+            history,
+            benchmark_history,
+            event,
+            next_earnings_date=next_earnings,
+            config=config,
+        )
+    except Exception:
+        counts["calculation_rejected"] += 1
+        results.append(
+            VpmaTickerResult(
+                ticker=ticker.ticker,
+                classification="excluded",
+                core_score=0.0,
+                event_score=0.0,
+                drift_score=0.0,
+                entry_score=0.0,
+                confirmation_score=None,
+                data_confidence="low",
+                setup_type="pead_deteriorating",
+                reason="Excluded: calculation error.",
+                valid_for_days=config.valid_days,
+                details={"risk_flags": ["calculation_error"], "model_version": MODEL_VERSION},
+            )
+        )
+        return
+    results.append(result)
+
+
+def _apply_enrichment_pass(
+    results: list[VpmaTickerResult],
+    config: VpmaConfig,
+    alpha_client: AlphaVantageClient,
+    counts: dict[str, int],
+) -> None:
     if config.enable_enrichment:
         enrichable = [
             result
@@ -1191,7 +1478,7 @@ def run_vpma_scan(
             enriched_by_ticker[result.ticker] = confirmation
             if confirmation.status == "ENRICHED":
                 counts["enriched_tickers"] += 1
-        results = [
+        results[:] = [
             apply_confirmation(result, enriched_by_ticker[result.ticker])
             if result.ticker in enriched_by_ticker
             else VpmaTickerResult(
@@ -1203,7 +1490,7 @@ def run_vpma_scan(
             for result in results
         ]
     else:
-        results = [
+        results[:] = [
             VpmaTickerResult(
                 **{
                     **result.__dict__,
@@ -1212,14 +1499,3 @@ def run_vpma_scan(
             )
             for result in results
         ]
-
-    if config.guidance_enable and sec_provider is not None:
-        _apply_guidance_pass(results, eligible, config, sec_provider, errors)
-
-    return VpmaScanResult(
-        results=results,
-        observed_at=observed_at,
-        analysed_tickers=counts["recent_event_tickers"],
-        counts=counts,
-        errors=errors,
-    )

@@ -10,8 +10,14 @@ from typing import Any
 import requests
 import yfinance as yf
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+
 from providers.sec import get_sec_provider
 from providers.sec.base import SECProvider
+from providers.sec.errors import SECAccessDeniedError, SECNotFoundError, SECRequestError
 from providers.sec.models import FilingMetadata, SECInsiderTransaction
 from scanners.insider.parser import (
     MasterIndexEntry,
@@ -276,6 +282,22 @@ def build_source_fingerprint(
 
 def _today() -> date:
     return datetime.now(UTC).date()
+
+
+def _ny_business_dates_before(reference: datetime, count: int) -> list[date]:
+    """Yield up to `count` US business days (Mon-Fri) before `reference` in Eastern time.
+
+    The current day is included only if it is a business day.  Weekends are skipped
+    without consuming a slot.
+    """
+    ny = reference.astimezone(ZoneInfo("America/New_York")) if reference.tzinfo is not None else reference
+    day = ny.date()
+    results: list[date] = []
+    while len(results) < count:
+        if day.weekday() < 5:
+            results.append(day)
+        day = day - timedelta(days=1)
+    return results
 
 
 def _median_dollar_volume(ticker: str) -> tuple[float | None, float | None, list[str]]:
@@ -1133,6 +1155,24 @@ def run_insider_scan(
     sec_provider = sec_provider or get_sec_provider()
     observed = datetime.fromisoformat((observed_at or datetime.now(UTC).isoformat()).replace("Z", "+00:00"))
     history_since = observed.date() - timedelta(days=max(0, config.history_days))
+
+    agent_value = str(getattr(sec_provider, "user_agent", "") or os.getenv("SEC_USER_AGENT", "")).strip()
+    user_agent_configured = bool(agent_value and agent_value != "hxfinancebot/1.0 (contact@hxfinancebot.dev)")
+
+    observed_ny = observed.astimezone(ZoneInfo("America/New_York")) if observed.tzinfo is not None else observed
+    candidate_dates = _ny_business_dates_before(observed, max(1, int(config.lookback_days)))
+    latest_candidate = candidate_dates[0] if candidate_dates else None
+
+    logger.info(
+        "Insider scan starting: lookback_business_days=%d history_days=%d cluster_days=%d "
+        "latest_candidate_index_date=%s user_agent_configured=%s",
+        config.lookback_days,
+        config.history_days,
+        config.cluster_days,
+        latest_candidate.isoformat() if latest_candidate else "none",
+        user_agent_configured,
+    )
+
     seen_accessions = set(prior_accessions or set())
     historical_by_ticker: dict[str, list[QualifyingPurchase]] = {}
     for purchase in prior_purchases or []:
@@ -1144,13 +1184,40 @@ def run_insider_scan(
     processed_accessions: set[str] = set()
     ledger_rows: list[dict[str, Any]] = []
     scanned_entries = 0
+    persistent_403_count = 0
+    dates_attempted = 0
+    dates_loaded = 0
 
-    for offset in range(config.lookback_days):
-        day = (observed.date() - timedelta(days=offset))
+    for day in candidate_dates:
+        dates_attempted += 1
+        is_today_or_tomorrow = day >= observed_ny.date() - timedelta(days=1)
         try:
             entries = sec_provider.daily_index_filings(day, forms={"4", "4/A"})
         except FileNotFoundError:
+            if day.weekday() >= 5:
+                logger.debug("Insider SEC index skipped: date=%s reason=weekend", day.isoformat())
+            elif is_today_or_tomorrow:
+                logger.info("Insider SEC index skipped: date=%s reason=current_index_not_yet_complete", day.isoformat())
+            else:
+                logger.info("Insider SEC index skipped: date=%s reason=index_file_not_found", day.isoformat())
             continue
+        except SECAccessDeniedError:
+            persistent_403_count += 1
+            if is_today_or_tomorrow:
+                logger.info("Insider SEC index skipped: date=%s reason=current_index_not_complete", day.isoformat())
+            else:
+                logger.warning("Insider SEC index access denied: date=%s reason=access_denied", day.isoformat())
+            continue
+        except SECNotFoundError:
+            logger.info("Insider SEC index skipped: date=%s reason=index_file_not_found", day.isoformat())
+            continue
+        except SECRequestError as exc:
+            logger.warning("Insider SEC index request failed: date=%s error=%s", day.isoformat(), exc.__class__.__name__)
+            continue
+
+        dates_loaded += 1
+        form4_count = len(entries)
+        logger.info("Insider SEC index loaded: date=%s form4_entries=%d", day.isoformat(), form4_count)
         for filing_metadata in entries:
             accession = filing_metadata.accession
             if accession in seen_accessions:
@@ -1170,6 +1237,15 @@ def run_insider_scan(
             except Exception as exc:
                 logger.warning("Insider filing failed for %s: %s", accession, exc.__class__.__name__)
                 continue
+
+    if dates_loaded == 0 and persistent_403_count > 0:
+        raise SECRequestError(
+            f"Insider scan failed: persistent SEC access denial across {persistent_403_count} historical business dates. "
+            "Check SEC_USER_AGENT configuration."
+        )
+
+    new_accessions = len(processed_accessions)
+    qualifying_purchases = sum(len(items) for items in new_purchases_by_ticker.values())
 
     all_tickers = sorted(set(historical_by_ticker).union(new_purchases_by_ticker))
     merged_purchases_by_ticker: dict[str, list[QualifyingPurchase]] = {}
@@ -1197,9 +1273,28 @@ def run_insider_scan(
     ]
     retained = [result for result in results if result is not None]
     retained.sort(key=lambda item: (item.total_score, item.conviction_score, item.commitment_score), reverse=True)
+
+    tickers_scored = len({r.ticker for r in retained})
+    signals_retained = len(retained)
+    logger.info(
+        "Insider engine scan: index_dates_attempted=%d index_dates_loaded=%d entries=%d "
+        "new_accessions=%d qualifying_purchases=%d tickers_scored=%d signals_retained=%d",
+        dates_attempted,
+        dates_loaded,
+        scanned_entries,
+        new_accessions,
+        qualifying_purchases,
+        tickers_scored,
+        signals_retained,
+    )
+
     return retained[: config.max_results], {
         "scanned_entries": scanned_entries,
-        "qualifying_purchases": sum(len(items) for items in new_purchases_by_ticker.values()),
+        "qualifying_purchases": qualifying_purchases,
         "processed_accessions": sorted(processed_accessions),
         "ledger_rows": ledger_rows,
+        "dates_attempted": dates_attempted,
+        "dates_loaded": dates_loaded,
+        "new_accessions": new_accessions,
+        "tickers_scored": tickers_scored,
     }

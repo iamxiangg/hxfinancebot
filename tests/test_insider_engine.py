@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import unittest
 from unittest.mock import patch
 
+from providers.sec.errors import SECAccessDeniedError, SECNotFoundError, SECRequestError
 from providers.sec.models import FilingMetadata, SECInsiderTransaction
 from scanners.insider.engine import (
     InsiderConfig,
     QualifyingPurchase,
+    _ny_business_dates_before,
     build_transaction_group_key,
     build_transaction_key,
     merge_purchase_history,
@@ -16,6 +18,11 @@ from scanners.insider.engine import (
     score_cluster,
 )
 from scanners.insider.parser import NonDerivativeTransaction, ParsedOwnershipFiling, ReportingOwner
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 
 def make_purchase(
@@ -356,7 +363,7 @@ class InsiderEngineTests(unittest.TestCase):
 
     @patch("scanners.insider.engine._median_dollar_volume", return_value=(45.0, 20_000_000.0, []))
     def test_run_scan_isolates_filing_failures(self, _mock_market) -> None:
-        target_day = date(2026, 6, 27)
+        target_day = date(2026, 6, 26)
         sec_provider = _FakeSECProvider(
             {
                 target_day: [
@@ -365,8 +372,8 @@ class InsiderEngineTests(unittest.TestCase):
                         cik="0000000001",
                         accession="bad",
                         form="4",
-                        filed_at=datetime(2026, 6, 27, tzinfo=UTC),
-                        report_date=date(2026, 6, 27),
+                        filed_at=datetime(2026, 6, 26, tzinfo=UTC),
+                        report_date=date(2026, 6, 26),
                         primary_document="bad.txt",
                         is_amendment=False,
                         source_url="https://www.sec.gov/Archives/edgar/data/1/bad.txt",
@@ -376,8 +383,8 @@ class InsiderEngineTests(unittest.TestCase):
                         cik="0000000002",
                         accession="good",
                         form="4",
-                        filed_at=datetime(2026, 6, 27, tzinfo=UTC),
-                        report_date=date(2026, 6, 27),
+                        filed_at=datetime(2026, 6, 26, tzinfo=UTC),
+                        report_date=date(2026, 6, 26),
                         primary_document="good.txt",
                         is_amendment=False,
                         source_url="https://www.sec.gov/Archives/edgar/data/2/good.txt",
@@ -398,7 +405,7 @@ class InsiderEngineTests(unittest.TestCase):
                         owner_is_ten_percent_owner=False,
                         officer_title="CEO",
                         security_title="Common Stock",
-                        transaction_date=date(2026, 6, 27),
+                        transaction_date=date(2026, 6, 26),
                         transaction_code="P",
                         acquired_disposed="A",
                         shares=10_000,
@@ -418,7 +425,7 @@ class InsiderEngineTests(unittest.TestCase):
                         owner_is_ten_percent_owner=False,
                         officer_title="CFO",
                         security_title="Common Stock",
-                        transaction_date=date(2026, 6, 27),
+                        transaction_date=date(2026, 6, 26),
                         transaction_code="P",
                         acquired_disposed="A",
                         shares=10_000,
@@ -433,13 +440,258 @@ class InsiderEngineTests(unittest.TestCase):
 
         results, receipt = run_insider_scan(
             config=InsiderConfig(lookback_days=1),
-            observed_at="2026-06-27T12:00:00+00:00",
+            observed_at="2026-06-26T12:00:00+00:00",
             sec_provider=sec_provider,
         )
 
         self.assertEqual(receipt["scanned_entries"], 2)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].ticker, "TEAM")
+
+
+class _FakeSECProvider403:
+    """Fake provider that raises SECAccessDeniedError for all dates."""
+    def __init__(self) -> None:
+        self.user_agent = "test/1.0 (test@example.com)"
+
+    def daily_index_filings(self, day: date, *, forms=None):
+        raise SECAccessDeniedError(f"https://www.sec.gov/test/{day}")
+
+    def form4_transactions(self, filing):
+        return []
+
+
+class _FakeSECProvider404:
+    """Fake provider that raises FileNotFoundError for all dates."""
+    def __init__(self) -> None:
+        self.user_agent = "test/1.0 (test@example.com)"
+
+    def daily_index_filings(self, day: date, *, forms=None):
+        raise FileNotFoundError(str(day))
+
+    def form4_transactions(self, filing):
+        return []
+
+
+class NyBusinessDatesTests(unittest.TestCase):
+    def test_sunday_utc_selects_prior_friday(self) -> None:
+        sunday_utc = datetime(2026, 6, 28, 2, 0, 0, tzinfo=UTC)
+        dates = _ny_business_dates_before(sunday_utc, 1)
+        self.assertEqual(len(dates), 1)
+        self.assertEqual(dates[0], date(2026, 6, 26))
+        self.assertEqual(dates[0].weekday(), 4)
+
+    def test_monday_morning_singapore_selects_prior_friday(self) -> None:
+        monday_sg = datetime(2026, 6, 29, 1, 34, 0, tzinfo=UTC)
+        dates = _ny_business_dates_before(monday_sg, 1)
+        self.assertEqual(len(dates), 1)
+        self.assertEqual(dates[0], date(2026, 6, 26))
+        self.assertEqual(dates[0].weekday(), 4)
+
+    def test_monday_afternoon_ny_selects_monday(self) -> None:
+        monday_ny = datetime(2026, 6, 29, 20, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        dates = _ny_business_dates_before(monday_ny, 1)
+        self.assertEqual(len(dates), 1)
+        self.assertEqual(dates[0], date(2026, 6, 29))
+        self.assertEqual(dates[0].weekday(), 0)
+
+    def test_business_days_exclude_weekends(self) -> None:
+        date_range_start = datetime(2026, 6, 26, 12, 0, 0, tzinfo=UTC)
+        all_dates = _ny_business_dates_before(date_range_start, 7)
+        for d in all_dates:
+            self.assertLess(d.weekday(), 5)
+
+    def test_seven_business_days_count_is_correct(self) -> None:
+        date_range_start = datetime(2026, 6, 26, 12, 0, 0, tzinfo=UTC)
+        dates = _ny_business_dates_before(date_range_start, 7)
+        self.assertEqual(len(dates), 7)
+
+
+class _FakeSECProvider403OnFirst:
+    """Fake provider: raises SECAccessDeniedError for 'today', succeeds for prior dates."""
+    def __init__(self, today: date) -> None:
+        self.today = today
+        self.user_agent = "test/1.0 (test@example.com)"
+
+    def daily_index_filings(self, day: date, *, forms=None):
+        if day == self.today:
+            raise SECAccessDeniedError(f"403 for {day}")
+        if day == self.today - timedelta(days=1):
+            return [
+                FilingMetadata(
+                    ticker="", cik="0000000001", accession="good", form="4",
+                    filed_at=datetime(day.year, day.month, day.day, tzinfo=UTC),
+                    report_date=day, primary_document="good.txt", is_amendment=False,
+                    source_url="https://www.sec.gov/Archives/edgar/data/1/good.txt",
+                )
+            ]
+        raise FileNotFoundError(str(day))
+
+    def form4_transactions(self, filing):
+        return [
+            SECInsiderTransaction(
+                ticker="TEAM", issuer_cik="1", accession="good", owner_cik="10",
+                owner_name="CEO", owner_is_director=False, owner_is_officer=True,
+                owner_is_ten_percent_owner=False, officer_title="CEO",
+                security_title="Common Stock",
+                transaction_date=date(2026, 6, 23) if filing.report_date == date(2026, 6, 23) else date(2026, 6, 24),
+                transaction_code="P", acquired_disposed="A", shares=10_000,
+                price_per_share=40.0, shares_owned_after=200_000.0,
+                direct_or_indirect="D", footnotes=[],
+            ),
+            SECInsiderTransaction(
+                ticker="TEAM", issuer_cik="1", accession="good", owner_cik="11",
+                owner_name="CFO", owner_is_director=False, owner_is_officer=True,
+                owner_is_ten_percent_owner=False, officer_title="CFO",
+                security_title="Common Stock",
+                transaction_date=date(2026, 6, 23) if filing.report_date == date(2026, 6, 23) else date(2026, 6, 24),
+                transaction_code="P", acquired_disposed="A", shares=10_000,
+                price_per_share=40.0, shares_owned_after=200_000.0,
+                direct_or_indirect="D", footnotes=[],
+            ),
+        ]
+
+
+
+class _FakeSECProviderHoliday:
+    """Fake provider that raises FileNotFoundError for a specific holiday date, succeeds for other dates."""
+    def __init__(self, holiday: date) -> None:
+        self.holiday = holiday
+        self.user_agent = "test/1.0 (test@example.com)"
+
+    def daily_index_filings(self, day: date, *, forms=None):
+        if day == self.holiday:
+            raise FileNotFoundError(str(day))
+        return [
+            FilingMetadata(
+                ticker="", cik="0000000001", accession="acc", form="4",
+                filed_at=datetime(day.year, day.month, day.day, tzinfo=UTC),
+                report_date=day, primary_document="doc.txt", is_amendment=False,
+                source_url=f"https://www.sec.gov/Archives/edgar/data/1/acc.txt",
+            )
+        ]
+
+    def form4_transactions(self, filing):
+        return []
+
+
+class InsiderScanErrorTests(unittest.TestCase):
+    @patch("scanners.insider.engine._median_dollar_volume", return_value=(45.0, 20_000_000.0, []))
+    def test_persistent_403_raises_source_failure(self, _mock_market) -> None:
+        sec_provider = _FakeSECProvider403()
+        with self.assertRaises(SECRequestError):
+            run_insider_scan(
+                config=InsiderConfig(lookback_days=7),
+                observed_at="2026-06-26T12:00:00+00:00",
+                sec_provider=sec_provider,
+            )
+
+    @patch("scanners.insider.engine._median_dollar_volume", return_value=(45.0, 20_000_000.0, []))
+    def test_all_404_dates_completes_without_error(self, _mock_market) -> None:
+        sec_provider = _FakeSECProvider404()
+        results, receipt = run_insider_scan(
+            config=InsiderConfig(lookback_days=3),
+            observed_at="2026-06-26T12:00:00+00:00",
+            sec_provider=sec_provider,
+        )
+        self.assertEqual(results, [])
+        self.assertEqual(receipt["scanned_entries"], 0)
+
+    @patch("scanners.insider.engine._median_dollar_volume", return_value=(45.0, 20_000_000.0, []))
+    def test_current_date_403_falls_back_to_prior_dates(self, _mock_market) -> None:
+        sec_provider = _FakeSECProvider403OnFirst(today=date(2026, 6, 26))
+        results, receipt = run_insider_scan(
+            config=InsiderConfig(lookback_days=3),
+            observed_at="2026-06-26T12:00:00+00:00",
+            sec_provider=sec_provider,
+        )
+        self.assertEqual(receipt["scanned_entries"], 1)
+
+    @patch("scanners.insider.engine._median_dollar_volume", return_value=(45.0, 20_000_000.0, []))
+    def test_one_404_does_not_terminate_scan(self, _mock_market) -> None:
+        target_day = date(2026, 6, 26)
+        sec_provider = _FakeSECProvider(
+            {
+                target_day: [
+                    FilingMetadata(
+                        ticker="",
+                        cik="0000000002",
+                        accession="good",
+                        form="4",
+                        filed_at=datetime(2026, 6, 26, tzinfo=UTC),
+                        report_date=date(2026, 6, 26),
+                        primary_document="good.txt",
+                        is_amendment=False,
+                        source_url="https://www.sec.gov/Archives/edgar/data/2/good.txt",
+                    ),
+                ]
+            },
+            {
+                "good": [
+                    SECInsiderTransaction(
+                        ticker="TEAM",
+                        issuer_cik="1",
+                        accession="good",
+                        owner_cik="10",
+                        owner_name="CEO",
+                        owner_is_director=False,
+                        owner_is_officer=True,
+                        owner_is_ten_percent_owner=False,
+                        officer_title="CEO",
+                        security_title="Common Stock",
+                        transaction_date=date(2026, 6, 26),
+                        transaction_code="P",
+                        acquired_disposed="A",
+                        shares=10_000,
+                        price_per_share=40.0,
+                        shares_owned_after=200_000.0,
+                        direct_or_indirect="D",
+                        footnotes=[],
+                    ),
+                    SECInsiderTransaction(
+                        ticker="TEAM",
+                        issuer_cik="1",
+                        accession="good",
+                        owner_cik="11",
+                        owner_name="CFO",
+                        owner_is_director=False,
+                        owner_is_officer=True,
+                        owner_is_ten_percent_owner=False,
+                        officer_title="CFO",
+                        security_title="Common Stock",
+                        transaction_date=date(2026, 6, 26),
+                        transaction_code="P",
+                        acquired_disposed="A",
+                        shares=10_000,
+                        price_per_share=40.0,
+                        shares_owned_after=200_000.0,
+                        direct_or_indirect="D",
+                        footnotes=[],
+                    ),
+                ],
+            },
+        )
+
+        results, receipt = run_insider_scan(
+            config=InsiderConfig(lookback_days=3),
+            observed_at="2026-06-26T12:00:00+00:00",
+            sec_provider=sec_provider,
+        )
+
+        self.assertGreaterEqual(receipt["scanned_entries"], 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].ticker, "TEAM")
+
+    def test_missing_holiday_index_is_skipped(self) -> None:
+        holiday = date(2026, 6, 25)
+        sec_provider = _FakeSECProviderHoliday(holiday=holiday)
+        results, receipt = run_insider_scan(
+            config=InsiderConfig(lookback_days=5),
+            observed_at="2026-06-26T12:00:00+00:00",
+            sec_provider=sec_provider,
+        )
+        self.assertGreaterEqual(receipt["dates_loaded"], 1)
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":

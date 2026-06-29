@@ -12,7 +12,11 @@ import requests
 
 from providers.sec.base import SECProvider
 from providers.sec.cache import JSONDiskCache
-from providers.sec.errors import SECNotFoundError, SECRequestError
+from providers.sec.errors import (
+    SECAccessDeniedError,
+    SECNotFoundError,
+    SECRequestError,
+)
 from providers.sec.models import (
     CompanyFacts,
     CompanyProfile,
@@ -123,8 +127,10 @@ class OfficialSECProvider(SECProvider):
         if not self.user_agent:
             self.user_agent = "hxfinancebot/1.0 (contact@hxfinancebot.dev)"
             logger.warning(
-                "SEC_USER_AGENT not set; using default '%s'. "
-                "Set SEC_USER_AGENT to a descriptive contact string per SEC EDGAR rules.",
+                "SEC_USER_AGENT is not configured. Using default '%s'. "
+                "Set the SEC_USER_AGENT GitHub Actions repository variable to a descriptive "
+                "contact string (e.g. 'hxfinancebot contact@example.com'). "
+                "This is NOT an account or API key — it follows SEC EDGAR fair-access rules.",
                 self.user_agent,
             )
         self.session = session or requests.Session()
@@ -204,6 +210,8 @@ class OfficialSECProvider(SECProvider):
             )
         except SECNotFoundError as exc:
             raise FileNotFoundError(str(day)) from exc
+        except SECAccessDeniedError as exc:
+            raise SECAccessDeniedError(str(exc)) from exc
         rows: list[FilingMetadata] = []
         for entry in parse_master_index(index_text):
             form = str(entry.form_type or "").strip().upper()
@@ -462,12 +470,17 @@ class OfficialSECProvider(SECProvider):
                 time.sleep(min(2 ** attempt, 5))
                 continue
             status = int(getattr(response, "status_code", 0))
-            if status in (403, 404):
+            if status == 404:
                 raise SECNotFoundError(url)
+            if status == 403:
+                if attempt >= self.retry_limit:
+                    raise SECAccessDeniedError(url)
+                time.sleep(min(2 ** attempt, 5))
+                continue
             if status == 429 or 500 <= status < 600:
                 if attempt >= self.retry_limit:
                     raise SECRequestError(f"SEC retryable request failed for {url}: HTTP {status}")
-                time.sleep(min(2 ** attempt, 5))
+                time.sleep(min(2 ** attempt, 8))
                 continue
             if 400 <= status < 500:
                 raise SECRequestError(f"SEC request failed for {url}: HTTP {status}")
