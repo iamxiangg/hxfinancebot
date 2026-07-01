@@ -206,5 +206,155 @@ class InsiderParserTests(unittest.TestCase):
         self.assertEqual(filing.transactions[0].transaction_code, "P")
 
 
+class WrapperDrillingTests(unittest.TestCase):
+    """Regression tests for ``_parse_root`` drilling past the ``<SEC-DOCUMENT>`` wrapper.
+
+    Production funnel log surfaced the exact substring::
+
+        ParseError("unexpected root tag 'SEC-DOCUMENT' (expected <ownershipDocument>);
+                    input first 80 chars: '<SEC-DOCUMENT>0001207407-26-000010.txt ...'")
+
+    The provider layer's ``find_ownership_xml_filename`` returns ``None`` for
+    Case A (wrapper already contains ``<ownershipDocument>``); the
+    ``scanners/insider/official.py`` path then falls back to passing the raw
+    index text to the parser. Pre the round-10 drill-past-wrapper helper,
+    ``_parse_root``'s root-tag check rejected the SGML envelope as
+    ``unexpected root tag 'SEC-DOCUMENT'`` and this filing landed in the
+    WARNING-noise bin instead of being parsed. The fix lives in parser.py,
+    not in the provider, so this test suite covers all four edge cases
+    locally.
+    """
+
+    _OWNERSHIP_BODY = (
+        '<?xml version="1.0"?>'
+        '<ownershipDocument>'
+        '  <issuer>'
+        '    <issuerCik>1001</issuerCik>'
+        '    <issuerTradingSymbol>WRAP</issuerTradingSymbol>'
+        '  </issuer>'
+        '  <reportingOwner>'
+        '    <reportingOwnerId>'
+        '      <rptOwnerCik>2002</rptOwnerCik>'
+        '      <rptOwnerName>Wrapper Tester</rptOwnerName>'
+        '    </reportingOwnerId>'
+        '    <reportingOwnerRelationship>'
+        '      <isDirector>0</isDirector>'
+        '      <isOfficer>1</isOfficer>'
+        '      <isTenPercentOwner>0</isTenPercentOwner>'
+        '      <officerTitle>Chief Executive Officer</officerTitle>'
+        '    </reportingOwnerRelationship>'
+        '  </reportingOwner>'
+        '  <periodOfReport>2026-06-23</periodOfReport>'
+        '  <nonDerivativeTable>'
+        '    <nonDerivativeTransaction>'
+        '      <securityTitle><value>Common Stock</value></securityTitle>'
+        '      <transactionDate><value>2026-06-23</value></transactionDate>'
+        '      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>'
+        '      <transactionAmounts>'
+        '        <transactionShares><value>1500</value></transactionShares>'
+        '        <transactionPricePerShare><value>9.5</value></transactionPricePerShare>'
+        '        <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>'
+        '      </transactionAmounts>'
+        '      <postTransactionAmounts>'
+        '        <sharesOwnedFollowingTransaction><value>15000</value></sharesOwnedFollowingTransaction>'
+        '      </postTransactionAmounts>'
+        '      <ownershipNature><directOrIndirectOwnership><value>D</value></directOrIndirectOwnership></ownershipNature>'
+        '    </nonDerivativeTransaction>'
+        '  </nonDerivativeTable>'
+        '</ownershipDocument>'
+    )
+
+    def _build_submission_wrapper(
+        self,
+        *,
+        body: str | None = None,
+        leading_whitespace: bool = False,
+        trailing_after_close: str = "\n<post-filing-footer>cleanup</post-filing-footer>\n",
+        truncate_closing_tag: bool = False,
+    ) -> str:
+        # Verbatim shape of an EDGAR submission index for accession
+        # ``0001207407-26-000010`` -- the EXACT prefix the production log
+        # showed (``<SEC-DOCUMENT>0001207407-26-000010.txt : 20260623\n
+        # <SEC-HEADER>``). The helper must recognise this prefix and
+        # drill past it to the inner ``<ownershipDocument>``.
+        body_xml = body if body is not None else self._OWNERSHIP_BODY
+        closing_tag = "</ownershipDocument>"
+        if truncate_closing_tag:
+            body_xml = body_xml[: body_xml.rfind(closing_tag)]
+        prefix = (
+            "<SEC-DOCUMENT>0001207407-26-000010.txt : 20260623\n"
+            "<SEC-HEADER>0001207407-26-000010-index.htm\n"
+            "<ACCEPTANCE-DATETIME>20260623120000\n"
+            "<FILENAME>primary_doc.xml\n"
+        )
+        text = prefix + body_xml + (closing_tag if not truncate_closing_tag else "") + trailing_after_close
+        return ("  \n" + text) if leading_whitespace else text
+
+    def test_sec_submission_wrapper_is_drilled_past(self) -> None:
+        # The exact production failure mode: provider hands the raw
+        # index text (with ``<SEC-DOCUMENT>`` envelope intact) to the
+        # parser. Pre-fix, ``_parse_root`` raised
+        # ``unexpected root tag 'SEC-DOCUMENT' (expected <ownershipDocument>)``.
+        # Post-fix, the drill helper isolates the inner XML and the
+        # parser produces a fully-populated ``ParsedOwnershipFiling``.
+        wrapped = self._build_submission_wrapper()
+
+        filing = parse_ownership_xml(wrapped, accession="0001207407-26-000010")
+
+        self.assertEqual(filing.issuer_ticker, "WRAP")
+        self.assertEqual(filing.reporting_owners[0].name, "Wrapper Tester")
+        self.assertEqual(filing.transactions[0].transaction_code, "P")
+        self.assertEqual(filing.transactions[0].shares, 1500.0)
+        self.assertEqual(filing.transactions[0].price_per_share, 9.5)
+        # The is_officer branch on ``reportingOwnerRelationship`` reached
+        # proves we descended *into* the inner XML, not just stopped at
+        # the wrapper.
+        self.assertTrue(filing.reporting_owners[0].is_officer)
+
+    def test_inner_ownership_xml_unchanged_when_no_wrapper(self) -> None:
+        # Belt-and-braces: drill must be a no-op for the happy path
+        # where the parser already receives a bare ``<ownershipDocument>``
+        # body (the ``HTTPSubmissionProvider`` case). Same observable
+        # fields as the wrapper case proves the helper just stripped the
+        # wrapper rather than accidentally mutating the inner XML.
+        filing = parse_ownership_xml(self._OWNERSHIP_BODY, accession="0003")
+
+        self.assertEqual(filing.issuer_ticker, "WRAP")
+        self.assertEqual(filing.reporting_owners[0].name, "Wrapper Tester")
+        self.assertEqual(filing.transactions[0].shares, 1500.0)
+
+    def test_leading_whitespace_before_sec_document_still_triggers_drill(self) -> None:
+        # Defensive edge case: SEC occasionally serves a leading BOM or
+        # CRLF sequence before the SGML opener (Fed-filings ingestions
+        # via FRED-style intermediaries have been observed doing this).
+        # ``lstrip().startswith("<SEC-DOCUMENT")`` is the prefix check,
+        # but the start-of-XML search uses the *original* ``xml_text``
+        # to keep the index. We assert the wrapper is still drilled
+        # past and the inner ownership XML survives.
+        wrapped = self._build_submission_wrapper(leading_whitespace=True)
+
+        filing = parse_ownership_xml(wrapped, accession="0004")
+
+        self.assertEqual(filing.issuer_ticker, "WRAP")
+        self.assertEqual(filing.reporting_owners[0].name, "Wrapper Tester")
+        self.assertEqual(filing.transactions[0].shares, 1500.0)
+
+    def test_truncated_wrapper_with_no_closing_tag_routes_to_parse_error(self) -> None:
+        # Defence-in-depth: if the wrapper contains ``<SEC-DOCUMENT>``
+        # *and* ``<ownershipDocument>`` but is truncated before
+        # ``</ownershipDocument>`` (think: a 502 Bad Gateway mid-stream
+        # that dropped the last 200 bytes of the body), the helper must
+        # NOT silently emit a half-truncated ownership XML saying
+        # ``transaction_shares = 0``. The contract is to surface the
+        # existing ParseError so the engine-level catch records the
+        # filing as a known failure rather than a successful parse that
+        # produced an empty filing. Critical for not corrupting the
+        # downstream ingest pipeline with zero-share rows.
+        truncated = self._build_submission_wrapper(truncate_closing_tag=True)
+
+        with self.assertRaises(ET.ParseError):
+            parse_ownership_xml(truncated, accession="0005")
+
+
 if __name__ == "__main__":
     unittest.main()

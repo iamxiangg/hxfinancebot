@@ -110,6 +110,49 @@ def find_ownership_xml_filename(filing_text: str) -> str | None:
     return matches[0] if matches else None
 
 
+def _maybe_extract_ownership_xml(xml_text: str) -> str:
+    """Drill past a SEC submission wrapper to the inner ``<ownershipDocument>``.
+
+    EDGAR submission indexes serve the filing as a ``<SEC-DOCUMENT>`` SGML
+    wrapper followed by the ``<ownershipDocument>`` payload. The wrapper
+    itself opens with ``<SEC-DOCUMENT>`` and carries ``<SEC-HEADER>`` /
+    ``<FILENAME>`` metadata; the actual Form 4 XML lives further down. When
+    the provider layer falls back to passing the raw index text (because
+    ``find_ownership_xml_filename`` detects Case A: the wrapper already
+    contains ``<ownershipDocument>``), this helper isolates the inner
+    element so the downstream root-tag check in ``_parse_root`` sees the
+    expected ``<ownershipDocument>`` markup instead of the SGML envelope.
+
+    Purely string-based: subsetting ``xml_text[start:end]`` and feeding the
+    slice to ``_parse_root`` lets ``lxml``'s ``recover=True`` round apply to
+    just the ownership XML body, so the SGML recovery defences in
+    ``_parse_root`` remain in effect.
+
+    Returns ``xml_text`` unchanged when no wrapper is detected, when the
+    inner ``<ownershipDocument>`` opener is missing, or when the closing
+    ``</ownershipDocument>`` tag is also missing - in those cases
+    ``_parse_root`` will surface the appropriate ``ParseError``.
+    """
+    # ``lstrip()`` only strips ASCII whitespace; SEC submissions are
+    # sometimes served with a UTF-8 BOM (`\ufeff`) at the very start of
+    # the document (most often via proxies that auto-add the BOM). Strip
+    # the BOM explicitly before the whitespace pass so the prefix check
+    # recognises wrapper-prefixed input unconditionally.
+    if not xml_text.lstrip("\ufeff").lstrip().startswith("<SEC-DOCUMENT"):
+        return xml_text
+
+    start_idx = xml_text.find("<ownershipDocument")
+    if start_idx == -1:
+        return xml_text
+
+    end_marker = "</ownershipDocument>"
+    end_idx = xml_text.find(end_marker, start_idx)
+    if end_idx == -1:
+        return xml_text
+
+    return xml_text[start_idx:end_idx + len(end_marker)]
+
+
 def _text(node: Any) -> str:
     # Accepts both xml.etree.ElementTree.Element and lxml.etree._Element - the
     # public surface used here (.text) is identical across both libraries.
@@ -139,6 +182,7 @@ def _parse_root(xml_text: str) -> Any:
     Falls back to stdlib only when ``lxml`` is missing (e.g. a partial dev
     environment); lxml is in the workflow dependency list already.
     """
+    xml_text = _maybe_extract_ownership_xml(xml_text)
     if _HAS_LXML:
         parser = _LXML_ETREE.XMLParser(recover=True, resolve_entities=False)
         try:
