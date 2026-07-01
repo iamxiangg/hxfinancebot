@@ -1,6 +1,10 @@
 # hxfinancebot
 
-Automated multi-source stock scanner and review funnel. Ingests signals from Congress disclosures, insider Form 4 filings, VPMA/PEAD earnings reactions, and fundamental inflection scanners. Enriches candidates with BTD (buy-the-dip) metrics, Feroldi AI scoring, and pushes review cards to Google Sheets + Telegram.
+Automated multi-source stock scanner and review funnel. Ingests signals from Congress disclosures, insider Form 4 filings, VPMA/PEAD earnings reactions, and fundamental inflection scanners. Enriches candidates with BTD (buy-the-dip) metrics, Feroldi 38-point deterministic scoring with **multi-year growth trajectory analysis**, and pushes review cards to Google Sheets + Telegram.
+
+**New: FMP Integration** — optional Financial Modeling Prep API key unlocks 3-year growth trajectory scoring (accelerating/stable/decelerating) for ROE, FCF, and EPS. FMP free tier (250 req/day, no credit card) covers the full pipeline with 8× headroom.
+
+**New in PR 1:** Canonical Entity Master, Evidence Ledger with provenance tracking, and no-LLM decision guardrails.
 
 ---
 
@@ -8,28 +12,40 @@ Automated multi-source stock scanner and review funnel. Ingests signals from Con
 
 ```
 hxfinancebot/
+├── models/             # Shared dataclasses (provenance, entity, evidence)
+│   └── common.py       #   SourceEvidence, DerivedValue, EntityMapping, EvidenceRecord
 ├── scanners/           # Scanner engines (signal generation)
 │   ├── congress/       #   Political disclosure scanning
 │   ├── insider/        #   SEC Form 4 insider-buying scanning
 │   ├── vpma/           #   VPMA/PEAD post-earnings drift scanning
 │   ├── earnings/       #   Earnings short-volatility scanning
-│   └── fundamental_inflection/
+│   ├── fundamental_inflection/
 │                       #   Fundamental-growth inflection scanning
+│   ├── entity_master/  #   Canonical entity resolution (CIK-based)
+│   ├── evidence_ledger/#   Idempotent evidence ledger with provenance
+│   └── no_llm_guard.py #   No-LLM decision guardrails
 ├── funnel/             # Review funnel (candidate intake, enrichment, notification)
 │   ├── review_candidates.py  # Main orchestrator
 │   ├── review_bot.py         # Telegram review bot
 │   ├── congress_adapter.py
 │   ├── insider_adapter.py
 │   ├── vpma_adapter.py
-│   ├── feroldi_ai.py         # AI-assisted draft generation
+│   ├── feroldi_ai.py         # AI-assisted draft generation (narrative-only)
+│   ├── feroldi_financials.py # F01–F05 deterministic scoring (trajectory analysis)
+│   ├── feroldi_fmp.py        # FMP API client (3-year annual data)
 │   ├── feroldi_gate.py       # Feroldi quality gate
+│   ├── feroldi_models.py     # Dataclasses (trajectory_label, weighted_growth)
 │   └── btd_enrichment.py     # BTD metric enrichment
 ├── tactical/           # Tactical delivery (per-scan Telegram notifications)
 │   ├── congress_runner.py
 │   └── earnings_runner.py
 ├── providers/          # Data providers (SEC EDGAR, etc.)
 │   └── sec/
-├── tests/              # 261 unit and integration tests
+├── docs/               # Architecture and module documentation
+│   ├── no_llm_decision_architecture.md
+│   ├── entity_master.md
+│   └── congress_scanner_refactor.md
+├── tests/              # 343 unit and integration tests
 ├── config/             # Static configuration overrides
 ├── archive/            # Legacy single-file scripts (retired)
 └── .github/workflows/  # GitHub Actions CI entry points
@@ -46,14 +62,71 @@ Each scanner under `scanners/` is a self-contained engine with no GitHub Actions
 | **VPMA** | Post-earnings-announcement drift (PEAD) setups | `scanners/vpma/engine.py` |
 | **Earnings** | Short-volatility earnings plays | `scanners/earnings/engine.py` |
 | **Fundamental Inflection** | Revenue/earnings growth inflection points | `scanners/fundamental_inflection/engine.py` |
+| **Entity Master** | Canonical entity resolution (CIK-based) | `scanners/entity_master/engine.py` |
+| **Evidence Ledger** | Idempotent evidence tracking with provenance | `scanners/evidence_ledger/engine.py` |
+
+### No-LLM Decision Guardrails
+
+`NO_LLM_DECISIONS=true` (default) ensures all investment decisions are deterministic. See `docs/no_llm_decision_architecture.md` for the full specification.
+
+- `scanners/no_llm_guard.py` — Runtime invariants, LLM endpoint blocklist, AI field detection
+- AI-generated fields (AI Feroldi Score, AI Quality Summary, etc.) are **narrative-only** and never influence gates, scores, or recommendations
+- All deterministic workflows run without `OPENAI_API_KEY`
+
+### Entity Master
+
+Canonical entity layer using SEC CIK as primary identity. See `docs/entity_master.md`.
+
+- **Automatic mappings** only for exact CIK, legal name, or historical ticker matches
+- **Fuzzy suggestions** generated for review only — never auto-activated
+- **Subsidiary extraction** from Exhibit 21 tables (manual review required)
+- **Former names and tickers** extracted from SEC submissions history
+
+### Evidence Ledger
+
+Idempotent evidence ledger with full provenance tracking.
+
+- **Stable evidence IDs** — reproducible hash-based identifiers
+- **Idempotent upserts** — duplicate records detected by payload hash
+- **Amendment/supersession** — amended records marked inactive with pointer to successor
+- **Separate states** — ingested, processed, scored, delivered tracked independently
+
+### Feroldi 38-Point First Cut (deterministic)
+
+The Feroldi first cut is a **zero-LLM, 11-question scoring rubric** that produces a score out of 38 across three categories:
+
+| Category | Questions | Max Points |
+|---|---|---|
+| **Financials (F01–F05)** | Cash-to-debt, gross margin, ROE, FCF, EPS | 17 |
+| **Management (M01–M03)** | CEO tenure/alignment, insider ownership, mission clarity | 10 |
+| **Stock (S01–S03)** | 5-year performance vs SPY, buybacks/dividends/debt, earnings surprise | 11 |
+
+Every score is derived from raw numeric inputs using explicit formulas — no qualitative inference, no LLM, no paid API required.
+
+#### Multi-Year Growth Trajectory (F03/F04/F05)
+
+When `FMP_API_KEY` is set (free at [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs), 250 req/day, no credit card), the pipeline extracts 3 years of annual financial data to compute **weighted growth rates** and classify the growth trajectory:
+
+| Trajectory | Condition | Meaning |
+|---|---|---|
+| `accelerating` | Recent growth > prior × 1.2 | Growth compounding; premium valuation justified |
+| `stable` | Recent growth within ±3pp of prior | Predictable compounder |
+| `decelerating` | Recent growth < prior × 0.8 | Growth fading; monitor closely |
+| `moderate` | Neither accelerating/stable/decelerating | Normal variation |
+| `recovering` | Prior growth ≤ 0, recent > 0 | Turnaround in progress |
+| `declining` | Prior growth > 0, recent ≤ 0 | Downtrend beginning |
+
+Weighted growth uses 60% recent YoY + 40% prior YoY to smooth volatility. Trajectory labels are written to Google Sheets columns for filtering and sorting.
+
+**Rate limit safety:** FMP free tier allows 250 requests/day. At 10 tickers × 3 endpoints = 30 calls per run, the pipeline has **8× headroom**.
 
 ### Review funnel
 
 The `funnel/review_candidates.py` orchestrator:
 1. Runs each configured scanner adapter
 2. Collects signals into a unified candidate list
-3. Enriches with BTD metrics, Feroldi AI scoring, and Telegram notifications
-4. Writes results to Google Sheets (`BTD_Candidates`, `Signal_Log`, `Insider_Ledger`)
+3. Enriches with BTD metrics, Feroldi 38-point scoring (with optional FMP trajectory analysis), and Telegram notifications
+4. Writes results to Google Sheets (`BTD_Candidates`, `Signal_Log`, `Insider_Ledger`, `Feroldi_First_Cut_Detail`)
 
 Source-level failures (e.g. VPMA crash) do not block other sources — the funnel continues with whatever signals were successfully collected.
 
@@ -85,6 +158,7 @@ Copy these to your GitHub Actions repository variables or a local `.env` file:
 | Variable | Notes |
 |---|---|
 | `SEC_USER_AGENT` | A descriptive contact string, e.g. `hxfinancebot contact@example.com`. This is **not** an account or API key — it follows SEC EDGAR fair-access rules. Required for production; tests use a fallback. |
+| `FMP_API_KEY` | Optional. Free API key from [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs) — unlocks 3-year growth trajectory scoring for F03/F04/F05. Free tier: 250 req/day. |
 
 **Scanner configuration (all optional, sensible defaults):**
 
@@ -110,6 +184,19 @@ Copy these to your GitHub Actions repository variables or a local `.env` file:
 | `SEC_REQUEST_TIMEOUT` | 30 | Request timeout in seconds |
 | `SEC_CACHE_TTL_HOURS` | 24 | Disk cache TTL |
 | `SEC_CACHE_DIR` | `funnel_output/sec_cache` | Cache directory |
+
+**Feroldi trajectory scoring:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `FEROLDI_ENRICH_LIMIT` | 10 | Max tickers to score per run |
+| `FEROLDI_FORCE_REFRESH` | `false` | Re-score even if data is recent |
+| `FEROLDI_REFRESH_DAYS` | 7 | Days before re-scoring a candidate |
+| `FEROLDI_GATE_MODE` | `observe` | `observe` (log only) or `enforce` |
+| `FEROLDI_GATE_PASS_THRESHOLD` | 27.5 | Score threshold to pass gate |
+| `FEROLDI_GATE_REVIEW_THRESHOLD` | 23.0 | Score threshold for manual review |
+| `FEROLDI_GATE_MIN_COVERAGE` | 0.75 | Minimum coverage ratio to evaluate gate |
+| `FEROLDI_GATE_ALLOW_REVIEW` | `true` | Allow review recommendations |
 
 ---
 
@@ -139,7 +226,7 @@ python tactical/earnings_runner.py
 ### Run tests
 
 ```bash
-# All tests (261)
+# All tests (520)
 python -m unittest discover tests -v
 
 # Specific test file
@@ -147,6 +234,19 @@ python -m unittest tests.test_vpma_engine -v
 
 # Specific test
 python -m unittest tests.test_vpma_engine.ReactionCalculationTests.test_abnormal_return_with_duplicate_index -v
+```
+
+### Run trajectory batch report
+
+```bash
+# Report trajectory labels and weighted growth for a list of tickers
+FMP_API_KEY=your_key_here \
+  python -c "
+from funnel.feroldi_scoring import run_feroldi_first_cut
+for ticker in ['AAPL', 'GOOGL', 'NVDA', 'AMZN']:
+    d = run_feroldi_first_cut(ticker)
+    print(f'{ticker}: F03={d.f03.trajectory_label} F04={d.f04.trajectory_label} F05={d.f05.trajectory_label}')
+"
 ```
 
 ---
@@ -183,6 +283,12 @@ The repo intentionally ignores local artifacts:
 Committed by GitHub Actions:
 - `earnings_notification_state.json` — earnings notification dedup state
 
+## Documentation
+
+- `docs/no_llm_decision_architecture.md` — No-LLM guardrails specification
+- `docs/entity_master.md` — Entity Master architecture and API
+- `docs/congress_scanner_refactor.md` — Congress scanner refactor notes
+
 ---
 
 ## Contributing
@@ -191,3 +297,4 @@ Committed by GitHub Actions:
 2. Scanner adapters (`funnel/*_adapter.py`) bridge engines into the review funnel.
 3. Add tests for any new behavior. Existing test patterns use `unittest` with `unittest.mock`.
 4. Do not change existing scoring thresholds without a documented reason.
+5. **Never** allow LLM-generated values to influence any investment decision (score, gate, admission, displacement, position sizing, Telegram eligibility).

@@ -1,6 +1,28 @@
 name: Sheet Beautifier
 
-"on":
+# Triggers:
+#   - push / pull_request on main: run unit tests only (no secrets, cheap
+#     regression check for sheet_beautifier.py + the dynamic-column
+#     refactor it depends on).
+#   - schedule (weekly Monday 06:00 UTC): run the full test suite + a
+#     DRY-RUN against the live sheet. The dry-run reads the sheet but
+#     never writes, so it's safe to automate. The receipt is uploaded
+#     as an artifact for the operator to audit. To switch the scheduled
+#     job to APPLY mode, change the `mode: dry_run` line in the
+#     ``Determine mode`` step below — but be aware apply mode actually
+#     writes to the live sheet, so do it intentionally.
+#   - workflow_dispatch: the manual escape hatch. The operator picks
+#     dry_run (preview) or apply (writes to the live sheet).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 06:00 UTC Monday == 14:00 SGT. Cheap enough to run weekly; if
+    # the beautifier has a bug the workflow fails and the operator
+    # gets a notification, so weekly is a reasonable balance.
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       mode:
@@ -19,12 +41,91 @@ name: Sheet Beautifier
 permissions:
   contents: read
 
+# Share the funnel-pilot concurrency group so the beautifier never
+# contends with funnel_pilot.yml or funnel_production.yml on the same
+# spreadsheet. The beautifier mutates column widths, banding, tab
+# colors, and (for BTD_Candidates) filter views, so running it
+# concurrently with a production data write could interleave the
+# requests and leave the sheet in an inconsistent state. ``cancel-in-
+# progress: false`` is intentional: an in-flight beautify should
+# finish before a new pilot run starts.
+concurrency:
+  group: funnel-pilot
+  cancel-in-progress: false
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # Unit tests + syntax checks — no secrets, runs on every push / PR.
+  # ---------------------------------------------------------------------------
+  # The dynamic-column refactor in pilot_writer.py /
+  # pilot_signal_log_writer.py / pilot_sheet_setup.py is also covered
+  # here: a hardcoded column letter (e.g. ``A:Z``) in any of those
+  # modules would silently drop or expose columns when a header list
+  # is reordered, and a unit-test regression there would break the
+  # beautifier's filter-view indices. So both test files run in the
+  # same job.
+  test:
+    name: Unit tests + syntax checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache the wheel directory keyed on the CI dep lock file
+          # so subsequent runs skip re-downloading pandas / yfinance
+          # / google-api-python-client etc. The cache invalidates
+          # when requirements-ci.txt changes (NOT when
+          # requirements.txt changes, which the test job doesn't
+          # install from).
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install dependencies
+        # See requirements-ci.txt for the dep-set rationale.
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: Check Python syntax
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel tests
+          echo "Python syntax checks passed."
+
+      - name: Run unit tests
+        # Single ``unittest discover`` invocation runs all 575 tests
+        # (including tests/test_sheet_beautifier.py and
+        # tests/test_pilot_dynamic_columns.py) in one boot of the
+        # test runner. Splitting into per-file invocations was
+        # redundant overhead with no isolation benefit.
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+  # ---------------------------------------------------------------------------
+  # Beautify job — runs the actual beautifier against the live sheet.
+  # Gated to ``workflow_dispatch`` (manual) and ``schedule`` (weekly).
+  # PRs / pushes do NOT run this job — unit tests are sufficient for
+  # PR-time regression protection, and exposing GCP secrets to PR
+  # workflows (especially forks) is a security/quota risk.
+  # ---------------------------------------------------------------------------
   beautify:
     name: Beautify Google Sheets
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    # 9 sheets × multiple batchUpdate calls (formatting + banding +
+    # column widths + number formats + tab colors + filter view)
+    # plus the apply_filter_views reads is easily 6-9 minutes of
+    # API round-trips. Bumped from 10 to 15 to absorb a 503 backoff
+    # on the weekly schedule (manual runs can be re-triggered).
+    timeout-minutes: 15
+    needs: test
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -40,6 +141,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install google-api-python-client google-auth
 
+      - name: Determine mode
+        id: mode
+        # workflow_dispatch: honour the operator's choice.
+        # schedule: default to dry_run (safe). Change to "apply" here
+        # if you want the weekly run to actually format the sheet.
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=dry_run" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Selected mode: ${{ steps.mode.outputs.mode }}"
+
       - name: Run beautifier
         env:
           GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
@@ -49,11 +164,62 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.mode }}" == "dry_run" ]]; then
+          if [[ "${{ steps.mode.outputs.mode }}" == "dry_run" ]]; then
+            echo "=== Running in DRY-RUN mode (no writes) ==="
             python -m funnel.sheet_beautifier --dry-run
           else
+            echo "=== Running in APPLY mode (writes to live sheet) ==="
             python -m funnel.sheet_beautifier
           fi
+
+      - name: Fail loudly on beautify errors
+        # The beautifier catches per-sheet exceptions and reports them
+        # in the receipt without exiting non-zero. PR / scheduled runs
+        # should still fail loudly so the operator gets a notification
+        # if a sheet is mis-formatted, the API has a new quirk, or
+        # a saved filter view silently failed to create because of
+        # column drift. We check TWO conditions:
+        #   1. ``errors`` — per-sheet exceptions raised by the API.
+        #   2. ``filter_views_skipped_missing_headers`` — a filter
+        #      view that could not be created because a referenced
+        #      header is missing. This is the BTD_Candidates
+        #      "Strong Congress, BTD-Rejected" view's canary: if a
+        #      column gets renamed and the view silently drops, the
+        #      whole reason this workflow exists is gone, so we fail.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          receipt_path = Path("funnel_output/sheet_beautifier_receipt.json")
+          if not receipt_path.exists():
+              print("No receipt found — beautifier did not run.")
+              sys.exit(1)
+          receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+          errors = receipt.get("errors", [])
+          if errors:
+              print(f"Beautify completed with {len(errors)} error(s):")
+              for err in errors:
+                  print(f"  ! {err['sheet']}: {err['error']}")
+              sys.exit(1)
+
+          skipped_fv = receipt.get("filter_views_skipped_missing_headers", [])
+          if skipped_fv:
+              print(
+                  f"Beautify completed with {len(skipped_fv)} "
+                  f"filter view(s) skipped due to missing headers:"
+              )
+              for entry in skipped_fv:
+                  view = entry.get("view", "?")
+                  missing = ", ".join(entry.get("missing", []))
+                  print(f"  ! {view}: missing headers = {missing}")
+              sys.exit(1)
+
+          print("Beautify completed with no errors.")
+          PY
 
       - name: Upload receipt
         if: always()

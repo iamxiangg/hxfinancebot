@@ -1,0 +1,13 @@
+# CI-only test deps for .github/workflows/sheet_beautifier.yml.
+# Minimal subset of requirements.txt — excludes the FinBERT backend
+# (torch + transformers, ~1.5GB) which no unit test imports; the
+# feroldi module is no-LLM by design. Keep in sync with
+# requirements.txt so CI mirrors prod.
+
+google-api-python-client>=2.90.0
+google-auth>=2.0.0
+pandas>=2.0.0
+requests>=2.31.0
+yfinance==1.4.1  # match requirements.txt exact pin to avoid drift between CI and prod
+python-telegram-bot>=20.0.0
+lxml>=4.9.0

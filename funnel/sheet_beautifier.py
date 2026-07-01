@@ -85,6 +85,361 @@ PRODUCTION_SHEETS: list[tuple[str, list[str]]] = [
     (MANUAL_SEED_SHEET, MANUAL_SEED_HEADERS),
 ]
 
+
+# ---------------------------------------------------------------------------
+# Saved filter views
+# ---------------------------------------------------------------------------
+# NamedFilterView definitions. Each entry references headers by name so that
+# column-index lookups remain robust if BTD_CANDIDATE_HEADERS is reordered or
+# extended. If a referenced header is missing, that specific spec is skipped
+# with a warning rather than failing the whole beautify run.
+#
+# Sheets API reference (filter views, NOT basic filter):
+#   addFilterView -> filter {title, range, sortSpecs, filterSpecs}
+#   filterSpec.columnIndex + filterCriteria.condition (type ∈ ConditionType
+#   enum: TEXT_EQ, TEXT_CONTAINS, NUMBER_GREATER_THAN_EQ,
+#   NUMBER_LESS_THAN_EQ, CUSTOM_FORMULA, ...).
+#
+# Multi-value OR matching: ``ONE_OF_LIST`` is for data-validation rules, not
+# filter views, and is rejected with ``ConditionType 'ONE_OF_LIST' is not
+# supported in filters.``. ``TEXT_EQ`` does not give clean OR semantics
+# across multiple values either. The reliable path is ``CUSTOM_FORMULA``
+# with an ``=OR(...)`` formula. The first value in ``_FilterSpec.values``
+# is treated as a format-string template and supports two placeholders:
+#   ``{col}``  — substituted with the column letter of the resolved header
+#   ``{row}``  — substituted with the first data row (currently 2; the
+#               header sits on row 1, data starts on row 2)
+
+FilterConditionType = str  # alias for readability
+
+# First data row (1-based) is 2 because the header sits on row 1 and data
+# starts on row 2. ``CUSTOM_FORMULA`` templates use ``{row}`` as a
+# placeholder; the substitution lives in ``_build_filter_view_request``.
+# Promoting to a module-level constant keeps the layout assumption
+# grep-able and gives a future override path an obvious handle.
+_FIRST_DATA_ROW = 2
+
+
+@dataclass
+class _FilterSpec:
+    header: str
+    """Header name used to resolve the column index at runtime."""
+    type: FilterConditionType
+    values: list[str]
+
+
+@dataclass
+class _SortSpec:
+    header: str
+    descending: bool = False
+
+
+@dataclass
+class _FilterViewSpec:
+    name: str
+    filters: list[_FilterSpec] = field(default_factory=list)
+    sorts: list[_SortSpec] = field(default_factory=list)
+    """Human-readable explanation dumped into the receipt on dry-run so the
+    operator can confirm the view's intent without reading the source."""
+
+
+# Filter thresholds are env-overridable so operators can tune them without
+# code edits. ``_btd_filter_int_env`` is the canonical reader: it returns the
+# default if the env var is unset OR unparseable. The beautify never crashes
+# on a bad value because the filter view is a non-destructive aid, not a hard
+# gate.
+def _btd_filter_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Filter view threshold %s=%r is not an int — using default %d.",
+            name, raw, default,
+        )
+        return default
+
+
+# "Strong Congress, BTD-Rejected" — surfaces the INTC-style pattern the user
+# flagged: ticker rejected by the BTD gate, but the congress-signal footprint
+# is too strong to ignore. Operators open BTD_Candidates, switch to this view,
+# and triage.
+BTD_CANDIDATES_FILTER_VIEWS: list[_FilterViewSpec] = [
+    _FilterViewSpec(
+        name="🚨 Strong Congress, BTD-Rejected",
+        filters=[
+            # Multi-value OR via CUSTOM_FORMULA — Sheets API's filter views do
+            # not accept ONE_OF_LIST, and TEXT_EQ does not give clean OR
+            # semantics across multiple values. The formula references the
+            # resolved column letter via ``{col}`` and the first data row
+            # via ``{row}`` (both substituted at request-build time, see
+            # _build_filter_view_request). Row 2 is the convention: the
+            # filter view's data range starts at the second 1-based row
+            # because row 1 holds the header.
+            _FilterSpec(
+                header="Status",
+                type="CUSTOM_FORMULA",
+                values=[
+                    '=OR({col}{row}="BTD_FAILED",{col}{row}="BTD_UNAVAILABLE")',
+                ],
+            ),
+            _FilterSpec(
+                header="Congress Active Purchases",
+                type="NUMBER_GREATER_THAN_EQ",
+                values=[
+                    str(_btd_filter_int_env("BTD_FILTER_MIN_ACTIVE_PURCHASES", 4))
+                ],
+            ),
+            _FilterSpec(
+                header="Congress Unique Members",
+                type="NUMBER_GREATER_THAN_EQ",
+                values=[
+                    str(_btd_filter_int_env("BTD_FILTER_MIN_UNIQUE_MEMBERS", 2))
+                ],
+            ),
+        ],
+        sorts=[
+            _SortSpec(header="Congress Active Purchases", descending=True),
+            _SortSpec(header="Congress Unique Members", descending=True),
+        ],
+    ),
+]
+
+
+# Sheet name → filter views to apply on that sheet. Future sheets add an entry
+# here without touching the wiring block in ``beautify_sheets``. An absent key
+# (or empty list) means "no filter views for this sheet" — the call is skipped
+# entirely, so this stays cheap for sheets that don't need it.
+FILTER_VIEW_CONFIG: dict[str, list[_FilterViewSpec]] = {
+    BTD_CANDIDATES_SHEET: BTD_CANDIDATES_FILTER_VIEWS,
+}
+
+
+def _resolve_header_indices(
+    headers: list[str],
+    needed: list[str],
+) -> dict[str, int]:
+    """Build a ``{header_name: column_index}`` map. Missing headers are
+    silently dropped; callers can inspect the missing set via the unfulfilled
+    argument outside this helper."""
+    by = {h.strip(): idx for idx, h in enumerate(headers)}
+    out: dict[str, int] = {}
+    for name in needed:
+        if name in by:
+            out[name] = by[name]
+    return out
+
+
+def _build_filter_view_request(
+    spec: _FilterViewSpec,
+    *,
+    headers: list[str],
+    sheet_id: int,
+    row_count: int,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Render a single ``_FilterViewSpec`` to the Sheets ``addFilterView``
+    request body shape, or return ``None`` if any required header is missing.
+
+    Returns ``(request_or_none, missing_headers)``. The caller decides
+    whether to log+skip or hard-fail on missing headers.
+    """
+    needed = [f.header for f in spec.filters] + [s.header for s in spec.sorts]
+    resolved = _resolve_header_indices(headers, needed)
+    missing = sorted(set(needed) - set(resolved))
+    if missing:
+        return None, missing
+
+    column_count = len(headers)
+
+    filter_specs: list[dict[str, Any]] = []
+    for f in spec.filters:
+        col_letter = _column_letter(resolved[f.header] + 1)
+        if f.type == "CUSTOM_FORMULA":
+            # Treat the first value as a format-string template; substitute
+            # ``{col}`` with the resolved column letter and ``{row}`` with
+            # the first data row. Used to express multi-value OR matches
+            # that the Sheets API does not otherwise support for filter
+            # views (e.g., status in a set of values).
+            if not f.values:
+                # Defensive: a CUSTOM_FORMULA with no template is malformed.
+                # Returned as a missing-header so the caller logs+skips
+                # the spec rather than shipping a broken request. An empty
+                # ``values`` list is NOT a "filter shows everything" intent;
+                # if a future caller actually wants an unfiltered view,
+                # they should omit the spec from the FilterViewSpec.
+                return None, [f.header]
+            formula = f.values[0].format(col=col_letter, row=_FIRST_DATA_ROW)
+            condition: dict[str, Any] = {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": formula}],
+            }
+        else:
+            condition = {
+                "type": f.type,
+                "values": [{"userEnteredValue": v} for v in f.values],
+            }
+        filter_specs.append(
+            {
+                "columnIndex": resolved[f.header],
+                "filterCriteria": {"condition": condition},
+            }
+        )
+
+    sort_specs: list[dict[str, Any]] = [
+        {
+            "dimensionIndex": resolved[s.header],
+            "sortOrder": "DESCENDING" if s.descending else "ASCENDING",
+        }
+        for s in spec.sorts
+    ]
+
+    # Google Sheets API quirk: the addFilterView payload key is ``"filter"``
+    # (containing a FilterView resource), NOT ``"filterView"``. The API
+    # rejects ``"filterView"`` with: Unknown name "filterView" at
+    # 'requests[0].add_filter_view': Cannot find field. Verified against
+    # the v4 discovery doc (AddFilterViewRequest schema). If you change
+    # this back to ``"filterView"``, the BTD_Candidates saved filter view
+    # will fail to create and the receipt will show
+    # filter_views_applied: [] — tests in tests/test_sheet_beautifier.py
+    # pin the correct key.
+    request = {
+        "addFilterView": {
+            "filter": {
+                "title": spec.name,
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": max(row_count, 2),
+                    "startColumnIndex": 0,
+                    "endColumnIndex": max(column_count, 1),
+                },
+                "sortSpecs": sort_specs,
+                "filterSpecs": filter_specs,
+            }
+        }
+    }
+    return request, []
+
+
+def _fetch_existing_filter_view_names(
+    service,
+    spreadsheet_id: str,
+    sheet_id: int,
+) -> set[str]:
+    """Return the set of NamedFilterView titles already attached to ``sheet_id``.
+
+    Used to keep ``apply_filter_views`` idempotent: re-running the beautifier
+    must NOT create duplicate views. The call uses a minimal field mask to
+    avoid pulling in column data we don't need.
+    """
+    response = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties.sheetId,filterViews.title)",
+        )
+        .execute()
+    )
+    existing: set[str] = set()
+    for sheet in response.get("sheets", []):
+        if int(sheet.get("properties", {}).get("sheetId", -1)) != sheet_id:
+            continue
+        for view in sheet.get("filterViews", []) or []:
+            title = str(view.get("title", "")).strip()
+            if title:
+                existing.add(title)
+    return existing
+
+
+@dataclass
+class _FilterViewApplyResult:
+    """Outcome of one ``apply_filter_views`` call.
+
+    Surfaced via the ``BeautifyReceipt`` so operators can audit per-run which
+    views were created vs. skipped (idempotent — view already on the sheet)
+    vs. skipped (missing headers — column drift or rename). All three lists
+    are kept separate because the same view name is NEVER duplicated in two
+    lists: each spec takes exactly one of three outcomes.
+    """
+
+    applied: list[_FilterViewSpec] = field(default_factory=list)
+    skipped_existing: list[_FilterViewSpec] = field(default_factory=list)
+    # Tuple of (view_name, missing_headers) for specs whose column refs don't
+    # resolve against the actual sheet headers.
+    skipped_missing_headers: list[tuple[str, list[str]]] = field(
+        default_factory=list,
+    )
+
+
+def apply_filter_views(
+    service,
+    spreadsheet_id: str,
+    *,
+    sheet_name: str,
+    sheet_id: int,
+    headers: list[str],
+    row_count: int,
+    specs: list[_FilterViewSpec],
+) -> _FilterViewApplyResult:
+    """Create the requested NamedFilterViews on ``sheet_name``.
+
+    Idempotent: any spec whose ``name`` already exists on the sheet is skipped
+    (no duplicate views). Specs whose required headers are missing in the
+    sheet (e.g. column drift / rename) are also skipped + logged.
+
+    Returns a ``_FilterViewApplyResult`` partitioning specs into
+    applied / skipped_existing / skipped_missing_headers so the caller can
+    populate the receipt without re-inspecting the sheet.
+    """
+    result = _FilterViewApplyResult()
+    if not specs:
+        return result
+
+    existing = _fetch_existing_filter_view_names(
+        service, spreadsheet_id, sheet_id,
+    )
+    requests: list[dict[str, Any]] = []
+    for spec in specs:
+        if spec.name in existing:
+            logger.info(
+                "Filter view %r already exists on %r — skipping (idempotent).",
+                spec.name, sheet_name,
+            )
+            result.skipped_existing.append(spec)
+            continue
+        request, missing = _build_filter_view_request(
+            spec,
+            headers=headers,
+            sheet_id=sheet_id,
+            row_count=row_count,
+        )
+        if request is None:
+            logger.warning(
+                "Filter view %r on %r skipped — missing headers: %s",
+                spec.name, sheet_name, ", ".join(missing),
+            )
+            result.skipped_missing_headers.append((spec.name, list(missing)))
+            continue
+        requests.append(request)
+        result.applied.append(spec)
+        logger.info(
+            "Filter view %r on %r: %d filter specs, %d sort specs.",
+            spec.name, sheet_name,
+            len(request["addFilterView"]["filter"]["filterSpecs"]),
+            len(request["addFilterView"]["filter"]["sortSpecs"]),
+        )
+
+    if not requests:
+        return result
+
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": requests},
+    ).execute()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Number format classification
 # ---------------------------------------------------------------------------
@@ -462,6 +817,15 @@ class BeautifyReceipt:
     sheets_skipped: list[str] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
     dry_run: bool = False
+    # Filter-view telemetry — populated by ``beautify_sheets``. Operators
+    # inspect these to confirm their saved views exist (applied), were
+    # skipped because they already exist (idempotent), or were skipped
+    # because the sheet's columns don't carry what the spec references.
+    filter_views_applied: list[str] = field(default_factory=list)
+    filter_views_skipped_existing: list[str] = field(default_factory=list)
+    filter_views_skipped_missing_headers: list[dict[str, Any]] = field(
+        default_factory=list,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +887,18 @@ def beautify_sheets(
         )
 
         if dry_run:
+            # Dry-run still surfaces what filter views WOULD be created so
+            # operators see the intended outcome in the receipt + log.
+            specs_for_sheet = FILTER_VIEW_CONFIG.get(sheet_name, [])
+            if specs_for_sheet:
+                receipt.filter_views_applied.extend(
+                    s.name for s in specs_for_sheet
+                )
+                logger.info(
+                    "[dry-run] would create %d filter view(s) on %r: %s",
+                    len(specs_for_sheet), sheet_name,
+                    ", ".join(s.name for s in specs_for_sheet),
+                )
             receipt.sheets_processed.append(sheet_name)
             continue
 
@@ -532,6 +908,31 @@ def beautify_sheets(
             apply_column_widths(service, spreadsheet_id, sheet_id, column_count)
             apply_number_formats(service, spreadsheet_id, sheet_id, column_count, header_classes)
             apply_tab_colour(service, spreadsheet_id, sheet_id, tab_colour)
+            # Saved filter views — only the sheets listed in FILTER_VIEW_CONFIG.
+            # ``apply_filter_views`` is idempotent (existing views are skipped),
+            # and the per-view outcome is recorded on the receipt so the
+            # operator can audit what was created vs. skipped per cycle.
+            specs_for_sheet = FILTER_VIEW_CONFIG.get(sheet_name, [])
+            if specs_for_sheet:
+                fv_result = apply_filter_views(
+                    service,
+                    spreadsheet_id,
+                    sheet_name=sheet_name,
+                    sheet_id=sheet_id,
+                    headers=headers,
+                    row_count=row_count,
+                    specs=specs_for_sheet,
+                )
+                receipt.filter_views_applied.extend(
+                    s.name for s in fv_result.applied
+                )
+                receipt.filter_views_skipped_existing.extend(
+                    s.name for s in fv_result.skipped_existing
+                )
+                receipt.filter_views_skipped_missing_headers.extend(
+                    {"view": name, "missing": list(missing)}
+                    for name, missing in fv_result.skipped_missing_headers
+                )
             receipt.sheets_processed.append(sheet_name)
         except Exception as exc:
             logger.error("Failed to beautify %r: %s", sheet_name, exc)
@@ -568,6 +969,20 @@ def main() -> None:
     print(f"Errors:       {len(receipt.errors)}")
     if receipt.sheets_processed:
         print(f"Sheets:       {', '.join(receipt.sheets_processed)}")
+    if receipt.filter_views_applied:
+        print(f"Filter views: {len(receipt.filter_views_applied)} applied")
+        for name in receipt.filter_views_applied:
+            print(f"  ✓ {name}")
+    if receipt.filter_views_skipped_existing:
+        print(
+            f"  ({len(receipt.filter_views_skipped_existing)} "
+            f"skipped — already existed)"
+        )
+    if receipt.filter_views_skipped_missing_headers:
+        print(
+            f"  ({len(receipt.filter_views_skipped_missing_headers)} "
+            f"skipped — missing headers)"
+        )
     if receipt.errors:
         for err in receipt.errors:
             print(f"  ! {err['sheet']}: {err['error']}")
@@ -583,6 +998,9 @@ def main() -> None:
                 "sheets_processed": receipt.sheets_processed,
                 "sheets_skipped": receipt.sheets_skipped,
                 "errors": receipt.errors,
+                "filter_views_applied": receipt.filter_views_applied,
+                "filter_views_skipped_existing": receipt.filter_views_skipped_existing,
+                "filter_views_skipped_missing_headers": receipt.filter_views_skipped_missing_headers,
             },
             indent=2,
             sort_keys=True,

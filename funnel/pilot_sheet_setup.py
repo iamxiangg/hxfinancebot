@@ -452,13 +452,22 @@ def _read_sheet_rows(
 ) -> list[list[Any]]:
     """
     Read the relevant area of one approved pilot worksheet.
+
+    The read extent is derived from the canonical header length for the
+    sheet (``len(PILOT_SCHEMAS[sheet_name])``) so that trimming trailing
+    empty grid columns never causes the read to silently drop fields.
+    ``MINIMUM_COLUMN_COUNT`` is reserved for grid CREATION only.
     """
     _assert_allowed_sheet(
         sheet_name
     )
 
     final_column = _column_letter(
-        MINIMUM_COLUMN_COUNT
+        len(
+            PILOT_SCHEMAS[
+                sheet_name
+            ]
+        )
     )
 
     response = (
@@ -573,13 +582,21 @@ def _clear_header_row(
 ) -> None:
     """
     Clear only row 1 of an approved pilot worksheet.
+
+    The clear extent is derived from the canonical header length for the
+    sheet (``len(PILOT_SCHEMAS[sheet_name])``) so that the operation
+    stays aligned with the live schema even after a grid-trimming pass.
     """
     _assert_allowed_sheet(
         sheet_name
     )
 
     final_column = _column_letter(
-        MINIMUM_COLUMN_COUNT
+        len(
+            PILOT_SCHEMAS[
+                sheet_name
+            ]
+        )
     )
 
     (

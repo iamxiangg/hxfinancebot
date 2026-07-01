@@ -23,6 +23,7 @@ from funnel.google_client import (
     get_sheets_service,
     get_spreadsheet_id,
 )
+from funnel.sheet_table import column_letter
 from funnel.signal_schema import Signal
 
 
@@ -239,7 +240,7 @@ def _verify_header(
         service,
         spreadsheet_id,
         TARGET_SHEET,
-        "A1:O1",
+        f"A1:{column_letter(len(SIGNAL_HEADERS))}1",
     )
 
     if not rows:
@@ -512,7 +513,7 @@ def _clear_existing_data(
             spreadsheetId=spreadsheet_id,
             range=(
                 f"'{TARGET_SHEET}'!"
-                "A2:O"
+                f"A2:{column_letter(len(SIGNAL_HEADERS))}"
             ),
             body={},
         )
@@ -564,7 +565,7 @@ def _verify_written_rows(
         service,
         spreadsheet_id,
         TARGET_SHEET,
-        "A2:O",
+        f"A2:{column_letter(len(SIGNAL_HEADERS))}",
     )
 
     if len(actual_rows) != len(

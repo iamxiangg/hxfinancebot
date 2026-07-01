@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
+import sys
+from pathlib import Path
 from typing import Any
+
+import requests
+from googleapiclient.errors import HttpError
 
 from funnel.btd_enrichment import fetch_yfinance_metrics, metrics_to_candidate_updates, to_float
 from funnel.candidate_ingestor import classify_signals, get_pending_new_ticker_records
 from funnel.congress_adapter import run_congress_adapter
 from funnel.feroldi_ai import draft_to_candidate_updates, request_feroldi_draft
 from funnel.feroldi_gate import apply_feroldi_gate
+from funnel.feroldi_scoring import detail_to_candidate_updates, run_feroldi_first_cut
+from funnel.feroldi_sheet_writer import detail_to_sheet_row
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.insider_adapter import run_insider_adapter
 from funnel.review_schema import (
@@ -34,6 +42,18 @@ from funnel.vpma_adapter import run_vpma_adapter
 
 
 logger = logging.getLogger(__name__)
+
+
+# Transient Sheets / network errors that we tolerate silently (logged and
+# swallowed) at well-defined fault barriers. Anything OUTSIDE this tuple is a
+# programmer bug and SHOULD crash loudly so it gets noticed during development
+# and staging. We deliberately do NOT include ``OSError`` here because it's a
+# broad parent of unrelated conditions (FileNotFoundError, MemoryError, etc.)
+# that should never be silently swallowed at a Sheets-write site.
+_TRANSIENT_SHEETS_ERRORS: tuple[type[BaseException], ...] = (
+    HttpError,                  # 4xx / 5xx Sheets API responses
+    requests.RequestException,  # transport-level failures (incl. Timeout, Connection)
+)
 
 
 def _float_value(value: Any, default: float) -> float:
@@ -170,6 +190,124 @@ def _candidate_index(records: list[dict[str, str]]) -> dict[str, dict[str, str]]
         for record in records
         if str(record.get("Candidate ID") or "").strip()
     }
+
+
+def _fingerprint_candidate(record: dict[str, str]) -> str:
+    """Stable SHA-256 fingerprint of a BTD candidate row's content.
+
+    Used by the race-condition guard to detect any external mutation of
+    ``BTD_CANDIDATES_SHEET`` between the initial read at the top of ``run()``
+    and the final upsert. We hash every column the row carries so any
+    editorial change (Status / Decision / Telegram Message ID / etc.) is
+    detected, while remaining cheap (single sha256 per row).
+    """
+    payload = "|".join(
+        f"{header}={str(record.get(header, '') or '').strip()}"
+        for header in BTD_CANDIDATE_HEADERS
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _filter_external_mutation(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    headers: list[str],
+    key_header: str,
+    snapshot_fingerprints: dict[str, str],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Refuse to upsert any candidate whose row was externally mutated between
+    the top-of-``run()`` read and this final-upsert step.
+
+    Returns the filtered candidate list with conflicting IDs removed. If the
+    re-read itself fails for any reason, returns ``[]`` and skips the upsert
+    for the entire cycle — we'd rather drop one cycle than silently overwrite
+    a parallel writer's edit.
+
+    Known limitation: a write landing between this re-read and the actual
+    ``upsert_records`` call below is still invisible to this guard. Eliminating
+    that window would require row-level locking which Google Sheets does not
+    support natively.
+    """
+    candidate_ids_being_upserted = {
+        str(candidate.get(key_header) or "").strip().upper()
+        for candidate in candidates
+        if str(candidate.get(key_header) or "").strip()
+    }
+    if not candidate_ids_being_upserted:
+        return candidates
+
+    try:
+        current_rows = read_table(service, spreadsheet_id, sheet_name, headers)
+    except _TRANSIENT_SHEETS_ERRORS as exc:
+        # If the re-read itself fails transiently, err on safety: skip upsert
+        # for the cycle because we cannot verify nothing changed externally.
+        logger.warning(
+            "Race-condition guard: could not re-read %s to verify safety; "
+            "skipping BTD_Candidates upsert for this cycle: %r",
+            sheet_name,
+            exc,
+        )
+        return []
+    except (KeyError, ValueError, TypeError) as exc:
+        # Header mismatch / wrong arg count / missing candidate-id field —
+        # programmer bug. Re-raise so it's noticed during development,
+        # not silently swallowed (which would drop an entire cycle for a typo).
+        logger.exception(
+            "Race-condition guard: programmer error re-reading %s: %r",
+            sheet_name,
+            exc,
+        )
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Race-condition guard: unexpected error re-reading %s; "
+            "skipping BTD_Candidates upsert for this cycle: %r",
+            sheet_name,
+            exc,
+        )
+        return []
+
+    current_fingerprints = {
+        str(row.get(key_header) or "").strip().upper(): _fingerprint_candidate(row)
+        for row in current_rows
+        if str(row.get(key_header) or "").strip()
+    }
+
+    safe: list[dict[str, Any]] = []
+    blocked: list[str] = []
+    for candidate in candidates:
+        cid = str(candidate.get(key_header) or "").strip().upper()
+        snap = snapshot_fingerprints.get(cid)
+        curr = current_fingerprints.get(cid)
+        if snap is None:
+            # Row didn't exist at the start of the cycle — the upsert will
+            # create it. Safe.
+            safe.append(candidate)
+            continue
+        if curr is None:
+            # Row existed at the start but has since been deleted externally;
+            # safer to re-create it.
+            safe.append(candidate)
+            continue
+        if snap == curr:
+            safe.append(candidate)
+            continue
+        blocked.append(cid)
+        logger.warning(
+            "Race-condition guard: external mutation detected on Candidate ID %s; "
+            "skipping upsert to avoid clobbering a parallel writer.",
+            cid,
+        )
+
+    if blocked:
+        logger.info(
+            "Race-condition guard blocked %d of %d candidates from upsert.",
+            len(blocked),
+            len(candidate_ids_being_upserted),
+        )
+    return safe
 
 
 def _active_for_enrichment(candidate: dict[str, Any]) -> bool:
@@ -316,14 +454,134 @@ def add_optional_ai_drafts(
             candidate["Last Error"] = f"AI draft failed: {exc!r}"[:500]
         updated.append(candidate)
 
-    append_records(
-        service,
-        spreadsheet_id,
-        FEROLDI_AI_DRAFTS_SHEET,
-        FEROLDI_AI_DRAFT_HEADERS,
-        draft_rows,
-    )
+    try:
+        append_records(
+            service,
+            spreadsheet_id,
+            FEROLDI_AI_DRAFTS_SHEET,
+            FEROLDI_AI_DRAFT_HEADERS,
+            draft_rows,
+        )
+    except _TRANSIENT_SHEETS_ERRORS as exc:
+        # A transient Sheets failure here must NOT abort the rest of the
+        # pipeline. AI drafts are advisory only; losing one cycle of drafts
+        # is acceptable, but wiping out the BTD_Candidates upsert that runs
+        # later in ``run()`` is not.
+        logger.exception("Failed to write Feroldi_AI_Drafts rows: %r", exc)
     return updated
+
+
+def enrich_feroldi_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    service,
+    spreadsheet_id: str,
+    limit: int = 10,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Run Feroldi first-cut enrichment and scoring on eligible candidates.
+
+    Only processes candidates that:
+    - Are active (not in a final status)
+    - Passed BTD gate (BTD_PASSED, BYPASSED_MANUAL) or already Telegram Eligible
+    - Don't already have recent Feroldi data (unless force_refresh)
+
+    On failure, preserves the previous valid Feroldi score.
+    """
+    from funnel.review_schema import FEROLDI_FIRST_CUT_DETAIL_SHEET, FEROLDI_FIRST_CUT_DETAIL_HEADERS
+
+    now = utc_now_iso()
+    refresh_days = int(_float_value(os.getenv("FEROLDI_REFRESH_DAYS"), 7.0))
+
+    detail_rows: list[dict[str, Any]] = []
+    enriched: list[dict[str, Any]] = []
+    count = 0
+
+    for candidate in candidates:
+        candidate = dict(candidate)
+        if not _active_for_enrichment(candidate):
+            enriched.append(candidate)
+            continue
+
+        # Only process candidates that passed BTD or are Telegram Eligible
+        status = str(candidate.get("Status") or "").strip().upper()
+        telegram_eligible = str(candidate.get("Telegram Eligible") or "").strip().upper() == "YES"
+        if status not in {"BTD_PASSED", "BYPASSED_MANUAL"} and not telegram_eligible:
+            enriched.append(candidate)
+            continue
+
+        # Skip if recent Feroldi data exists (unless force_refresh)
+        last_updated = str(candidate.get("Feroldi Last Updated") or "").strip()
+        if not force_refresh and last_updated:
+            try:
+                from datetime import datetime, timezone
+                last = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                age_days = (datetime.now(timezone.utc) - last).days
+                if age_days < refresh_days:
+                    enriched.append(candidate)
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        if count >= limit:
+            enriched.append(candidate)
+            continue
+
+        ticker = str(candidate.get("Ticker") or "").strip()
+        candidate_id = str(candidate.get("Candidate ID") or "").strip()
+        if not ticker:
+            enriched.append(candidate)
+            continue
+
+        # Preserve previous Feroldi data in case of failure
+        prev_feroldi = {
+            k: candidate.get(k)
+            for k in (
+                "Feroldi Financial Score", "Feroldi Financial Available",
+                "Feroldi Management Score", "Feroldi Management Available",
+                "Feroldi Stock Score", "Feroldi Stock Available",
+                "Feroldi First Cut Score", "Feroldi Available Points",
+                "Feroldi Max Points", "Feroldi Equivalent Score",
+                "Feroldi Coverage", "Feroldi Missing Inputs",
+                "Feroldi Last Updated",
+            )
+        }
+
+        try:
+            detail = run_feroldi_first_cut(ticker, candidate_id=candidate_id)
+
+            # Write aggregated scores back to candidate row
+            updates = detail_to_candidate_updates(detail)
+            candidate.update({k: v for k, v in updates.items() if v not in ("", None)})
+
+            # Build detail row for Feroldi_First_Cut_Detail sheet
+            detail_rows.append(detail_to_sheet_row(detail, now))
+
+            count += 1
+        except Exception as exc:
+            # On failure, restore previous valid Feroldi data
+            candidate.update({k: v for k, v in prev_feroldi.items() if v not in ("", None)})
+            candidate["Last Error"] = f"Feroldi enrichment failed: {exc!r}"[:500]
+            logger.exception("Feroldi enrichment failed for %s", ticker)
+
+        enriched.append(candidate)
+
+    # Upsert detail rows to the Feroldi_First_Cut_Detail sheet
+    if detail_rows:
+        try:
+            upsert_records(
+                service,
+                spreadsheet_id,
+                FEROLDI_FIRST_CUT_DETAIL_SHEET,
+                FEROLDI_FIRST_CUT_DETAIL_HEADERS,
+                "Candidate ID",
+                detail_rows,
+            )
+            logger.info("Wrote %d Feroldi detail rows.", len(detail_rows))
+        except Exception as exc:
+            logger.exception("Failed to write Feroldi detail rows: %s", exc)
+
+    return enriched
 
 
 def notify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -448,17 +706,35 @@ def run() -> None:
     )
     existing_by_id = _candidate_index(existing_candidates)
 
+    # Capture per-row fingerprints now so we can detect any parallel writer
+    # that mutates ``BTD_CANDIDATES_SHEET`` between this read and the final
+    # ``upsert_records`` at the bottom of ``run()``. The funnel itself does
+    # not write to ``BTD_CANDIDATES_SHEET`` mid-cycle, so any difference is
+    # by definition external.
+    snapshot_fingerprints = {
+        str(record.get("Candidate ID") or "").strip().upper(): _fingerprint_candidate(record)
+        for record in existing_candidates
+        if str(record.get("Candidate ID") or "").strip()
+    }
+
     candidates = []
     for record in pending:
         incoming = comparison_to_candidate(record, now)
         existing = existing_by_id.get(str(incoming["Candidate ID"]).upper())
         candidates.append(merge_candidate(existing, incoming, now))
 
+    # Pre-compute the active candidate-ID set ONCE rather than rebuilding on
+    # every iteration. Without this, the comprehension is O(N x M) and re-creates
+    # a set for each of N existing records.
+    active_candidate_ids = {
+        str(candidate.get("Candidate ID") or "").upper()
+        for candidate in candidates
+        if str(candidate.get("Candidate ID") or "").strip()
+    }
     stale_active = [
         record
         for record in existing_candidates
-        if str(record.get("Candidate ID") or "").upper()
-        not in {str(candidate.get("Candidate ID") or "").upper() for candidate in candidates}
+        if str(record.get("Candidate ID") or "").upper() not in active_candidate_ids
         and _active_for_enrichment(record)
     ]
     candidates.extend(stale_active)
@@ -475,9 +751,22 @@ def run() -> None:
     ]
     candidates = add_optional_ai_drafts(service, spreadsheet_id, candidates)
 
+    # Feroldi first-cut enrichment and scoring (deterministic, no LLM)
+    feroldi_enrich_limit = int(_float_value(os.getenv("FEROLDI_ENRICH_LIMIT"), 10.0))
+    feroldi_force_refresh = str(os.getenv("FEROLDI_FORCE_REFRESH", "false")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    candidates = enrich_feroldi_candidates(
+        candidates,
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        limit=feroldi_enrich_limit,
+        force_refresh=feroldi_force_refresh,
+    )
+
     feroldi_mode = os.getenv("FEROLDI_GATE_MODE", "observe")
-    feroldi_pass_threshold = _float_value(os.getenv("FEROLDI_GATE_PASS_THRESHOLD"), 30.0)
-    feroldi_review_threshold = _float_value(os.getenv("FEROLDI_GATE_REVIEW_THRESHOLD"), 25.0)
+    feroldi_pass_threshold = _float_value(os.getenv("FEROLDI_GATE_PASS_THRESHOLD"), 27.5)
+    feroldi_review_threshold = _float_value(os.getenv("FEROLDI_GATE_REVIEW_THRESHOLD"), 23.0)
     feroldi_min_coverage = _float_value(os.getenv("FEROLDI_GATE_MIN_COVERAGE"), 0.75)
     feroldi_allow_review = str(os.getenv("FEROLDI_GATE_ALLOW_REVIEW", "true")).strip().lower() in {
         "1",
@@ -501,6 +790,28 @@ def run() -> None:
 
     candidates = notify_candidates(candidates)
 
+    # Race-condition guard. Re-read the sheet and compare fingerprint-by-
+    # fingerprint against the snapshot captured at the top of ``run()``;
+    # skip upserting any candidate whose row was externally mutated in the
+    # meantime. Caller's snapshot is the source of truth for what we plan
+    # to overwrite.
+    candidates = _filter_external_mutation(
+        service,
+        spreadsheet_id,
+        BTD_CANDIDATES_SHEET,
+        BTD_CANDIDATE_HEADERS,
+        "Candidate ID",
+        snapshot_fingerprints,
+        candidates,
+    )
+
+    if not candidates:
+        logger.warning(
+            "Skipping BTD_Candidates upsert for this cycle (race-condition guard "
+            "filtered all candidates OR the re-read failed)."
+        )
+        return
+
     upsert_records(
         service,
         spreadsheet_id,
@@ -513,4 +824,11 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    # When invoked as a stand-alone script (``python funnel/review_candidates.py``)
+    # `funnel.*` imports below would otherwise fail. Guarded so library imports
+    # of this module don't mutate ``sys.path``.
+    _THIS_FILE = Path(__file__).resolve()
+    _PROJECT_ROOT = _THIS_FILE.parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
     run()

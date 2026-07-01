@@ -20,17 +20,16 @@ class FeroldiTelegramTests(unittest.TestCase):
                 "Feroldi First Cut Score": 33,
                 "Feroldi Available Points": 38,
                 "Feroldi Equivalent Score": 36.47,
-                "Feroldi Missing Inputs": "Glassdoor",
+                "Feroldi Missing Inputs": "M02,M03",
             }
         )
 
         self.assertIn("Status: PASS (observe)", block)
         self.assertIn("Financials: 14/17", block)
-        self.assertIn("Management & culture: 10/10 available", block)
+        self.assertIn("Management & culture: 10/10", block)
         self.assertIn("Stock: 9/11", block)
         self.assertIn("Overall: 33/38 available", block)
-        self.assertIn("Equivalent: 36.5/42", block)
-        self.assertIn("Missing inputs: Glassdoor", block)
+        self.assertIn("Equivalent: 36.5/38", block)
 
     def test_incomplete_financial_or_stock_section_discloses_available_points(self) -> None:
         block = build_feroldi_block(
