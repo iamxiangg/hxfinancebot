@@ -1,0 +1,29 @@
+# CI-only test deps for the sheet_beautifier workflow's ``test`` job.
+#
+# This is the minimal subset of requirements.txt that lets
+# ``python -m unittest discover -s tests -v`` pass without installing
+# the heavy FinBERT backend (torch + transformers, ~1.5GB combined).
+#
+# Why we don't use requirements.txt here:
+#   - The feroldi module is no-LLM by design
+#     (see funnel/scanners/no_llm_guard.py).
+#   - No unit test imports torch or transformers.
+#   - Installing the ML wheels would slow CI by 1-2 minutes per run
+#     with zero test-coverage benefit.
+#
+# If a future test ever needs torch, the right move is to add it here
+# (and update the comment in .github/workflows/sheet_beautifier.yml),
+# NOT to switch the workflow to ``pip install -r requirements.txt``.
+#
+# When editing this file: also update the pip cache key by bumping a
+# comment in .github/workflows/sheet_beautifier.yml, OR just let the
+# ``cache-dependency-path: requirements-ci.txt`` setting pick up the
+# new content automatically.
+
+google-api-python-client>=2.90.0
+google-auth>=2.0.0
+pandas>=2.0.0
+requests>=2.31.0
+yfinance==1.4.1  # match requirements.txt exact pin to avoid drift between CI and prod
+python-telegram-bot>=20.0.0
+lxml>=4.9.0

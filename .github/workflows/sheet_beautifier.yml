@@ -76,12 +76,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # Cache the wheel directory keyed on the CI dep lock file
+          # so subsequent runs skip re-downloading pandas / yfinance
+          # / google-api-python-client etc. The cache invalidates
+          # when requirements-ci.txt changes (NOT when
+          # requirements.txt changes, which the test job doesn't
+          # install from).
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
 
       - name: Install dependencies
+        # Install from the CI-only dep set in requirements-ci.txt.
+        # Deliberately do NOT use ``pip install -r requirements.txt``
+        # because the FinBERT backend (torch + transformers, ~1.5GB
+        # combined) is not exercised by any unit test — the feroldi
+        # module is no-LLM by design (see
+        # funnel/scanners/no_llm_guard.py). Adding torch here would
+        # slow CI by 1-2 minutes per run with zero test-coverage
+        # benefit.
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install google-api-python-client google-auth
+          python -m pip install -r requirements-ci.txt
 
       - name: Check Python syntax
         run: |
