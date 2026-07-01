@@ -35,3 +35,12 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Google service-account credentials (DO NOT COMMIT — private key material).
+# The project loads these via ``GCP_SERVICE_ACCOUNT_FILE`` env var. The
+# broad patterns below catch common naming variants so a renamed file
+# stays out of the repo even if someone runs ``git add .`` without filter.
+gcp_service_account*.json
+google_service_account*.json
+*_service_account.json
+*service-account-key*.json
+

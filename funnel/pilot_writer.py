@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
+from funnel.sheet_table import column_letter
 from funnel.signal_schema import Signal
 
 logger = logging.getLogger(__name__)
@@ -85,13 +86,27 @@ def ensure_pilot_sheets(service, spreadsheet_id: str) -> None:
     logger.info("Created pilot worksheets: %s", ", ".join(missing))
 
 
-def _read_table(service, spreadsheet_id: str, sheet_name: str) -> list[list[Any]]:
+def _read_table(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_name: str,
+    column_count: int,
+) -> list[list[Any]]:
+    """
+    Read the relevant area of one pilot worksheet.
+
+    ``column_count`` MUST be derived from the canonical header list (e.g.
+    ``len(PENDING_HEADERS)``). Reading more columns than the schema defines
+    surfaces stale or operator-added columns the code does not know how
+    to interpret — and reading FEWER columns would silently drop trailing
+    fields.
+    """
     response = (
         service.spreadsheets()
         .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'!A:Z",
+            range=f"'{sheet_name}'!A:{column_letter(column_count)}",
             majorDimension="ROWS",
         )
         .execute()
@@ -130,7 +145,7 @@ def _write_table(
     ]
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id,
-        range=f"'{sheet_name}'!A:Z",
+        range=f"'{sheet_name}'!A:{column_letter(len(headers))}",
         body={},
     ).execute()
     service.spreadsheets().values().update(
@@ -238,15 +253,24 @@ def write_pilot_results(signals: list[Signal], comparison: list[dict[str, Any]])
     ensure_pilot_sheets(service, spreadsheet_id)
 
     pending_existing = _rows_to_dicts(
-        _read_table(service, spreadsheet_id, PENDING_SHEET),
+        _read_table(
+            service, spreadsheet_id, PENDING_SHEET,
+            len(PENDING_HEADERS),
+        ),
         PENDING_HEADERS,
     )
     signal_existing = _rows_to_dicts(
-        _read_table(service, spreadsheet_id, SIGNAL_LOG_SHEET),
+        _read_table(
+            service, spreadsheet_id, SIGNAL_LOG_SHEET,
+            len(SIGNAL_HEADERS),
+        ),
         SIGNAL_HEADERS,
     )
     funnel_existing = _rows_to_dicts(
-        _read_table(service, spreadsheet_id, FUNNEL_SHEET),
+        _read_table(
+            service, spreadsheet_id, FUNNEL_SHEET,
+            len(FUNNEL_HEADERS),
+        ),
         FUNNEL_HEADERS,
     )
 

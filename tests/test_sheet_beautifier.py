@@ -78,11 +78,21 @@ class TestResolveHeaderIndices(unittest.TestCase):
 
 
 class TestBuildFilterViewRequest(unittest.TestCase):
-    def test_renders_status_one_of_list(self) -> None:
+    def test_renders_status_custom_formula(self) -> None:
+        """Multi-value OR on the Status column is expressed via a
+        ``CUSTOM_FORMULA`` whose first ``values`` entry is a format-string
+        template. The ``{col}`` placeholder is substituted with the
+        resolved column letter and ``{row}`` with the first data row
+        (currently 2, because row 1 holds the header).
+        """
         spec = _FilterViewSpec(
             name="V",
             filters=[
-                _FilterSpec(header="Status", type="ONE_OF_LIST", values=["BTD_FAILED"]),
+                _FilterSpec(
+                    header="Status",
+                    type="CUSTOM_FORMULA",
+                    values=['=OR({col}{row}="BTD_FAILED",{col}{row}="BTD_UNAVAILABLE")'],
+                ),
             ],
         )
         request, missing = _build_filter_view_request(
@@ -90,14 +100,74 @@ class TestBuildFilterViewRequest(unittest.TestCase):
         )
         self.assertIsNotNone(request)
         self.assertEqual(missing, [])
-        view = request["addFilterView"]["filterView"]
+        view = request["addFilterView"]["filter"]
         self.assertEqual(view["title"], "V")
         self.assertEqual(view["sortSpecs"], [])
         self.assertEqual(len(view["filterSpecs"]), 1)
         self.assertEqual(view["filterSpecs"][0]["columnIndex"], 0)
         condition = view["filterSpecs"][0]["filterCriteria"]["condition"]
-        self.assertEqual(condition["type"], "ONE_OF_LIST")
-        self.assertEqual(condition["values"], [{"userEnteredValue": "BTD_FAILED"}])
+        self.assertEqual(condition["type"], "CUSTOM_FORMULA")
+        # {col} → "A" (columnIndex=0) and {row} → 2 (first data row).
+        # The exact-match assertion below also guards against any
+        # unsubstituted placeholders: if a future refactor drops
+        # ``row=`` or ``col=`` from the format kwargs, str.format
+        # raises KeyError, but if it switches to a manual concat path
+        # the mismatch here would catch it.
+        self.assertEqual(
+            condition["values"],
+            [{"userEnteredValue": '=OR(A2="BTD_FAILED",A2="BTD_UNAVAILABLE")'}],
+        )
+
+    def test_custom_formula_column_letter_scales_beyond_a(self) -> None:
+        """Regression guard for the column-letter math: when the resolved
+        header is NOT at column 0, the substituted letter must reflect the
+        actual column position (catches off-by-one in
+        ``_column_letter(resolved[f.header] + 1)``).
+        """
+        # Status sits at index 5 → column letter F.
+        headers = ["X0", "X1", "X2", "X3", "X4", "Status"]
+        spec = _FilterViewSpec(
+            name="V",
+            filters=[
+                _FilterSpec(
+                    header="Status",
+                    type="CUSTOM_FORMULA",
+                    values=['={col}{row}=42'],
+                ),
+            ],
+        )
+        request, missing = _build_filter_view_request(
+            spec, headers=headers, sheet_id=1, row_count=10,
+        )
+        self.assertIsNotNone(request)
+        condition = request["addFilterView"]["filter"]["filterSpecs"][0]["filterCriteria"]["condition"]
+        self.assertEqual(
+            condition["values"],
+            [{"userEnteredValue": "=F2=42"}],
+        )
+
+    def test_custom_formula_with_no_values_returns_none(self) -> None:
+        """Defensive: a CUSTOM_FORMULA with an empty ``values`` list is
+        malformed (no template to render). The function must return
+        ``None, [header]`` so the caller can log+skip the spec rather
+        than ship a broken request to the Sheets API.
+
+        Note: this is treated as a missing-header error, NOT as a
+        "filter shows everything" intent. Callers that want an
+        unfiltered view should simply omit the spec from
+        ``_FilterViewSpec.filters``.
+        """
+        spec = _FilterViewSpec(
+            name="V",
+            filters=[
+                _FilterSpec(header="Status", type="CUSTOM_FORMULA", values=[]),
+            ],
+        )
+        request, missing = _build_filter_view_request(
+            spec, headers=["Status"], sheet_id=1, row_count=10,
+        )
+        self.assertIsNone(request)
+        self.assertEqual(missing, ["Status"])
 
     def test_renders_number_gte_with_sort(self) -> None:
         spec = _FilterViewSpec(
@@ -117,7 +187,7 @@ class TestBuildFilterViewRequest(unittest.TestCase):
             sheet_id=99, row_count=2000,
         )
         self.assertIsNotNone(request)
-        view = request["addFilterView"]["filterView"]
+        view = request["addFilterView"]["filter"]
         self.assertEqual(view["sortSpecs"][0]["dimensionIndex"], 0)
         self.assertEqual(view["sortSpecs"][0]["sortOrder"], "DESCENDING")
         self.assertEqual(view["sortSpecs"][1]["dimensionIndex"], 1)
@@ -125,10 +195,44 @@ class TestBuildFilterViewRequest(unittest.TestCase):
         self.assertEqual(view["range"]["sheetId"], 99)
         self.assertEqual(view["range"]["endRowIndex"], 2000)
 
-    def test_returns_none_when_header_missing(self) -> None:
+    def test_request_uses_filter_key_not_filter_view(self) -> None:
+        """Regression guard for the Google Sheets API quirk.
+
+        The ``addFilterView`` request body uses the key ``"filter"`` (a
+        FilterView resource), NOT ``"filterView"`` (which the API rejects
+        with: ``Unknown name "filterView" at 'requests[0].add_filter_view'``).
+        This test pins the correct key so a future revert is caught
+        immediately by CI.
+        """
         spec = _FilterViewSpec(
             name="V",
-            filters=[_FilterSpec(header="Status", type="ONE_OF_LIST", values=["X"])],
+            filters=[
+                _FilterSpec(header="Status", type="CUSTOM_FORMULA", values=['=OR({col}{row}="X")']),
+            ],
+        )
+        request, _ = _build_filter_view_request(
+            spec, headers=["Status"], sheet_id=1, row_count=10,
+        )
+        self.assertIsNotNone(request)
+        # Must use ``filter`` (the correct API field name), not ``filterView``.
+        self.assertIn("filter", request["addFilterView"])
+        self.assertNotIn("filterView", request["addFilterView"])
+        # The FilterView resource itself lives under ``filter`` and carries
+        # the title/range/sort/filter specs.
+        view = request["addFilterView"]["filter"]
+        self.assertIn("title", view)
+        self.assertIn("range", view)
+        self.assertIn("filterSpecs", view)
+
+    def test_returns_none_when_header_missing(self) -> None:
+        # The condition type is incidental to this test — the contract
+        # under verification is "a spec whose referenced header is
+        # absent from the sheet is skipped (None) and the missing
+        # header is reported". CUSTOM_FORMULA is just the most common
+        # shape used by the shipped BTD_Candidates view.
+        spec = _FilterViewSpec(
+            name="V",
+            filters=[_FilterSpec(header="Status", type="CUSTOM_FORMULA", values=['=OR({col}{row}="X")'])],
         )
         request, missing = _build_filter_view_request(
             spec, headers=["Ticker"], sheet_id=1, row_count=10,
@@ -213,7 +317,12 @@ class TestApplyFilterViewsIdempotent(unittest.TestCase):
         body = kwargs["body"]
         self.assertEqual(len(body["requests"]), 1)
         self.assertIn("addFilterView", body["requests"][0])
-        view = body["requests"][0]["addFilterView"]["filterView"]
+        # Google Sheets API quirk: the payload key is ``filter`` (a FilterView
+        # resource), not ``filterView``. Asserting both makes a future revert
+        # to the wrong key a hard CI failure.
+        self.assertIn("filter", body["requests"][0]["addFilterView"])
+        self.assertNotIn("filterView", body["requests"][0]["addFilterView"])
+        view = body["requests"][0]["addFilterView"]["filter"]
         self.assertEqual(view["title"], "🚨 Strong Congress, BTD-Rejected")
 
     def test_applies_only_missing_views_when_some_exist(self) -> None:
@@ -253,7 +362,11 @@ class TestApplyFilterViewsMissingHeaders(unittest.TestCase):
         spec = _FilterViewSpec(
             name="Strong congress review",
             filters=[
-                _FilterSpec(header="Status", type="ONE_OF_LIST", values=["BTD_FAILED"]),
+                _FilterSpec(
+                    header="Status",
+                    type="CUSTOM_FORMULA",
+                    values=['=OR({col}{row}="BTD_FAILED")'],
+                ),
                 _FilterSpec(
                     header="Congress Active Purchases",
                     type="NUMBER_GREATER_THAN_EQ",

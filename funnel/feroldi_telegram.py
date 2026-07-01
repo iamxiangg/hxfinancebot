@@ -11,7 +11,9 @@ from funnel.telegram_review import build_callback_data, build_review_message
 
 FEROLDI_SECTION_MAXIMUMS = {
     "Financials": 17,
+    "Management": 10,
     "Stock": 11,
+    "Overall": 38,
 }
 
 
@@ -54,14 +56,18 @@ def build_feroldi_block(candidate: dict[str, Any]) -> str:
     if stock_available and stock_available not in {"11", "11.0"}:
         stock_denominator = f"{_number(stock_available)} available (max 11)"
 
+    management_denom = "10"
+    if management_available and management_available not in ("10", "10.0"):
+        management_denom = f"{_number(management_available)} available (max 10)"
+
     lines = [
         "FEROLDI FIRST-CUT",
         f"- Status: {gate} ({mode})",
         f"- Financials: {financial_score}/{financial_denominator}",
-        f"- Management & culture: {management_score}/{management_available} available",
+        f"- Management & culture: {management_score}/{management_denom}",
         f"- Stock: {stock_score}/{stock_denominator}",
         f"- Overall: {overall_score}/{overall_available} available",
-        f"- Equivalent: {equivalent}/42",
+        f"- Equivalent: {equivalent}/38",
     ]
 
     missing = _clean(candidate.get("Feroldi Missing Inputs"))

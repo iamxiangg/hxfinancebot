@@ -94,12 +94,30 @@ PRODUCTION_SHEETS: list[tuple[str, list[str]]] = [
 # extended. If a referenced header is missing, that specific spec is skipped
 # with a warning rather than failing the whole beautify run.
 #
-# Sheets API reference:
-#   addFilterView -> filterView {title, range, sortSpecs, filterSpecs}
-#   filterSpec.columnIndex + filterCriteria.condition (one of:
-#     ONE_OF_LIST, NUMBER_GREATER_THAN_EQ, NUMBER_LESS_THAN_EQ, TEXT_EQ, etc.)
+# Sheets API reference (filter views, NOT basic filter):
+#   addFilterView -> filter {title, range, sortSpecs, filterSpecs}
+#   filterSpec.columnIndex + filterCriteria.condition (type ∈ ConditionType
+#   enum: TEXT_EQ, TEXT_CONTAINS, NUMBER_GREATER_THAN_EQ,
+#   NUMBER_LESS_THAN_EQ, CUSTOM_FORMULA, ...).
+#
+# Multi-value OR matching: ``ONE_OF_LIST`` is for data-validation rules, not
+# filter views, and is rejected with ``ConditionType 'ONE_OF_LIST' is not
+# supported in filters.``. ``TEXT_EQ`` does not give clean OR semantics
+# across multiple values either. The reliable path is ``CUSTOM_FORMULA``
+# with an ``=OR(...)`` formula. The first value in ``_FilterSpec.values``
+# is treated as a format-string template and supports two placeholders:
+#   ``{col}``  — substituted with the column letter of the resolved header
+#   ``{row}``  — substituted with the first data row (currently 2; the
+#               header sits on row 1, data starts on row 2)
 
 FilterConditionType = str  # alias for readability
+
+# First data row (1-based) is 2 because the header sits on row 1 and data
+# starts on row 2. ``CUSTOM_FORMULA`` templates use ``{row}`` as a
+# placeholder; the substitution lives in ``_build_filter_view_request``.
+# Promoting to a module-level constant keeps the layout assumption
+# grep-able and gives a future override path an obvious handle.
+_FIRST_DATA_ROW = 2
 
 
 @dataclass
@@ -152,10 +170,20 @@ BTD_CANDIDATES_FILTER_VIEWS: list[_FilterViewSpec] = [
     _FilterViewSpec(
         name="🚨 Strong Congress, BTD-Rejected",
         filters=[
+            # Multi-value OR via CUSTOM_FORMULA — Sheets API's filter views do
+            # not accept ONE_OF_LIST, and TEXT_EQ does not give clean OR
+            # semantics across multiple values. The formula references the
+            # resolved column letter via ``{col}`` and the first data row
+            # via ``{row}`` (both substituted at request-build time, see
+            # _build_filter_view_request). Row 2 is the convention: the
+            # filter view's data range starts at the second 1-based row
+            # because row 1 holds the header.
             _FilterSpec(
                 header="Status",
-                type="ONE_OF_LIST",
-                values=["BTD_FAILED", "BTD_UNAVAILABLE"],
+                type="CUSTOM_FORMULA",
+                values=[
+                    '=OR({col}{row}="BTD_FAILED",{col}{row}="BTD_UNAVAILABLE")',
+                ],
             ),
             _FilterSpec(
                 header="Congress Active Purchases",
@@ -227,10 +255,31 @@ def _build_filter_view_request(
 
     filter_specs: list[dict[str, Any]] = []
     for f in spec.filters:
-        condition: dict[str, Any] = {
-            "type": f.type,
-            "values": [{"userEnteredValue": v} for v in f.values],
-        }
+        col_letter = _column_letter(resolved[f.header] + 1)
+        if f.type == "CUSTOM_FORMULA":
+            # Treat the first value as a format-string template; substitute
+            # ``{col}`` with the resolved column letter and ``{row}`` with
+            # the first data row. Used to express multi-value OR matches
+            # that the Sheets API does not otherwise support for filter
+            # views (e.g., status in a set of values).
+            if not f.values:
+                # Defensive: a CUSTOM_FORMULA with no template is malformed.
+                # Returned as a missing-header so the caller logs+skips
+                # the spec rather than shipping a broken request. An empty
+                # ``values`` list is NOT a "filter shows everything" intent;
+                # if a future caller actually wants an unfiltered view,
+                # they should omit the spec from the FilterViewSpec.
+                return None, [f.header]
+            formula = f.values[0].format(col=col_letter, row=_FIRST_DATA_ROW)
+            condition: dict[str, Any] = {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": formula}],
+            }
+        else:
+            condition = {
+                "type": f.type,
+                "values": [{"userEnteredValue": v} for v in f.values],
+            }
         filter_specs.append(
             {
                 "columnIndex": resolved[f.header],
@@ -246,9 +295,18 @@ def _build_filter_view_request(
         for s in spec.sorts
     ]
 
+    # Google Sheets API quirk: the addFilterView payload key is ``"filter"``
+    # (containing a FilterView resource), NOT ``"filterView"``. The API
+    # rejects ``"filterView"`` with: Unknown name "filterView" at
+    # 'requests[0].add_filter_view': Cannot find field. Verified against
+    # the v4 discovery doc (AddFilterViewRequest schema). If you change
+    # this back to ``"filterView"``, the BTD_Candidates saved filter view
+    # will fail to create and the receipt will show
+    # filter_views_applied: [] — tests in tests/test_sheet_beautifier.py
+    # pin the correct key.
     request = {
         "addFilterView": {
-            "filterView": {
+            "filter": {
                 "title": spec.name,
                 "range": {
                     "sheetId": sheet_id,
@@ -369,8 +427,8 @@ def apply_filter_views(
         logger.info(
             "Filter view %r on %r: %d filter specs, %d sort specs.",
             spec.name, sheet_name,
-            len(request["addFilterView"]["filterView"]["filterSpecs"]),
-            len(request["addFilterView"]["filterView"]["sortSpecs"]),
+            len(request["addFilterView"]["filter"]["filterSpecs"]),
+            len(request["addFilterView"]["filter"]["sortSpecs"]),
         )
 
     if not requests:

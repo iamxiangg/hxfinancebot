@@ -4,7 +4,7 @@ import math
 from typing import Any
 
 
-FEROLDI_FIRST_CUT_MAX_POINTS = 42.0
+FEROLDI_FIRST_CUT_MAX_POINTS = 38.0
 VALID_GATE_MODES = {"off", "observe", "enforce"}
 
 
@@ -128,14 +128,14 @@ def apply_feroldi_gate(
     candidate: dict[str, Any],
     *,
     mode: str = "observe",
-    pass_threshold: float = 30.0,
-    review_threshold: float = 25.0,
+    pass_threshold: float = 27.5,
+    review_threshold: float = 23.0,
     min_coverage: float = 0.75,
     allow_review: bool = True,
 ) -> dict[str, Any]:
     """Apply a coverage-aware first-cut Feroldi gate.
 
-    Thresholds are expressed as equivalent points out of the full 42-point
+    Thresholds are expressed as equivalent points out of the full 38-point
     first-cut maximum. Partial data is normalised only when minimum coverage is
     met. In observe mode the gate is recorded but the preceding BTD eligibility
     decision is preserved.
@@ -184,6 +184,7 @@ def apply_feroldi_gate(
     coverage = available / maximum
     equivalent = score / available * maximum
     display = format_feroldi_score(score, available, maximum)
+    max_points_display = _number_text(maximum)
 
     candidate["Feroldi First Cut Score"] = round(score, 2)
     candidate["Feroldi Available Points"] = round(available, 2)
@@ -199,16 +200,16 @@ def apply_feroldi_gate(
         )
     elif equivalent >= pass_threshold:
         gate = "PASS"
-        reason = f"{display}; equivalent score meets the {pass_threshold:.1f}/42 pass threshold."
+        reason = f"{display}; equivalent score meets the {pass_threshold:.1f}/{max_points_display} pass threshold."
     elif equivalent >= review_threshold:
         gate = "REVIEW"
         reason = (
-            f"{display}; equivalent score is below {pass_threshold:.1f}/42 but meets the "
-            f"{review_threshold:.1f}/42 review threshold."
+            f"{display}; equivalent score is below {pass_threshold:.1f}/{max_points_display} but meets the "
+            f"{review_threshold:.1f}/{max_points_display} review threshold."
         )
     else:
         gate = "FAIL"
-        reason = f"{display}; equivalent score is below the {review_threshold:.1f}/42 review threshold."
+        reason = f"{display}; equivalent score is below the {review_threshold:.1f}/{max_points_display} review threshold."
 
     if normalised_mode == "observe":
         reason += " Observe-only mode preserved the BTD eligibility decision."

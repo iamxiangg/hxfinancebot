@@ -7,12 +7,12 @@ from funnel.feroldi_gate import apply_feroldi_gate, format_feroldi_score
 
 class FeroldiGateTests(unittest.TestCase):
     def test_complete_score_display(self) -> None:
-        self.assertEqual(format_feroldi_score(32, 42, 42), "32/42 (76.2%)")
+        self.assertEqual(format_feroldi_score(32, 38, 38), "32/38 (84.2%)")
 
     def test_partial_score_display_is_not_misleading(self) -> None:
         self.assertEqual(
-            format_feroldi_score(31, 38, 42),
-            "31/38 available (81.6%; 34.3/42 equivalent)",
+            format_feroldi_score(31, 35, 38),
+            "31/35 available (88.6%; 33.7/38 equivalent)",
         )
 
     def test_observe_mode_preserves_btd_eligibility(self) -> None:
@@ -21,12 +21,12 @@ class FeroldiGateTests(unittest.TestCase):
                 "Ticker": "ABC",
                 "Status": "BTD_PASSED",
                 "Telegram Eligible": "YES",
-                "Feroldi First Cut Score": 20,
-                "Feroldi Available Points": 42,
+                "Feroldi First Cut Score": 18,
+                "Feroldi Available Points": 38,
             },
             mode="observe",
-            pass_threshold=30,
-            review_threshold=25,
+            pass_threshold=27.5,
+            review_threshold=23.0,
         )
 
         self.assertEqual(candidate["Feroldi Gate"], "FAIL")
@@ -34,23 +34,23 @@ class FeroldiGateTests(unittest.TestCase):
         self.assertEqual(candidate["Status"], "BTD_PASSED")
         self.assertIn("Observe-only", candidate["Feroldi Gate Reason"])
 
-    def test_partial_score_is_normalised_to_42(self) -> None:
+    def test_partial_score_is_normalised_to_38(self) -> None:
         candidate = apply_feroldi_gate(
             {
                 "Ticker": "ABC",
                 "Status": "BTD_PASSED",
                 "Telegram Eligible": "YES",
-                "Feroldi First Cut Score": 31,
-                "Feroldi Available Points": 38,
+                "Feroldi First Cut Score": 28,
+                "Feroldi Available Points": 35,
             },
             mode="enforce",
-            pass_threshold=30,
-            review_threshold=25,
+            pass_threshold=27.5,
+            review_threshold=23.0,
             min_coverage=0.75,
         )
 
         self.assertEqual(candidate["Feroldi Gate"], "PASS")
-        self.assertAlmostEqual(candidate["Feroldi Equivalent Score"], 34.26, places=2)
+        self.assertAlmostEqual(candidate["Feroldi Equivalent Score"], 30.4, places=1)
         self.assertEqual(candidate["Telegram Eligible"], "YES")
         self.assertEqual(candidate["Status"], "FEROLDI_PASSED")
 
@@ -59,12 +59,12 @@ class FeroldiGateTests(unittest.TestCase):
             {
                 "Status": "BTD_PASSED",
                 "Telegram Eligible": "YES",
-                "Feroldi First Cut Score": 27,
-                "Feroldi Available Points": 42,
+                "Feroldi First Cut Score": 24,
+                "Feroldi Available Points": 38,
             },
             mode="enforce",
-            pass_threshold=30,
-            review_threshold=25,
+            pass_threshold=27.5,
+            review_threshold=23.0,
             allow_review=True,
         )
 
@@ -77,12 +77,12 @@ class FeroldiGateTests(unittest.TestCase):
             {
                 "Status": "BTD_PASSED",
                 "Telegram Eligible": "YES",
-                "Feroldi First Cut Score": 24,
-                "Feroldi Available Points": 42,
+                "Feroldi First Cut Score": 20,
+                "Feroldi Available Points": 38,
             },
             mode="enforce",
-            pass_threshold=30,
-            review_threshold=25,
+            pass_threshold=27.5,
+            review_threshold=23.0,
         )
 
         self.assertEqual(candidate["Feroldi Gate"], "FAIL")
@@ -94,8 +94,8 @@ class FeroldiGateTests(unittest.TestCase):
             {
                 "Status": "BTD_PASSED",
                 "Telegram Eligible": "YES",
-                "Feroldi First Cut Score": 25,
-                "Feroldi Available Points": 30,
+                "Feroldi First Cut Score": 20,
+                "Feroldi Available Points": 25,
             },
             mode="enforce",
             min_coverage=0.75,
@@ -122,8 +122,8 @@ class FeroldiGateTests(unittest.TestCase):
             {
                 "Status": "BTD_FAILED",
                 "Telegram Eligible": "NO",
-                "Feroldi First Cut Score": 40,
-                "Feroldi Available Points": 42,
+                "Feroldi First Cut Score": 35,
+                "Feroldi Available Points": 38,
             },
             mode="enforce",
         )

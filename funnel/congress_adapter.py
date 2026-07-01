@@ -11,6 +11,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import requests
+from googleapiclient.errors import HttpError
+
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.review_schema import CONGRESS_LEDGER_HEADERS, CONGRESS_LEDGER_SHEET
 from funnel.review_setup import ensure_review_sheets
@@ -25,6 +28,20 @@ from scanners.congress.engine import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Transient Sheets / network errors tolerated silently (logged and swallowed)
+# at well-defined fault barriers. Anything OUTSIDE this tuple is a programmer
+# bug and SHOULD crack loudly so it gets noticed during development / staging.
+# Deliberately excludes ``OSError`` because that parent class also covers
+# unrelated conditions (MemoryError, IsADirectoryError, FileNotFoundError…)
+# that should never be silently swallowed at a Sheets-write site.
+# Mirrors funnel/review_candidates._TRANSIENT_SHEETS_ERRORS but kept local to
+# avoid a circular import at module load.
+_TRANSIENT_SHEETS_ERRORS: tuple[type[BaseException], ...] = (
+    HttpError,                  # 4xx / 5xx Sheets API responses
+    requests.RequestException,  # transport-level failures (incl. Timeout, Connection)
+)
 
 
 SUPPORTED_CATEGORIES = {
@@ -399,7 +416,19 @@ def run_congress_adapter_detailed(
         branch_scope=os.getenv("POLITICAL_DISCLOSURE_SCOPE", "all"),
     )
     if persist_ledger:
-        _save_ledger(scan.ledger, ledger_context)
+        # Saving the ledger is best-effort. If Google Sheets rate-limits the
+        # write or the API is temporarily unavailable, we must still return the
+        # freshly-collected signals so the rest of the funnel can run. The
+        # worst-case cost of skipping a save is one duplicate signal next cycle.
+        # Narrow to transient Sheets / network errors — programmer bugs (e.g.
+        # KeyError, AttributeError) should crash loudly during development.
+        try:
+            _save_ledger(scan.ledger, ledger_context)
+        except _TRANSIENT_SHEETS_ERRORS as exc:
+            logger.warning(
+                "Congress ledger save failed; signals will still be returned: %r",
+                exc,
+            )
 
     signal_observed_at = observed_at or scan.metadata.fetched_at
     signals: list[Signal] = []
