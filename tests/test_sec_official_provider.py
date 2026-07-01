@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -367,6 +368,94 @@ class OfficialSECProviderTests(unittest.TestCase):
             primary_document=primary_document,
             is_amendment=form.endswith("/A"),
             source_url=f"https://www.sec.gov/Archives/edgar/data/1650372/{accession.replace('-', '')}/{accession}.txt",
+        )
+
+
+class UserAgentWarningDedupTests(unittest.TestCase):
+    """When ``SEC_USER_AGENT`` is unset, the provider falls back to a default
+    AND logs a WARNING. The warning dedups within a single Python process so
+    repeated ``OfficialSECProvider()`` constructions during one scan don't
+    spam the workflow log on every cron run -- the first occurrence is loud,
+    subsequent ones within the same process are silently suppressed.
+    """
+
+    def setUp(self) -> None:
+        # Reset the module-level dedup flag so each test starts in a fresh state.
+        from providers.sec import official as official_module
+        official_module._USER_AGENT_WARN_EMITTED = False
+
+    def test_first_construction_without_user_agent_emits_warning(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertLogs("providers.sec.official", level="WARNING") as captured:
+                OfficialSECProvider()
+        self.assertTrue(
+            any(
+                "SEC_USER_AGENT is not configured" in line
+                for line in captured.output
+            )
+        )
+
+    def test_second_construction_in_same_process_does_not_emit_warning(self) -> None:
+        """Dedup: first construction emits and locks the flag; a subsequent
+        construction in the same process must NOT emit."""
+        # First construction: emits and locks the flag.
+        with patch.dict(os.environ, {}, clear=True):
+            OfficialSECProvider()
+
+        # Second construction: deduped. ``assertLogs`` raises on
+        # no-logs-captured, so install a custom handler for negative
+        # assertions.
+        captured_records: list = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured_records.append(record)
+
+        handler = _Capture(level=logging.WARNING)
+        target_logger = logging.getLogger("providers.sec.official")
+        target_logger.addHandler(handler)
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                OfficialSECProvider()
+        finally:
+            target_logger.removeHandler(handler)
+
+        self.assertFalse(
+            any(
+                "SEC_USER_AGENT is not configured" in r.getMessage()
+                for r in captured_records
+            ),
+            "second construction should NOT emit warning once flag is set",
+        )
+
+    def test_warning_with_user_agent_set_does_not_emit(self) -> None:
+        """If the user provides SEC_USER_AGENT, no warning at all -- including
+        on the FIRST construction -- so we never spam even log lines without
+        value to the operator."""
+        captured_records: list = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured_records.append(record)
+
+        handler = _Capture(level=logging.WARNING)
+        target_logger = logging.getLogger("providers.sec.official")
+        target_logger.addHandler(handler)
+        try:
+            with patch.dict(
+                os.environ,
+                {"SEC_USER_AGENT": "hxfinancebot-tests/test@example.com"},
+                clear=True,
+            ):
+                OfficialSECProvider()
+        finally:
+            target_logger.removeHandler(handler)
+
+        self.assertFalse(
+            any(
+                "SEC_USER_AGENT is not configured" in r.getMessage()
+                for r in captured_records
+            )
         )
 
 

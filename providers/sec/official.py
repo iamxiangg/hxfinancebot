@@ -32,6 +32,34 @@ from scanners.insider.parser import find_ownership_xml_filename, parse_master_in
 
 logger = logging.getLogger(__name__)
 
+
+# Track whether the SEC_USER_AGENT-not-configured WARNING has already been
+# emitted in this Python process. The funnel workflow can construct
+# ``OfficialSECProvider`` more than once per scan (e.g. once for the guidance
+# enrichment pass, once for the insider ingestion); without dedup, this
+# fires once per constructor and floods the log on every cron run.
+_USER_AGENT_WARN_EMITTED = False
+
+
+def _warn_user_agent_unconfigured_once(default_user_agent: str) -> None:
+    """Emit the SEC_USER_AGENT-not-configured WARNING at most once per process.
+
+    Multiple ``OfficialSECProvider`` constructions in one scan would otherwise
+    log this on every instance and bury real warnings downstream.
+    """
+    global _USER_AGENT_WARN_EMITTED
+    if _USER_AGENT_WARN_EMITTED:
+        return
+    _USER_AGENT_WARN_EMITTED = True
+    logger.warning(
+        "SEC_USER_AGENT is not configured. Using default '%s'. "
+        "Set the SEC_USER_AGENT GitHub Actions repository variable to a descriptive "
+        "contact string (e.g. 'hxfinancebot contact@example.com'). "
+        "This is NOT an account or API key — it follows SEC EDGAR fair-access rules.",
+        default_user_agent,
+    )
+
+
 SEC_BASE_URL = "https://www.sec.gov"
 SEC_DATA_URL = "https://data.sec.gov"
 TICKER_MAP_URL = f"{SEC_BASE_URL}/files/company_tickers.json"
@@ -126,13 +154,7 @@ class OfficialSECProvider(SECProvider):
         self.user_agent = str(user_agent or os.getenv("SEC_USER_AGENT", "")).strip()
         if not self.user_agent:
             self.user_agent = "hxfinancebot/1.0 (contact@hxfinancebot.dev)"
-            logger.warning(
-                "SEC_USER_AGENT is not configured. Using default '%s'. "
-                "Set the SEC_USER_AGENT GitHub Actions repository variable to a descriptive "
-                "contact string (e.g. 'hxfinancebot contact@example.com'). "
-                "This is NOT an account or API key — it follows SEC EDGAR fair-access rules.",
-                self.user_agent,
-            )
+            _warn_user_agent_unconfigured_once(self.user_agent)
         self.session = session or requests.Session()
         if hasattr(self.session, "headers"):
             self.session.headers.update({"User-Agent": self.user_agent})
