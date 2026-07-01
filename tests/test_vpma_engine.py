@@ -401,5 +401,177 @@ class VpmaScanIsolationTests(unittest.TestCase):
         self.assertIn(result.classification, {"actionable", "wait", "near_miss", "risk", "excluded"})
 
 
+class YfinanceVpmaDataSourceErrorPathsTests(unittest.TestCase):
+    """Verify yfinance-internal failures don't escalate to ``unexpected_errors``.
+
+    Both ``Ticker.get_earnings_dates`` and the lazy ``Ticker.earnings_dates``
+    property can raise ``KeyError`` (or other exceptions) when Yahoo lacks a
+    usable calendar entry for a given ticker. The data source must absorb
+    these so the scan step can downgrade such tickers via the standard
+    missing-market-data or no-event paths, instead of emitting a per-ticker
+    ``WARNING VPMA evaluation failed`` and inflating the unexpected_errors
+    bucket at the scan step.
+    """
+
+    def test_earnings_dates_returns_empty_when_both_methods_raise_keyerror(self) -> None:
+        class _BothFailTicker:
+            def get_earnings_dates(self, limit: int = 8) -> pd.DataFrame:  # noqa: ARG002
+                raise KeyError("chart")
+
+            @property
+            def earnings_dates(self) -> pd.DataFrame:
+                raise KeyError("chart")
+
+        ds = YfinanceVpmaDataSource()
+        with patch("scanners.vpma.engine.yf.Ticker", return_value=_BothFailTicker()):
+            result = ds.earnings_dates("AAPL")
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertTrue(result.empty)
+
+    def test_earnings_dates_returns_empty_when_first_method_raises_and_property_raises(self) -> None:
+        """Migration-safe path: when ``get_earnings_dates`` is removed and the
+        property raises, we still want a clean empty DataFrame rather than a
+        leaked exception."""
+        class _FirstRaisesPropertyRaises:
+            def get_earnings_dates(self, limit: int = 8) -> pd.DataFrame:  # noqa: ARG002
+                raise RuntimeError("removed in yfinance")
+
+            @property
+            def earnings_dates(self) -> pd.DataFrame:
+                raise RuntimeError("chart endpoint unavailable")
+
+        ds = YfinanceVpmaDataSource()
+        with patch(
+            "scanners.vpma.engine.yf.Ticker",
+            return_value=_FirstRaisesPropertyRaises(),
+        ):
+            result = ds.earnings_dates("MSFT")
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertTrue(result.empty)
+
+    def test_earnings_dates_falls_back_to_property_when_first_method_raises(self) -> None:
+        """Happy path: first method raises, property returns a valid DataFrame."""
+        frame = pd.DataFrame(
+            {"EPS Estimate": [1.5], "Reported EPS": [1.6]},
+            index=[pd.Timestamp("2026-06-15 16:30:00")],
+        )
+
+        class _FirstRaisesPropertyOK:
+            def get_earnings_dates(self, limit: int = 8) -> pd.DataFrame:  # noqa: ARG002
+                raise KeyError("transient")
+
+            @property
+            def earnings_dates(self) -> pd.DataFrame:
+                return frame
+
+        ds = YfinanceVpmaDataSource()
+        with patch(
+            "scanners.vpma.engine.yf.Ticker",
+            return_value=_FirstRaisesPropertyOK(),
+        ):
+            result = ds.earnings_dates("NVDA")
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertEqual(len(result), 1)
+
+
+class TzAwareTradingIndexInExtractEventTests(unittest.TestCase):
+    """``yf.download`` returns a tz-aware ``DatetimeIndex`` for US session
+    hours. ``extract_recent_earnings_event`` must localize the trading index
+    before comparing against the tz-naive ``reaction_session`` returned by
+    ``map_reaction_session`` - otherwise pandas raises on the cross-tz
+    comparison and the failure bubbles up to ``unexpected_errors``."""
+
+    def test_extract_recent_event_with_tz_aware_trading_index(self) -> None:
+        tz_aware_index = pd.bdate_range("2026-06-01", periods=20).tz_localize("America/New_York")
+        frame = pd.DataFrame(
+            {"Surprise(%)": [5.0, 12.0]},
+            index=[pd.Timestamp("2026-06-05 08:00:00"), pd.Timestamp("2026-06-20 16:30:00")],
+        )
+
+        event = extract_recent_earnings_event(
+            frame,
+            tz_aware_index,
+            lookback_days=90,
+            today=date(2026, 6, 25),
+        )
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.reaction_session, pd.Timestamp("2026-06-22"))
+        self.assertEqual(event.release_timing, "after_market")
+        self.assertEqual(event.eps_surprise_pct, 12.0)
+
+
+class VpmaUnexpectedErrorDiagnosticTests(unittest.TestCase):
+    """Verify that warnings now include the actual exception message and
+    traceback so future funnel runs surface the root cause - exactly what
+    was missing from the prior ``WARNING VPMA evaluation failed for <T>: KeyError``
+    entries that hid the actual exception text."""
+
+    def test_unexpected_error_warning_includes_exception_message_and_details(self) -> None:
+        """A valid OHLCV history is required - the prior version used an empty
+        DataFrame which triggered ``missing_market_data`` early return before
+        ``earnings_dates`` was called, so the warning path was never reached."""
+        dates = pd.bdate_range("2026-01-02", periods=90)
+        history_aapl = pd.DataFrame({
+            "Open": [150.0] * 90,
+            "High": [152.0] * 90,
+            "Low": [149.0] * 90,
+            "Close": [151.0] * 90,
+            "Volume": [10_000_000] * 90,
+        }, index=dates)
+        benchmark = pd.DataFrame({
+            "Open": [500.0] * 90,
+            "High": [502.0] * 90,
+            "Low": [499.0] * 90,
+            "Close": [501.0] * 90,
+            "Volume": [10_000_000] * 90,
+        }, index=dates)
+
+        config = VpmaConfig(enable_enrichment=False, guidance_enable=False, valid_days=3)
+        with patch.dict("os.environ", {"VPMA_TEST_TICKERS": "AAPL"}, clear=True):
+            with patch.object(
+                YfinanceVpmaDataSource,
+                "download_histories",
+                return_value={"AAPL": history_aapl},
+            ), patch.object(
+                YfinanceVpmaDataSource,
+                "benchmark_history",
+                return_value=benchmark,
+            ), patch.object(
+                YfinanceVpmaDataSource,
+                "next_earnings_date",
+                return_value=None,
+            ), patch.object(
+                YfinanceVpmaDataSource,
+                "earnings_dates",
+                side_effect=KeyError("calendar_payload_missing"),
+            ):
+                with self.assertLogs("scanners.vpma.engine", level="WARNING") as captured:
+                    scan = run_vpma_scan(config=config)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("AAPL", joined)
+        self.assertIn("KeyError", joined)
+        self.assertIn("calendar_payload_missing", joined)
+        # ``exc_info=True`` triggers Python's logging to print the full traceback.
+        self.assertIn("Traceback", joined)
+
+        result = next(r for r in scan.results if r.ticker == "AAPL")
+        self.assertIn("KeyError", result.reason)
+        self.assertIn("calendar_payload_missing", result.reason)
+        self.assertEqual(result.details.get("error_class"), "KeyError")
+        self.assertIn(
+            "calendar_payload_missing",
+            result.details.get("error_message", ""),
+        )
+        self.assertEqual(scan.counts.get("unexpected_errors", 0), 1)
+        # The ``errors`` list is now colon-parseable (no embedded message).
+        self.assertIn("evaluate:AAPL:KeyError", scan.errors)
+
+
 if __name__ == "__main__":
     unittest.main()

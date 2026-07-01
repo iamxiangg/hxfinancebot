@@ -193,14 +193,27 @@ class YfinanceVpmaDataSource:
         return history.dropna(how="all").copy()
 
     def earnings_dates(self, ticker: str) -> pd.DataFrame:
+        # Both ``get_earnings_dates`` and the lazy ``earnings_dates`` property
+        # in yfinance can raise ``KeyError`` (and related lookup errors) for
+        # tickers that lack a usable earnings calendar on Yahoo's side. The
+        # prior implementation only guarded the first call, leaving the
+        # ``getattr`` fallback unguarded; on failure the property getter was
+        # re-evaluated uncaught, escalating a recoverable empty-calendar
+        # condition into an ``unexpected_errors`` bucket at the scan step.
         yf_ticker = yf.Ticker(ticker, session=self.session)
         try:
             frame = yf_ticker.get_earnings_dates(limit=8)
         except Exception:
-            frame = getattr(yf_ticker, "earnings_dates", pd.DataFrame())
+            try:
+                frame = getattr(yf_ticker, "earnings_dates", pd.DataFrame())
+            except Exception:
+                return pd.DataFrame()
         if frame is None or isinstance(frame, list):
             return pd.DataFrame()
-        return frame.copy()
+        try:
+            return frame.copy()
+        except Exception:
+            return pd.DataFrame()
 
     def next_earnings_date(self, ticker: str) -> date | None:
         yf_ticker = yf.Ticker(ticker, session=self.session)
@@ -434,6 +447,13 @@ def extract_recent_earnings_event(
     working = earnings_frame.copy()
     if isinstance(working.index, pd.DatetimeIndex) and working.index.tz is not None:
         working.index = working.index.tz_localize(None)
+
+    # Strip tz from ``trading_index`` so it matches the tz-naive
+    # ``reaction_session`` returned by ``map_reaction_session`` - otherwise
+    # the cross-tz boolean comparison below raises and the failure bubbles
+    # up to ``unexpected_errors``.
+    if isinstance(trading_index, pd.DatetimeIndex) and trading_index.tz is not None:
+        trading_index = trading_index.tz_localize(None)
 
     today_value = today or datetime.now(UTC).date()
     candidates = []
@@ -1344,7 +1364,22 @@ def run_vpma_scan(
             )
         except Exception as exc:
             counts["unexpected_errors"] += 1
-            logger.warning("VPMA evaluation failed for %s: %s", ticker.ticker, exc.__class__.__name__)
+            # Mirror the Insider fix: include ``str(exc)`` (truncated to 200 chars)
+            # and ``exc_info=True`` so the next funnel run prints the actual
+            # failure message + traceback instead of just the class name. With
+            # only ``exc.__class__.__name__`` the high ``unexpected_errors``
+            # count in the scan summary offered no path back to the root cause.
+            exc_message = str(exc).replace("\n", " ").replace("\r", " ")[:200]
+            logger.warning(
+                "VPMA evaluation failed for %s: %s: %s",
+                ticker.ticker,
+                exc.__class__.__name__,
+                exc_message,
+                exc_info=True,
+            )
+            # Keep the ``errors`` list parseable (colon-separated brief summary).
+            # The full message lives in ``result.details["error_message"]`` and
+            # in the WARNING log above, both of which handle the original text.
             errors.append(f"evaluate:{ticker.ticker}:{exc.__class__.__name__}")
             results.append(
                 VpmaTickerResult(
@@ -1357,9 +1392,14 @@ def run_vpma_scan(
                     confirmation_score=None,
                     data_confidence="low",
                     setup_type="pead_deteriorating",
-                    reason=f"Excluded: unexpected error ({exc.__class__.__name__}).",
+                    reason=f"Excluded: unexpected error ({exc.__class__.__name__}): {exc_message}.",
                     valid_for_days=config.valid_days,
-                    details={"risk_flags": ["unexpected_error"], "model_version": MODEL_VERSION},
+                    details={
+                        "risk_flags": ["unexpected_error"],
+                        "model_version": MODEL_VERSION,
+                        "error_class": exc.__class__.__name__,
+                        "error_message": exc_message,
+                    },
                 )
             )
 
