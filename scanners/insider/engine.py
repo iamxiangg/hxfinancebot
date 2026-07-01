@@ -1235,7 +1235,7 @@ def run_insider_scan(
                 for purchase in consolidate_purchases(parsed_purchases):
                     new_purchases_by_ticker.setdefault(purchase.ticker, []).append(purchase)
             except Exception as exc:
-                logger.warning("Insider filing failed for %s: %s", accession, exc.__class__.__name__)
+                logger.warning("Insider filing failed for %s: %r", accession, exc)
                 continue
 
     if dates_loaded == 0 and persistent_403_count > 0:

@@ -896,6 +896,66 @@ def _data_confidence(event: EarningsEvent, risk_flags: list[str], has_eps_surpri
     return "medium"
 
 
+def _align_reaction_session_tz(
+    history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+    event: EarningsEvent,
+) -> tuple[pd.DataFrame, pd.DataFrame, EarningsEvent]:
+    """Normalize history / benchmark indexes and ``event.reaction_session`` to one tz.
+
+    ``yf.download`` returns a tz-aware ``DatetimeIndex`` (America/New_York in
+    US session hours; tz-naive elsewhere) while ``map_reaction_session``
+    returns the matching trading day as a tz-naive ``pd.Timestamp`` (the
+    earnings_dates frame from yfinance is tz-naive and the function strips
+    tz before comparing). The earlier tz mismatch caused
+    ``history.loc[event.reaction_session]`` in ``evaluate_ticker`` to raise
+    ``KeyError`` for many tickers, surfacing in the production logs as
+    ``WARNING VPMA evaluation failed for <TICKER>: KeyError``.
+
+    Aligning once up front lets every downstream ``.loc[...]`` and
+    ``reaction_session in history.index`` check work without an inline
+    try/except chain. Frame contents (rows, columns, dtypes, values) are
+    unchanged - only the index / tz is rewritten.
+    """
+    history_tz = history.index.tz if isinstance(history.index, pd.DatetimeIndex) else None
+    benchmark_tz = benchmark_history.index.tz if isinstance(benchmark_history.index, pd.DatetimeIndex) else None
+    # ``pd.Timestamp`` exposes ``tz``; plain ``datetime`` exposes ``tzinfo``.
+    # Cover both so a caller passing ``datetime`` doesn't silently skip the
+    # tz-alignment and re-introduce the ``KeyError`` we're guarding against.
+    session_tz = getattr(event.reaction_session, "tz", None) or getattr(
+        event.reaction_session, "tzinfo", None
+    )
+    target_tz = history_tz or benchmark_tz or session_tz
+
+    if history_tz != target_tz and isinstance(history.index, pd.DatetimeIndex):
+        history = history.copy()
+        if target_tz is None and history_tz is not None:
+            history.index = history.index.tz_localize(None)
+        elif target_tz is not None and history_tz is None:
+            history.index = history.index.tz_localize(target_tz)
+    if (
+        benchmark_tz != target_tz
+        and isinstance(benchmark_history.index, pd.DatetimeIndex)
+        and not benchmark_history.empty
+    ):
+        benchmark_history = benchmark_history.copy()
+        if target_tz is None and benchmark_tz is not None:
+            benchmark_history.index = benchmark_history.index.tz_localize(None)
+        elif target_tz is not None and benchmark_tz is None:
+            benchmark_history.index = benchmark_history.index.tz_localize(target_tz)
+
+    if session_tz != target_tz and hasattr(event.reaction_session, "tz_localize"):
+        new_session = (
+            event.reaction_session.tz_localize(None)
+            if target_tz is None
+            else event.reaction_session.tz_localize(target_tz)
+        )
+        event = EarningsEvent(
+            **{**event.__dict__, "reaction_session": new_session},
+        )
+    return history, benchmark_history, event
+
+
 def evaluate_ticker(
     ticker: UniverseTicker,
     history: pd.DataFrame,
@@ -905,6 +965,7 @@ def evaluate_ticker(
     next_earnings_date: date | None,
     config: VpmaConfig,
 ) -> VpmaTickerResult:
+    history, benchmark_history, event = _align_reaction_session_tz(history, benchmark_history, event)
     try:
         current_close = _extract_finite_scalar(history["Close"].iloc[-1])
     except ValueError:

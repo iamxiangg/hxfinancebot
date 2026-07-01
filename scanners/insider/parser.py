@@ -7,6 +7,22 @@ from datetime import datetime
 from typing import Any
 
 
+try:
+    # lxml is already a workflow dependency (pip install ... lxml). We prefer it
+    # over ``xml.etree.ElementTree`` because stdlib ET is strict and rejects SEC
+    # SGML constructs that the Form 4 filings regularly carry: bare
+    # ampersands (``&FOO`` not ``&amp;`` or ``&FOO;``), undeclared entities,
+    # control characters in element text, etc. With ``recover=True``, lxml
+    # tolerates those issues and still extracts the well-formed subtrees so
+    # the calls below (``findall``, ``attrib.get``, ``text``) work unchanged.
+    from lxml import etree as _LXML_ETREE  # noqa: F401  (presence-tested below)
+
+    _HAS_LXML = True
+except ImportError:  # pragma: no cover - kept for dev environments without lxml
+    _LXML_ETREE = None  # type: ignore[assignment]
+    _HAS_LXML = False
+
+
 MASTER_INDEX_SEPARATOR = "--------------------------------------------------------------------------------"
 
 
@@ -94,7 +110,9 @@ def find_ownership_xml_filename(filing_text: str) -> str | None:
     return matches[0] if matches else None
 
 
-def _text(node: ET.Element | None) -> str:
+def _text(node: Any) -> str:
+    # Accepts both xml.etree.ElementTree.Element and lxml.etree._Element - the
+    # public surface used here (.text) is identical across both libraries.
     return (node.text or "").strip() if node is not None and node.text else ""
 
 
@@ -108,8 +126,69 @@ def _float_text(node: ET.Element | None) -> float | None:
         return None
 
 
+def _parse_root(xml_text: str) -> Any:
+    """Return an Element compatible with both ``xml.etree`` and ``lxml.etree``.
+
+    Prefers ``lxml.etree.XMLParser(recover=True)`` which tolerates the SEC SGML
+    patterns that stdlib ``xml.etree.ElementTree.fromstring`` rejects (bare
+    ampersands, undeclared entity references, embedded control characters,
+    etc.). On a fully unrecoverable doc, ``lxml.etree.XMLSyntaxError`` is
+    re-raised as ``xml.etree.ElementTree.ParseError`` so the caller's
+    ``except ET.ParseError`` keeps working unchanged.
+
+    Falls back to stdlib only when ``lxml`` is missing (e.g. a partial dev
+    environment); lxml is in the workflow dependency list already.
+    """
+    if _HAS_LXML:
+        parser = _LXML_ETREE.XMLParser(recover=True, resolve_entities=False)
+        try:
+            root = _LXML_ETREE.fromstring(xml_text.encode("utf-8"), parser=parser)
+        except _LXML_ETREE.XMLSyntaxError as exc:
+            # Recovery exhausted - surface as stdlib ParseError so the
+            # engine-level catch in ``scanners/insider/engine.py`` continues
+            # to emit a single ``ParseError`` warning instead of two distinct
+            # exception types.
+            raise ET.ParseError(str(exc)) from exc
+        if root is None:
+            # lxml's ``recover=True`` returns ``None`` instead of raising
+            # when no root element can be salvaged (empty body, plain-text
+            # 404 page from a misrouted SEC mirror, or any other input with
+            # no recoverable root). Without this guard, ``parse_ownership_xml``
+            # would crash on the very first ``root.findall(...)`` with a
+            # confusing ``AttributeError: 'NoneType' object has no
+            # attribute 'findall'`` instead of the expected ``ParseError``.
+            # Surface as ``ParseError`` so the engine-level catch keeps
+            # treating this uniformly with the syntax-error case.
+            raise ET.ParseError(
+                "lxml XMLParser(recover=True) returned no root element "
+                f"from input (first 80 chars): {_one_line(xml_text[:80])!r}"
+            )
+        # Defence-in-depth: lxml's recover=True can return a valid Element
+        # whose root tag is anything other than ``<ownershipDocument>``
+        # (an HTML-style body from a misrouted SEC mirror, a ``<error>``
+        # XML envelope, a partial subtree the parser recovered enough to
+        # anchor but not enough to identify as the filing format). Without
+        # this check, ``parse_ownership_xml`` would produce silently empty
+        # filings (issuer_cik="", no transactions, no owners). The
+        # ``split("}", 1)[-1]`` (a.k.a. Clark notation local name) pattern
+        # handles both the bare tag and any XBRL namespace prefix uniformly.
+        local_name = root.tag.split("}", 1)[-1]
+        if local_name != "ownershipDocument":
+            raise ET.ParseError(
+                f"unexpected root tag {root.tag!r} (expected <ownershipDocument>); "
+                f"input first 80 chars: {_one_line(xml_text[:80])!r}"
+            )
+        return root
+    return ET.fromstring(xml_text)
+
+
+def _one_line(text: str) -> str:
+    """Collapse newlines/CRs to escaped ``\\n``/``\\r`` so log lines stay single-line."""
+    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+
+
 def parse_ownership_xml(xml_text: str, *, accession: str) -> ParsedOwnershipFiling:
-    root = ET.fromstring(xml_text)
+    root = _parse_root(xml_text)
     footnotes = {
         footnote.attrib.get("id", ""): _text(footnote)
         for footnote in root.findall(".//footnote")
