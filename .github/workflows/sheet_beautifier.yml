@@ -86,14 +86,7 @@ jobs:
           cache-dependency-path: requirements-ci.txt
 
       - name: Install dependencies
-        # Install from the CI-only dep set in requirements-ci.txt.
-        # Deliberately do NOT use ``pip install -r requirements.txt``
-        # because the FinBERT backend (torch + transformers, ~1.5GB
-        # combined) is not exercised by any unit test — the feroldi
-        # module is no-LLM by design (see
-        # funnel/scanners/no_llm_guard.py). Adding torch here would
-        # slow CI by 1-2 minutes per run with zero test-coverage
-        # benefit.
+        # See requirements-ci.txt for the dep-set rationale.
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
