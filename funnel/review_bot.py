@@ -158,6 +158,10 @@ def apply_action(
         else:
             updated["Status"] = "APPROVED_ALREADY_EXISTS"
             result = "Ticker already existed in Stock Summary USD"
+    elif action == "watch":
+        updated["Status"] = "WATCH"
+        updated["Active?"] = "YES"
+        result = "Candidate kept on watch"
     elif action == "reject":
         updated["Status"] = "REJECTED"
         result = "Candidate rejected"
@@ -170,7 +174,8 @@ def apply_action(
     updated["Decision"] = action.upper()
     updated["Decision At"] = now
     updated["Decision By"] = actor
-    updated["Active?"] = "NO"
+    if action != "watch":
+        updated["Active?"] = "NO"
 
     log_row = {
         "Decision ID": _decision_id(str(candidate.get("Candidate ID", "")), action, update_id),

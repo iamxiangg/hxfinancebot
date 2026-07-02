@@ -7,6 +7,7 @@ import requests
 
 from funnel.telegram_review import (
     answer_callback,
+    build_review_keyboard,
     build_review_message,
     build_callback_data,
     candidate_id_for_ticker,
@@ -29,6 +30,10 @@ class TelegramReviewTests(unittest.TestCase):
     def test_ignores_unrelated_callback(self) -> None:
         self.assertIsNone(parse_callback_data("other:approve:abc"))
         self.assertIsNone(parse_callback_data("hxv2:delete:abc"))
+        parsed = parse_callback_data("hxv2:watch:abc")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.action, "watch")
 
     def test_candidate_id_is_stable_and_normalised(self) -> None:
         self.assertEqual(
@@ -136,6 +141,11 @@ class TelegramReviewTests(unittest.TestCase):
         self.assertIn("Attention family: TECHNICAL + OWNERSHIP", message)
         self.assertIn("Corporate insider:", message)
         self.assertIn("Total score: 82", message)
+
+    def test_review_keyboard_includes_watch_action(self) -> None:
+        keyboard = build_review_keyboard({"Candidate ID": "cand-TEAM-demo"})
+        flat = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertEqual(flat, ["Approve", "Watch", "Reject", "Archive"])
 
 
 if __name__ == "__main__":

@@ -90,3 +90,26 @@ Each active candidate gets a suggested `Decision Lane`:
 Telegram review cards now surface this judgment block before the raw BTD and
 Feroldi detail so the human review starts from an investing decision, not just
 from raw fields.
+
+## Workflow Behaviour By Lane
+
+- `RESEARCH_NOW`
+  - review priority is escalated to `URGENT`
+  - Telegram review is sent immediately
+  - the card encourages active human work now
+
+- `WAITING_CONFIRMATION`
+  - candidate stays active in the sheet
+  - Telegram review is sent
+  - the candidate is automatically resurfaced when its review signature changes,
+    such as a new confirming source or a lane upgrade
+
+- `WATCH`
+  - candidate stays active
+  - Telegram provides a `Watch` action so it is retained without promotion
+  - no promotion happens unless the human explicitly approves later
+
+- `REJECT`
+  - candidate is auto-closed as `AUTO_REJECTED`
+  - no Telegram review is sent by default
+  - setting `Manual Override=YES` keeps it open for human review instead

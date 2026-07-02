@@ -14,7 +14,7 @@ import requests
 from googleapiclient.errors import HttpError
 
 from funnel.btd_enrichment import fetch_yfinance_metrics, metrics_to_candidate_updates, to_float
-from funnel.candidate_judgment import apply_candidate_judgment
+from funnel.candidate_judgment import apply_candidate_judgment, review_signature
 from funnel.candidate_ingestor import classify_signals, get_pending_new_ticker_records
 from funnel.congress_adapter import run_congress_adapter
 from funnel.feroldi_ai import draft_to_candidate_updates, request_feroldi_draft
@@ -314,6 +314,8 @@ def _filter_external_mutation(
 
 
 def _active_for_enrichment(candidate: dict[str, Any]) -> bool:
+    if str(candidate.get("Active?") or "").strip().upper() == "NO":
+        return False
     return str(candidate.get("Status") or "").strip().upper() not in CANDIDATE_FINAL_STATUSES
 
 
@@ -331,6 +333,60 @@ def _source_set(candidate: dict[str, Any]) -> set[str]:
 
 def _telegram_eligible(candidate: dict[str, Any]) -> bool:
     return str(candidate.get("Telegram Eligible") or "").strip().upper() == "YES"
+
+
+def _manual_override(candidate: dict[str, Any]) -> bool:
+    return str(candidate.get("Manual Override") or "").strip().upper() == "YES"
+
+
+def apply_candidate_workflow(candidate: dict[str, Any], now: str) -> dict[str, Any]:
+    candidate = dict(candidate)
+    lane = str(candidate.get("Decision Lane") or "").strip().upper()
+    status = str(candidate.get("Status") or "").strip().upper()
+
+    if status in CANDIDATE_FINAL_STATUSES:
+        return candidate
+
+    if lane == "RESEARCH_NOW":
+        candidate["Review Priority"] = "URGENT"
+        candidate["Active?"] = "YES"
+        candidate["Status"] = "RESEARCH_NOW"
+        return candidate
+
+    if lane == "WAITING_CONFIRMATION":
+        if candidate.get("Review Priority") not in {"URGENT", "HIGH"}:
+            candidate["Review Priority"] = "HIGH"
+        candidate["Active?"] = "YES"
+        candidate["Status"] = "WAITING_CONFIRMATION"
+        return candidate
+
+    if lane == "WATCH":
+        if candidate.get("Review Priority") not in {"URGENT", "HIGH"}:
+            candidate["Review Priority"] = "MEDIUM"
+        candidate["Active?"] = "YES"
+        candidate["Status"] = "WATCH"
+        return candidate
+
+    if lane == "REJECT":
+        if _manual_override(candidate):
+            candidate["Review Priority"] = "MANUAL_OVERRIDE"
+            candidate["Active?"] = "YES"
+            candidate["Telegram Eligible"] = "YES"
+            candidate["Status"] = "REVIEW"
+            reason = str(candidate.get("Decision Lane Reason") or "").strip()
+            if reason:
+                candidate["Decision Lane Reason"] = f"{reason} Manual override kept it open for human review."
+            return candidate
+
+        candidate["Telegram Eligible"] = "NO"
+        candidate["Active?"] = "NO"
+        candidate["Status"] = "AUTO_REJECTED"
+        candidate["Decision"] = "AUTO_REJECT"
+        candidate["Decision By"] = candidate.get("Decision By") or "SYSTEM"
+        candidate["Decision At"] = candidate.get("Decision At") or now
+        return candidate
+
+    return candidate
 
 
 def _process_btd_candidate(candidate: dict[str, Any], now: str) -> dict[str, Any]:
@@ -640,7 +696,13 @@ def notify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not _telegram_eligible(candidate):
             updated.append(candidate)
             continue
-        if candidate.get("Telegram Message ID") and not force_resend:
+        signature = review_signature(candidate)
+        lane = str(candidate.get("Decision Lane") or "").strip().upper()
+        last_signature = str(candidate.get("Telegram Last Notified Signature") or "").strip()
+        last_lane = str(candidate.get("Telegram Last Notified Lane") or "").strip().upper()
+        already_notified = bool(candidate.get("Telegram Message ID"))
+        should_resend = force_resend or not already_notified or signature != last_signature or lane != last_lane
+        if not should_resend:
             updated.append(candidate)
             continue
 
@@ -648,6 +710,8 @@ def notify_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             message_id = send_candidate_review(candidate)
             candidate["Telegram Message ID"] = message_id
             candidate["Telegram Last Notified At"] = now
+            candidate["Telegram Last Notified Signature"] = signature
+            candidate["Telegram Last Notified Lane"] = lane
             candidate["Status"] = "NOTIFIED"
         except Exception as exc:
             candidate["Last Error"] = f"Telegram notification failed: {exc!r}"[:500]
@@ -893,6 +957,7 @@ def run() -> None:
         for candidate in candidates
     ]
     candidates = [apply_candidate_judgment(candidate) for candidate in candidates]
+    candidates = [apply_candidate_workflow(candidate, now) for candidate in candidates]
 
     candidates = notify_candidates(candidates)
 

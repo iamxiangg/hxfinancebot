@@ -6,7 +6,7 @@ from typing import Any
 
 import requests
 
-from funnel.telegram_review import build_callback_data, build_review_message
+from funnel.telegram_review import build_review_keyboard, build_review_message
 
 
 FEROLDI_SECTION_MAXIMUMS = {
@@ -117,24 +117,7 @@ def send_candidate_review(
         json={
             "chat_id": chat_id,
             "text": build_review_message_with_feroldi(candidate),
-            "reply_markup": {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "Approve",
-                            "callback_data": build_callback_data("approve", candidate_id),
-                        },
-                        {
-                            "text": "Reject",
-                            "callback_data": build_callback_data("reject", candidate_id),
-                        },
-                        {
-                            "text": "Archive",
-                            "callback_data": build_callback_data("archive", candidate_id),
-                        },
-                    ]
-                ]
-            },
+            "reply_markup": build_review_keyboard(candidate),
             "disable_web_page_preview": True,
         },
         timeout=20,

@@ -4,7 +4,13 @@ import os
 import unittest
 from unittest.mock import patch
 
-from funnel.review_candidates import apply_btd_gate, comparison_to_candidate, merge_candidate
+from funnel.review_candidates import (
+    apply_btd_gate,
+    apply_candidate_workflow,
+    comparison_to_candidate,
+    merge_candidate,
+    notify_candidates,
+)
 from funnel.signal_schema import Signal
 
 
@@ -123,6 +129,71 @@ class ReviewCandidateTests(unittest.TestCase):
         self.assertEqual(candidate["Congress Recent Cluster Members"], 3)
         self.assertEqual(candidate["Congress Active Purchases"], 6)
         self.assertEqual(candidate["Congress Member Names"], "Pelosi, Gottheimer, Tuberville, Moore")
+
+    def test_reject_lane_auto_closes_without_manual_override(self) -> None:
+        candidate = apply_candidate_workflow(
+            {
+                "Ticker": "ABC",
+                "Decision Lane": "REJECT",
+                "Telegram Eligible": "NO",
+                "Active?": "YES",
+            },
+            "2026-07-02T00:00:00+00:00",
+        )
+
+        self.assertEqual(candidate["Status"], "AUTO_REJECTED")
+        self.assertEqual(candidate["Active?"], "NO")
+        self.assertEqual(candidate["Decision"], "AUTO_REJECT")
+
+    def test_reject_lane_manual_override_keeps_review_open(self) -> None:
+        candidate = apply_candidate_workflow(
+            {
+                "Ticker": "ABC",
+                "Decision Lane": "REJECT",
+                "Telegram Eligible": "NO",
+                "Active?": "YES",
+                "Manual Override": "YES",
+                "Decision Lane Reason": "Economics failed.",
+            },
+            "2026-07-02T00:00:00+00:00",
+        )
+
+        self.assertEqual(candidate["Status"], "REVIEW")
+        self.assertEqual(candidate["Active?"], "YES")
+        self.assertEqual(candidate["Telegram Eligible"], "YES")
+        self.assertIn("Manual override kept it open", candidate["Decision Lane Reason"])
+
+    @patch("funnel.review_candidates.send_candidate_review")
+    def test_candidate_resurfaces_when_review_signature_changes(self, mock_send_candidate_review) -> None:
+        mock_send_candidate_review.return_value = "456"
+        candidates = notify_candidates(
+            [
+                {
+                    "Candidate ID": "cand-TEAM",
+                    "Ticker": "TEAM",
+                    "Status": "WAITING_CONFIRMATION",
+                    "Active?": "YES",
+                    "Telegram Eligible": "YES",
+                    "Telegram Message ID": "123",
+                    "Telegram Last NotifiedSignature": "",
+                    "Telegram Last Notified Signature": "oldsig",
+                    "Telegram Last Notified Lane": "WAITING_CONFIRMATION",
+                    "Decision Lane": "RESEARCH_NOW",
+                    "Source": "vpma, insider",
+                    "Positive Sources": "vpma, insider",
+                    "Risk Sources": "",
+                    "Corroboration Level": "STRONG",
+                    "Conflict Status": "CLEAR",
+                    "BTD Gate": "PASS",
+                    "Feroldi Gate": "PASS",
+                    "Supporting Signal IDs": "vpma-TEAM-1, insider-TEAM-2",
+                }
+            ]
+        )
+
+        self.assertEqual(mock_send_candidate_review.call_count, 1)
+        self.assertEqual(candidates[0]["Telegram Message ID"], "456")
+        self.assertEqual(candidates[0]["Status"], "NOTIFIED")
 
 
 class ReviewCandidateRunTests(unittest.TestCase):

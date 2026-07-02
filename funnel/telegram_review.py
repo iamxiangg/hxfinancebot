@@ -31,7 +31,7 @@ def parse_callback_data(data: str) -> ReviewAction | None:
 
     action = parts[1].strip().lower()
     candidate_id = parts[2].strip()
-    if action not in {"approve", "reject", "archive"} or not candidate_id:
+    if action not in {"approve", "watch", "reject", "archive"} or not candidate_id:
         return None
 
     return ReviewAction(action=action, candidate_id=candidate_id)
@@ -121,7 +121,44 @@ def _judgment_block(candidate: dict[str, Any]) -> list[str]:
     if lane_reason:
         lines.append(f"- Why this lane: {lane_reason}")
 
+    if lane == "RESEARCH_NOW":
+        lines.append("- Operating instruction: worth active work now if the story makes qualitative sense.")
+    elif lane == "WAITING_CONFIRMATION":
+        lines.append("- Operating instruction: keep alive and wait for another confirming layer.")
+    elif lane == "WATCH":
+        lines.append("- Operating instruction: do not promote yet; keep it on watch for better confirmation.")
+    elif lane == "REJECT":
+        lines.append("- Operating instruction: the system will auto-close this unless you manually override it.")
+
     return lines
+
+
+def build_review_keyboard(candidate: dict[str, Any]) -> dict[str, Any]:
+    candidate_id = str(candidate.get("Candidate ID") or "").strip()
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Approve",
+                    "callback_data": build_callback_data("approve", candidate_id),
+                },
+                {
+                    "text": "Watch",
+                    "callback_data": build_callback_data("watch", candidate_id),
+                },
+            ],
+            [
+                {
+                    "text": "Reject",
+                    "callback_data": build_callback_data("reject", candidate_id),
+                },
+                {
+                    "text": "Archive",
+                    "callback_data": build_callback_data("archive", candidate_id),
+                },
+            ],
+        ]
+    }
 
 
 def build_review_message(candidate: dict[str, Any]) -> str:
@@ -262,24 +299,7 @@ def send_candidate_review(
         json={
             "chat_id": chat_id,
             "text": build_review_message(candidate),
-            "reply_markup": {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "Approve",
-                            "callback_data": build_callback_data("approve", candidate_id),
-                        },
-                        {
-                            "text": "Reject",
-                            "callback_data": build_callback_data("reject", candidate_id),
-                        },
-                        {
-                            "text": "Archive",
-                            "callback_data": build_callback_data("archive", candidate_id),
-                        },
-                    ]
-                ]
-            },
+            "reply_markup": build_review_keyboard(candidate),
             "disable_web_page_preview": True,
         },
         timeout=20,

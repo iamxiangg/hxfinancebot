@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -175,3 +176,20 @@ def apply_candidate_judgment(candidate: dict[str, Any]) -> dict[str, Any]:
         risks=risks,
     )
     return candidate
+
+
+def review_signature(candidate: dict[str, Any]) -> str:
+    parts = [
+        _clean(candidate.get("Ticker")).upper(),
+        _clean(candidate.get("Decision Lane")).upper(),
+        _clean(candidate.get("Source")).lower(),
+        _clean(candidate.get("Positive Sources")).lower(),
+        _clean(candidate.get("Risk Sources")).lower(),
+        _clean(candidate.get("Corroboration Level")).upper(),
+        _clean(candidate.get("Conflict Status")).upper(),
+        _clean(candidate.get("BTD Gate")).upper(),
+        _clean(candidate.get("Feroldi Gate")).upper(),
+        _clean(candidate.get("Supporting Signal IDs")),
+    ]
+    payload = "|".join(parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
