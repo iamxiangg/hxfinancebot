@@ -729,13 +729,23 @@ def run() -> None:
             ",".join(f"{source}:{error}" for source, error in sorted(failed_sources.items())),
         )
 
-    append_records(
-        service,
-        spreadsheet_id,
-        SIGNAL_LOG_SHEET,
-        SIGNAL_LOG_HEADERS,
-        signal_log_rows(signals, run_id, now),
-    )
+    # Signal-log writes are best-effort; losing one cycle after a transient
+    # network hiccup (e.g. SSL connection drop on the GitHub runner) is
+    # acceptable, but letting that crash the entire ``run()`` after three
+    # successful adapter scans is not. ``OSError`` is deliberately excluded
+    # from the module-level ``_TRANSIENT_SHEETS_ERRORS`` tuple (its broad
+    # parent scope would mask ``FileNotFoundError`` / ``MemoryError`` at
+    # other call sites), so we catch it here at this well-defined fault barrier.
+    try:
+        append_records(
+            service,
+            spreadsheet_id,
+            SIGNAL_LOG_SHEET,
+            SIGNAL_LOG_HEADERS,
+            signal_log_rows(signals, run_id, now),
+        )
+    except (_TRANSIENT_SHEETS_ERRORS, OSError) as exc:
+        logger.warning("Signal log write failed (network transient); continuing: %r", exc)
 
     master_records = get_stock_summary_ticker_records(service=service)
     comparison = classify_signals(signals, master_records)
