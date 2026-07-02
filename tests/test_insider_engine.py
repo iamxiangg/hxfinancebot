@@ -4,6 +4,8 @@ from datetime import UTC, date, datetime, timedelta
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 from providers.sec.errors import SECAccessDeniedError, SECNotFoundError, SECRequestError
 from providers.sec.models import FilingMetadata, SECInsiderTransaction
 from scanners.insider.engine import (
@@ -692,6 +694,72 @@ class InsiderScanErrorTests(unittest.TestCase):
         )
         self.assertGreaterEqual(receipt["dates_loaded"], 1)
         self.assertEqual(results, [])
+
+
+class MedianDollarVolumeRegressionTests(unittest.TestCase):
+    """Regression tests that call the real ``_median_dollar_volume`` function
+    (NOT mocked) with a patched ``yf.download`` to simulate the exact production
+    scenarios that previously crashed."""
+
+    def test_multi_column_close_dataframe_does_not_crash(self) -> None:
+        """Simulate yfinance returning a MultiIndex-column DataFrame for a
+        fund-wrapper ticker (e.g. \"$N\").  When ``history[\"Close\"]`` is a
+        DataFrame rather than a Series, ``.iloc[-1]`` produces a multi-element
+        Series and ``float(Series)`` raises ``TypeError`` unless the function
+        explicitly detects the DataFrame and takes the first column."""
+        from scanners.insider.engine import _median_dollar_volume
+
+        dates = pd.date_range("2026-01-01", periods=120, freq="B")
+        columns = pd.MultiIndex.from_tuples([
+            ("Close", "$N"), ("High", "$N"), ("Low", "$N"),
+            ("Open", "$N"), ("Volume", "$N"),
+            ("Close", "$N.XX"), ("High", "$N.XX"), ("Low", "$N.XX"),
+            ("Open", "$N.XX"), ("Volume", "$N.XX"),
+        ])
+        data = pd.DataFrame(index=dates, columns=columns)
+        data[("Close", "$N")] = 45.0
+        data[("Volume", "$N")] = 500_000
+        data[("Close", "$N.XX")] = 12.0
+        data[("Volume", "$N.XX")] = 100_000
+
+        with patch("yfinance.download", return_value=data):
+            price, mdv, flags = _median_dollar_volume("$N")
+
+        self.assertIsNotNone(price)
+        self.assertAlmostEqual(price, 45.0)
+        self.assertIsNotNone(mdv)
+        self.assertGreater(mdv, 0)
+        self.assertEqual(flags, [])
+
+    def test_single_column_series_still_works(self) -> None:
+        """Sanity check: the normal single-ticker path still works after the fix."""
+        from scanners.insider.engine import _median_dollar_volume
+
+        dates = pd.date_range("2026-01-01", periods=120, freq="B")
+        data = pd.DataFrame({
+            "Close": [45.0] * 120,
+            "Volume": [500_000] * 120,
+        }, index=dates)
+
+        with patch("yfinance.download", return_value=data):
+            price, mdv, flags = _median_dollar_volume("AAPL")
+
+        self.assertIsNotNone(price)
+        self.assertAlmostEqual(price, 45.0)
+        self.assertIsNotNone(mdv)
+        self.assertGreater(mdv, 0)
+        self.assertEqual(flags, [])
+
+    def test_empty_history_returns_sentinel(self) -> None:
+        """Empty DataFrame from yfinance returns market-data-unavailable."""
+        from scanners.insider.engine import _median_dollar_volume
+
+        with patch("yfinance.download", return_value=pd.DataFrame()):
+            price, mdv, flags = _median_dollar_volume("DELISTED")
+
+        self.assertIsNone(price)
+        self.assertIsNone(mdv)
+        self.assertIn("market_data_unavailable", flags)
 
 
 if __name__ == "__main__":
