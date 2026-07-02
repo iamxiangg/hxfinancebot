@@ -30,6 +30,19 @@ from funnel.feroldi_stock import score_s01, score_s02, score_s03
 logger = logging.getLogger(__name__)
 
 
+def _coalesce(*values: Any) -> Any:
+    """Return the first value that is not None or an empty string.
+
+    Numeric zero is a valid financial input and must not be discarded by
+    truthiness-based fallback chains.
+    """
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
 def score_feroldi_detail(
     detail: FeroldiDetailResult,
     *,
@@ -48,22 +61,22 @@ def score_feroldi_detail(
     # --- Financials ---
 
     # F01
-    cash = detail.f01.cash_and_equivalents or _nf(m, "cash")
-    lt_debt = detail.f01.long_term_debt or _nf(m, "long_term_debt")
+    cash = _coalesce(detail.f01.cash_and_equivalents, _nf(m, "cash"))
+    lt_debt = _coalesce(detail.f01.long_term_debt, _nf(m, "long_term_debt"))
     detail.f01 = score_f01(cash=cash, long_term_debt=lt_debt, source=src, source_period=period, source_date=src_date)
 
     # F02
-    rev = detail.f02.revenue_ttm or _nf(m, "revenue_ttm")
-    cor = detail.f02.cost_of_revenue_ttm or _nf(m, "cost_of_revenue_ttm")
-    gp = detail.f02.gross_profit_ttm or _nf(m, "gross_profit_ttm")
+    rev = _coalesce(detail.f02.revenue_ttm, _nf(m, "revenue_ttm"))
+    cor = _coalesce(detail.f02.cost_of_revenue_ttm, _nf(m, "cost_of_revenue_ttm"))
+    gp = _coalesce(detail.f02.gross_profit_ttm, _nf(m, "gross_profit_ttm"))
     detail.f02 = score_f02(revenue_ttm=rev, cost_of_revenue_ttm=cor, gross_profit_ttm=gp, source=src, source_period=period, source_date=src_date)
 
     # F03 — prefer quarterly TTM, fall back to yfinance info via detail fields
     q = detail.quarterly or {}
-    ni_cur = _nf(q, "ni_current") or _nf(m, "net_income_ttm") or detail.f03.current_net_income_ttm
-    ni_prior = _nf(q, "ni_prior") or detail.f03.prior_net_income_ttm
+    ni_cur = _coalesce(_nf(q, "ni_current"), _nf(m, "net_income_ttm"), detail.f03.current_net_income_ttm)
+    ni_prior = _coalesce(_nf(q, "ni_prior"), detail.f03.prior_net_income_ttm)
     ni_2y = _nf(q, "ni_2y")
-    eq_cur = _nf(q, "equity_current") or _nf(m, "total_equity")
+    eq_cur = _coalesce(_nf(q, "equity_current"), _nf(m, "total_equity"))
     eq_prior = _nf(q, "equity_prior")
     eq_2y = _nf(q, "equity_2y")
     # Store raw year-2 inputs before scoring (so sheet columns are populated)
@@ -84,10 +97,10 @@ def score_feroldi_detail(
     )
 
     # F04 — prefer quarterly TTM, fall back to yfinance info via detail fields
-    ocf_cur = _nf(q, "ocf_current") or _nf(m, "operating_cf") or detail.f04.current_operating_cf_ttm
-    capex_cur = _nf(q, "capex_current") or _nf(m, "capex") or detail.f04.current_capex_ttm
-    ocf_prior = _nf(q, "ocf_prior") or detail.f04.prior_operating_cf_ttm
-    capex_prior = _nf(q, "capex_prior") or detail.f04.prior_capex_ttm
+    ocf_cur = _coalesce(_nf(q, "ocf_current"), _nf(m, "operating_cf"), detail.f04.current_operating_cf_ttm)
+    capex_cur = _coalesce(_nf(q, "capex_current"), _nf(m, "capex"), detail.f04.current_capex_ttm)
+    ocf_prior = _coalesce(_nf(q, "ocf_prior"), detail.f04.prior_operating_cf_ttm)
+    capex_prior = _coalesce(_nf(q, "capex_prior"), detail.f04.prior_capex_ttm)
     ocf_2y = _nf(q, "ocf_2y")
     capex_2y = _nf(q, "capex_2y")
     # Store raw year-2 inputs before scoring (so sheet columns are populated)
@@ -101,8 +114,8 @@ def score_feroldi_detail(
     )
 
     # F05 — prefer quarterly TTM, fall back to yfinance info via detail fields
-    eps_cur = _nf(q, "eps_current") or _nf(m, "diluted_eps") or detail.f05.current_diluted_eps_ttm
-    eps_prior = _nf(q, "eps_prior") or detail.f05.prior_diluted_eps_ttm
+    eps_cur = _coalesce(_nf(q, "eps_current"), _nf(m, "diluted_eps"), detail.f05.current_diluted_eps_ttm)
+    eps_prior = _coalesce(_nf(q, "eps_prior"), detail.f05.prior_diluted_eps_ttm)
     eps_2y = _nf(q, "eps_2y")
     # Store raw year-2 input before scoring (so sheet column is populated)
     detail.f05.two_year_diluted_eps_ttm = eps_2y

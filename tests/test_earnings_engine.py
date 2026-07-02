@@ -22,6 +22,12 @@ from scanners.earnings.market_data import (
 )
 from scanners.earnings.models import HistoricalEventMove
 
+TEST_YAHOO_ENV = {
+    "EARNINGS_SKIP_WARMUP": "1",
+    "YAHOO_MIN_INTERVAL_SECONDS": "0",
+    "YAHOO_RETRY_LIMIT": "0",
+}
+
 
 def _build_history_frame() -> pd.DataFrame:
     index = pd.to_datetime(
@@ -177,12 +183,12 @@ class EarningsEngineTests(unittest.TestCase):
 
 class BatchHistoryTests(unittest.TestCase):
     def test_batch_history_returns_empty_dict_for_empty_input(self) -> None:
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(warmup_session=False)
         self.assertEqual(source.batch_history([]), {})
 
     def test_batch_history_single_ticker_returns_flat_dataframe(self) -> None:
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(warmup_session=False)
         history = _build_history_frame()
 
@@ -202,7 +208,7 @@ class BatchHistoryTests(unittest.TestCase):
         self.assertIn("Close", result["AAPL"].columns)
 
     def test_batch_history_retries_on_empty_then_succeeds(self) -> None:
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,  # disable to keep the test fast
@@ -222,7 +228,7 @@ class BatchHistoryTests(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
 
     def test_batch_history_gives_up_after_max_retries(self) -> None:
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,
@@ -239,7 +245,7 @@ class BatchHistoryTests(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
 
     def test_batch_history_multi_ticker_extracts_per_ticker_columns(self) -> None:
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(warmup_session=False)
         history_a = _build_history_frame()
         history_b = _build_history_frame().assign(Close=lambda df: df["Close"] + 50)
@@ -255,7 +261,7 @@ class BatchHistoryTests(unittest.TestCase):
         self.assertEqual(result["MSFT"]["Close"].iloc[-1], history_b["Close"].iloc[-1])
 
     def test_batch_history_drops_tickers_with_no_rows(self) -> None:
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(warmup_session=False)
         history_a = _build_history_frame()
         raw = pd.concat({"AAPL": history_a, "DELISTED": history_a.iloc[0:0]}, axis=1)
@@ -272,7 +278,7 @@ class DelistedFilterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             denylist_path = Path(temp_dir) / "denylist.json"
             denylist_path.write_text(json.dumps(["ALOY", "BCAT", "BSTZ", "BTX", "CEPT"]), encoding="utf-8")
-            with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+            with patch.dict("os.environ", TEST_YAHOO_ENV):
                 source = YahooEarningsDataSource(warmup_session=False)
             result = source.load_universe(
                 configured_tickers=["AAPL", "aloy", "MSFT", "BCAT", "NVDA"],
@@ -286,7 +292,7 @@ class DelistedFilterTests(unittest.TestCase):
 
     def test_load_universe_with_no_denylist_returns_all(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+            with patch.dict("os.environ", TEST_YAHOO_ENV):
                 source = YahooEarningsDataSource(warmup_session=False)
             result = source.load_universe(
                 configured_tickers=["AAPL", "MSFT"],
@@ -299,7 +305,7 @@ class DelistedFilterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             denylist_path = Path(temp_dir) / "denylist.json"
             denylist_path.write_text(json.dumps(["AAPL", "MSFT"]), encoding="utf-8")
-            with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+            with patch.dict("os.environ", TEST_YAHOO_ENV):
                 source = YahooEarningsDataSource(warmup_session=False)
             result = source.load_universe(
                 configured_tickers=["AAPL", "MSFT"],
@@ -318,7 +324,7 @@ class DelistedFilterTests(unittest.TestCase):
             ):
                 denylist_path = Path(temp_dir) / f"denylist_{label}.json"
                 denylist_path.write_text(raw_payload, encoding="utf-8")
-                with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+                with patch.dict("os.environ", TEST_YAHOO_ENV):
                     source = YahooEarningsDataSource(warmup_session=False)
                 with self.subTest(payload=raw_payload):
                     result = source.load_universe(
@@ -340,7 +346,7 @@ class DelistedFilterTests(unittest.TestCase):
             ):
                 denylist_path = Path(temp_dir) / f"denylist_{label}.json"
                 denylist_path.write_text(raw_payload, encoding="utf-8")
-                with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+                with patch.dict("os.environ", TEST_YAHOO_ENV):
                     source = YahooEarningsDataSource(warmup_session=False)
                 with self.subTest(payload=raw_payload):
                     result = source.load_universe(
@@ -530,7 +536,7 @@ class HistoryRetryTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from scanners.earnings.market_data import YahooEarningsDataSource
 
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,
@@ -554,7 +560,7 @@ class HistoryRetryTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from scanners.earnings.market_data import YahooEarningsDataSource
 
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,
@@ -582,7 +588,7 @@ class HistoryRetryTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from scanners.earnings.market_data import YahooEarningsDataSource
 
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,
@@ -609,7 +615,7 @@ class HistoryRetryTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from scanners.earnings.market_data import YahooEarningsDataSource
 
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,
@@ -636,7 +642,7 @@ class HistoryRetryTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from scanners.earnings.market_data import YahooEarningsDataSource
 
-        with patch.dict("os.environ", {"EARNINGS_SKIP_WARMUP": "1"}):
+        with patch.dict("os.environ", TEST_YAHOO_ENV):
             source = YahooEarningsDataSource(
                 warmup_session=False,
                 rate_limit_per_minute=0,

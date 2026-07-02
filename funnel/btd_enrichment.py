@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable
 
+from providers.yahoo_throttle import create_ticker, yahoo_call
+
 
 InfoFetcher = Callable[[str], dict[str, Any]]
 
@@ -196,14 +198,12 @@ def _format_earnings_date(value: Any) -> str:
 
 
 def fetch_yfinance_metrics(ticker: str) -> BtdMetrics:
-    import yfinance as yf
-
-    yf_ticker = yf.Ticker(ticker)
-    info = yf_ticker.info or {}
+    yf_ticker = create_ticker(ticker)
+    info = yahoo_call(lambda: yf_ticker.info or {}, label=f"btd-info:{ticker}") or {}
 
     next_earnings = ""
     try:
-        calendar = yf_ticker.calendar
+        calendar = yahoo_call(lambda: yf_ticker.calendar, label=f"btd-calendar:{ticker}")
         if calendar is not None and "Earnings Date" in calendar:
             next_earnings = _format_earnings_date(calendar["Earnings Date"])
     except Exception:

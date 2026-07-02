@@ -9,10 +9,13 @@ All tests use mocked yfinance and SEC providers — no live network calls.
 
 import os
 import unittest
+from datetime import UTC, date, datetime
 from unittest.mock import MagicMock, patch
 
 from funnel.feroldi_models import FeroldiDetailResult
+from funnel.feroldi_scoring import score_feroldi_detail
 from funnel.review_schema import FEROLDI_FIRST_CUT_DETAIL_HEADERS
+from providers.sec.models import CompanyFacts, FinancialFact
 
 
 class TestDetailToSheetRow(unittest.TestCase):
@@ -225,6 +228,28 @@ class TestEnrichFeroldiCandidates(unittest.TestCase):
         self.assertIn("Feroldi Stock Score", candidate)
         self.assertEqual(candidate.get("Feroldi Max Points"), 38.0)
 
+
+class TestFeroldiZeroValueFallbacks(unittest.TestCase):
+    def setUp(self):
+        from funnel.review_candidates import enrich_feroldi_candidates
+        self.enrich_feroldi_candidates = enrich_feroldi_candidates
+        self.service = MagicMock()
+        self.spreadsheet_id = "test_spreadsheet_id"
+
+    def test_f05_preserves_zero_quarterly_eps_instead_of_treating_it_as_missing(self):
+        detail = FeroldiDetailResult(ticker="GBTG")
+        detail.quarterly = {
+            "eps_current": 0.0,
+            "eps_prior": 0.16,
+        }
+
+        scored = score_feroldi_detail(detail, metrics={})
+
+        self.assertEqual(scored.f05.current_diluted_eps_ttm, 0.0)
+        self.assertEqual(scored.f05.prior_diluted_eps_ttm, 0.16)
+        self.assertEqual(scored.f05.available, 3.0)
+        self.assertIn("Current EPS 0.00 <= 0", scored.f05.reason)
+
     @patch("funnel.feroldi_enrichment.collect_yfinance_metrics")
     @patch("funnel.feroldi_enrichment.collect_quarterly_financials")
     @patch("funnel.feroldi_enrichment.collect_earnings_surprise")
@@ -390,6 +415,109 @@ class TestEnrichFeroldiCandidates(unittest.TestCase):
             )
             self.assertEqual(len(result), 1)
             self.assertIn("Last Error", result[0])
+
+
+class TestFeroldiSecFallbacks(unittest.TestCase):
+    @patch("funnel.feroldi_enrichment.collect_yfinance_metrics")
+    @patch("funnel.feroldi_enrichment.collect_quarterly_financials")
+    @patch("funnel.feroldi_enrichment.collect_earnings_surprise")
+    @patch("funnel.feroldi_enrichment.collect_price_history")
+    @patch("funnel.feroldi_sec.extract_filing_text")
+    @patch("providers.sec.get_sec_provider")
+    def test_sec_company_facts_backfills_missing_f05_prior(
+        self,
+        mock_get_sec_provider,
+        mock_filings,
+        mock_prices,
+        mock_earnings,
+        mock_qtr,
+        mock_yf,
+    ):
+        from funnel.feroldi_scoring import run_feroldi_first_cut
+
+        mock_yf.return_value = {
+            "ticker": "GBTG",
+            "company_name": "Global Business Travel Group",
+            "cik": "0000000001",
+            "currency": "USD",
+            "totalCash": 1000000,
+            "longTermDebt": 500000,
+            "totalRevenue": 5000000,
+            "costOfRevenue": 3000000,
+            "grossProfits": 2000000,
+            "netIncomeToCommon": 800000,
+            "bookValue": 10.0,
+            "sharesOutstanding": 1000000,
+            "operatingCashflow": 1200000,
+            "capitalExpenditure": -200000,
+            "dilutedEPS": None,
+            "currentPrice": 50.0,
+            "heldPercentInsiders": None,
+            "marketCap": 50000000,
+            "totalDebt": 800000,
+            "totalAssets": 5000000,
+        }
+        mock_qtr.return_value = {
+            "eps_current": 0.0,
+            "eps_prior": None,
+        }
+        mock_earnings.return_value = {}
+        mock_prices.return_value = {
+            "start_date": "",
+            "end_date": "",
+            "stock_start_price": None,
+            "stock_end_price": None,
+            "spy_start_price": None,
+            "spy_end_price": None,
+            "trading_days": 0,
+        }
+        mock_filings.return_value = {}
+
+        facts = CompanyFacts(
+            ticker="GBTG",
+            cik="0000000001",
+            facts={
+                "us-gaap:EarningsPerShareDiluted": [
+                    FinancialFact(
+                        concept_name="us-gaap:EarningsPerShareDiluted",
+                        original_concept="EarningsPerShareDiluted",
+                        value=0.16,
+                        unit="USD/shares",
+                        period_start=date(2024, 1, 1),
+                        period_end=date(2024, 12, 31),
+                        filed_at=datetime(2025, 2, 25, tzinfo=UTC),
+                        form="10-K",
+                        accession="0000000001-25-000001",
+                        fiscal_year=2024,
+                        fiscal_period="FY",
+                    ),
+                    FinancialFact(
+                        concept_name="us-gaap:EarningsPerShareDiluted",
+                        original_concept="EarningsPerShareDiluted",
+                        value=0.09,
+                        unit="USD/shares",
+                        period_start=date(2023, 1, 1),
+                        period_end=date(2023, 12, 31),
+                        filed_at=datetime(2024, 2, 25, tzinfo=UTC),
+                        form="10-K",
+                        accession="0000000001-24-000001",
+                        fiscal_year=2023,
+                        fiscal_period="FY",
+                    ),
+                ]
+            },
+        )
+        fake_provider = MagicMock()
+        fake_provider.company_facts.return_value = facts
+        mock_get_sec_provider.return_value = fake_provider
+
+        detail = run_feroldi_first_cut("GBTG", candidate_id="GBTG-001")
+
+        self.assertEqual(detail.f05.current_diluted_eps_ttm, 0.0)
+        self.assertEqual(detail.f05.prior_diluted_eps_ttm, 0.16)
+        self.assertIsNone(detail.f05.two_year_diluted_eps_ttm)
+        self.assertEqual(detail.f05.available, 3.0)
+        self.assertNotIn("F05", detail.missing_inputs)
 
 
 class TestFeroldiTrajectoryIntegration(unittest.TestCase):

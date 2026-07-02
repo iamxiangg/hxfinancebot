@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from providers.yahoo_throttle import yahoo_call, yahoo_download
 
 try:
     from zoneinfo import ZoneInfo
@@ -156,7 +157,7 @@ class YfinanceVpmaDataSource:
             batch = tickers[index : index + batch_size]
             if not batch:
                 continue
-            data = yf.download(
+            data = yahoo_download(
                 batch,
                 period=period,
                 auto_adjust=True,
@@ -180,7 +181,7 @@ class YfinanceVpmaDataSource:
         return histories
 
     def benchmark_history(self, ticker: str = DEFAULT_BENCHMARK) -> pd.DataFrame:
-        history = yf.download(
+        history = yahoo_download(
             ticker,
             period="1y",
             auto_adjust=True,
@@ -202,10 +203,16 @@ class YfinanceVpmaDataSource:
         # condition into an ``unexpected_errors`` bucket at the scan step.
         yf_ticker = yf.Ticker(ticker, session=self.session)
         try:
-            frame = yf_ticker.get_earnings_dates(limit=8)
+            frame = yahoo_call(
+                lambda: yf_ticker.get_earnings_dates(limit=8),
+                label=f"vpma-earnings-dates:{ticker}",
+            )
         except Exception:
             try:
-                frame = getattr(yf_ticker, "earnings_dates", pd.DataFrame())
+                frame = yahoo_call(
+                    lambda: getattr(yf_ticker, "earnings_dates", pd.DataFrame()),
+                    label=f"vpma-earnings-dates-fallback:{ticker}",
+                )
             except Exception:
                 return pd.DataFrame()
         if frame is None or isinstance(frame, list):
@@ -218,7 +225,10 @@ class YfinanceVpmaDataSource:
     def next_earnings_date(self, ticker: str) -> date | None:
         yf_ticker = yf.Ticker(ticker, session=self.session)
         try:
-            calendar = yf_ticker.calendar
+            calendar = yahoo_call(
+                lambda: yf_ticker.calendar,
+                label=f"vpma-calendar:{ticker}",
+            )
         except Exception:
             calendar = None
         if calendar is None:

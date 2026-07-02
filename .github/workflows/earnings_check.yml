@@ -62,6 +62,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EARNINGS_REQUEST_DELAY_SECONDS: "0.25"
+          EARNINGS_RATE_LIMIT_PER_MINUTE: "50"
           EARNINGS_MAX_TICKERS: "500"
           EARNINGS_MAX_CANDIDATES: "10"
           EARNINGS_LOOKAHEAD_DAYS: "3"
@@ -76,6 +77,9 @@ jobs:
           EARNINGS_SCREEN_EARLIEST_TIME: "14:30"
           EARNINGS_SCREEN_LATEST_TIME: "15:00"
           EARNINGS_STATE_RETENTION_DAYS: "45"
+          YAHOO_MAX_CONCURRENT_REQUESTS: "1"
+          YAHOO_MIN_INTERVAL_SECONDS: "0.4"
+          YAHOO_RETRY_LIMIT: "2"
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail

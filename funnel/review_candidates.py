@@ -332,6 +332,53 @@ def _telegram_eligible(candidate: dict[str, Any]) -> bool:
     return str(candidate.get("Telegram Eligible") or "").strip().upper() == "YES"
 
 
+def _process_btd_candidate(candidate: dict[str, Any], now: str) -> dict[str, Any]:
+    candidate = dict(candidate)
+    ticker = str(candidate.get("Ticker") or "").strip()
+    if not ticker:
+        return candidate
+    try:
+        metrics = fetch_yfinance_metrics(ticker)
+        updates = metrics_to_candidate_updates(metrics)
+        candidate.update({key: value for key, value in updates.items() if value not in ("", None)})
+        candidate["BTD Last Updated"] = now
+        if str(candidate.get("Status") or "").upper() == "NEW":
+            candidate["Status"] = "ENRICHED"
+    except Exception as exc:
+        candidate["Last Error"] = f"BTD enrichment failed: {exc!r}"[:500]
+    return candidate
+
+
+def _process_feroldi_candidate(candidate: dict[str, Any], now: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    candidate = dict(candidate)
+    ticker = str(candidate.get("Ticker") or "").strip()
+    candidate_id = str(candidate.get("Candidate ID") or "").strip()
+
+    prev_feroldi = {
+        k: candidate.get(k)
+        for k in (
+            "Feroldi Financial Score", "Feroldi Financial Available",
+            "Feroldi Management Score", "Feroldi Management Available",
+            "Feroldi Stock Score", "Feroldi Stock Available",
+            "Feroldi First Cut Score", "Feroldi Available Points",
+            "Feroldi Max Points", "Feroldi Equivalent Score",
+            "Feroldi Coverage", "Feroldi Missing Inputs",
+            "Feroldi Last Updated",
+        )
+    }
+
+    try:
+        detail = run_feroldi_first_cut(ticker, candidate_id=candidate_id)
+        updates = detail_to_candidate_updates(detail)
+        candidate.update({k: v for k, v in updates.items() if v not in ("", None)})
+        return candidate, detail_to_sheet_row(detail, now)
+    except Exception as exc:
+        candidate.update({k: v for k, v in prev_feroldi.items() if v not in ("", None)})
+        candidate["Last Error"] = f"Feroldi enrichment failed: {exc!r}"[:500]
+        logger.exception("Feroldi enrichment failed for %s", ticker)
+        return candidate, None
+
+
 def apply_btd_gate(candidate: dict[str, Any], *, manual_bypass: bool, threshold: float) -> dict[str, Any]:
     candidate = dict(candidate)
     source_set = _source_set(candidate)
@@ -381,35 +428,37 @@ def apply_btd_gate(candidate: dict[str, Any], *, manual_bypass: bool, threshold:
 
 
 def enrich_candidates(candidates: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
-    enriched: list[dict[str, Any]] = []
-    count = 0
     now = utc_now_iso()
-    for candidate in candidates:
-        candidate = dict(candidate)
+    enriched: list[dict[str, Any]] = [dict(candidate) for candidate in candidates]
+    job_indexes: list[int] = []
+
+    for index, candidate in enumerate(enriched):
         if not _active_for_enrichment(candidate) or not _status_allows_reprocessing(candidate):
-            enriched.append(candidate)
             continue
-
-        if count >= limit:
-            enriched.append(candidate)
+        if len(job_indexes) >= limit:
             continue
-
         ticker = str(candidate.get("Ticker") or "").strip()
         if not ticker:
-            enriched.append(candidate)
             continue
+        job_indexes.append(index)
 
-        try:
-            metrics = fetch_yfinance_metrics(ticker)
-            updates = metrics_to_candidate_updates(metrics)
-            candidate.update({key: value for key, value in updates.items() if value not in ("", None)})
-            candidate["BTD Last Updated"] = now
-            if str(candidate.get("Status") or "").upper() == "NEW":
-                candidate["Status"] = "ENRICHED"
-            count += 1
-        except Exception as exc:
-            candidate["Last Error"] = f"BTD enrichment failed: {exc!r}"[:500]
-        enriched.append(candidate)
+    worker_limit = max(1, int(_float_value(os.getenv("BTD_ENRICH_WORKERS"), 4.0)))
+    if len(job_indexes) <= 1 or worker_limit == 1:
+        for index in job_indexes:
+            enriched[index] = _process_btd_candidate(enriched[index], now)
+        return enriched
+
+    with ThreadPoolExecutor(
+        max_workers=min(worker_limit, len(job_indexes)),
+        thread_name_prefix="btd-enrich",
+    ) as executor:
+        future_to_index = {
+            executor.submit(_process_btd_candidate, enriched[index], now): index
+            for index in job_indexes
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            enriched[index] = future.result()
     return enriched
 
 
@@ -500,20 +549,17 @@ def enrich_feroldi_candidates(
     refresh_days = int(_float_value(os.getenv("FEROLDI_REFRESH_DAYS"), 7.0))
 
     detail_rows: list[dict[str, Any]] = []
-    enriched: list[dict[str, Any]] = []
-    count = 0
+    enriched: list[dict[str, Any]] = [dict(candidate) for candidate in candidates]
+    job_indexes: list[int] = []
 
-    for candidate in candidates:
-        candidate = dict(candidate)
+    for index, candidate in enumerate(enriched):
         if not _active_for_enrichment(candidate):
-            enriched.append(candidate)
             continue
 
         # Only process candidates that passed BTD or are Telegram Eligible
         status = str(candidate.get("Status") or "").strip().upper()
         telegram_eligible = str(candidate.get("Telegram Eligible") or "").strip().upper() == "YES"
         if status not in {"BTD_PASSED", "BYPASSED_MANUAL"} and not telegram_eligible:
-            enriched.append(candidate)
             continue
 
         # Skip if recent Feroldi data exists (unless force_refresh)
@@ -524,53 +570,38 @@ def enrich_feroldi_candidates(
                 last = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
                 age_days = (datetime.now(timezone.utc) - last).days
                 if age_days < refresh_days:
-                    enriched.append(candidate)
                     continue
             except (ValueError, TypeError):
                 pass
 
-        if count >= limit:
-            enriched.append(candidate)
+        if len(job_indexes) >= limit:
             continue
 
         ticker = str(candidate.get("Ticker") or "").strip()
-        candidate_id = str(candidate.get("Candidate ID") or "").strip()
         if not ticker:
-            enriched.append(candidate)
             continue
+        job_indexes.append(index)
 
-        # Preserve previous Feroldi data in case of failure
-        prev_feroldi = {
-            k: candidate.get(k)
-            for k in (
-                "Feroldi Financial Score", "Feroldi Financial Available",
-                "Feroldi Management Score", "Feroldi Management Available",
-                "Feroldi Stock Score", "Feroldi Stock Available",
-                "Feroldi First Cut Score", "Feroldi Available Points",
-                "Feroldi Max Points", "Feroldi Equivalent Score",
-                "Feroldi Coverage", "Feroldi Missing Inputs",
-                "Feroldi Last Updated",
-            )
-        }
-
-        try:
-            detail = run_feroldi_first_cut(ticker, candidate_id=candidate_id)
-
-            # Write aggregated scores back to candidate row
-            updates = detail_to_candidate_updates(detail)
-            candidate.update({k: v for k, v in updates.items() if v not in ("", None)})
-
-            # Build detail row for Feroldi_First_Cut_Detail sheet
-            detail_rows.append(detail_to_sheet_row(detail, now))
-
-            count += 1
-        except Exception as exc:
-            # On failure, restore previous valid Feroldi data
-            candidate.update({k: v for k, v in prev_feroldi.items() if v not in ("", None)})
-            candidate["Last Error"] = f"Feroldi enrichment failed: {exc!r}"[:500]
-            logger.exception("Feroldi enrichment failed for %s", ticker)
-
-        enriched.append(candidate)
+    worker_limit = max(1, int(_float_value(os.getenv("FEROLDI_ENRICH_WORKERS"), 4.0)))
+    if len(job_indexes) <= 1 or worker_limit == 1:
+        for index in job_indexes:
+            enriched[index], detail_row = _process_feroldi_candidate(enriched[index], now)
+            if detail_row:
+                detail_rows.append(detail_row)
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(worker_limit, len(job_indexes)),
+            thread_name_prefix="feroldi-enrich",
+        ) as executor:
+            future_to_index = {
+                executor.submit(_process_feroldi_candidate, enriched[index], now): index
+                for index in job_indexes
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                enriched[index], detail_row = future.result()
+                if detail_row:
+                    detail_rows.append(detail_row)
 
     # Upsert detail rows to the Feroldi_First_Cut_Detail sheet
     if detail_rows:

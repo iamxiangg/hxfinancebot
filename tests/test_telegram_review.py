@@ -86,7 +86,7 @@ class TelegramReviewTests(unittest.TestCase):
         )
 
         self.assertIn("BTD BASIC GATE", message)
-        self.assertIn("BTD ratio: 0.4", message)
+        self.assertIn("BTD ratio: 0.40", message)
         self.assertIn("Gross margin: 72.0%", message)
         self.assertIn("Political disclosure breadth:", message)
         self.assertIn("Unique members represented: 4", message)

@@ -8,8 +8,6 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import requests
-import yfinance as yf
-
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -19,6 +17,7 @@ from providers.sec import get_sec_provider
 from providers.sec.base import SECProvider
 from providers.sec.errors import SECAccessDeniedError, SECNotFoundError, SECRequestError
 from providers.sec.models import FilingMetadata, SECInsiderTransaction
+from providers.yahoo_throttle import yahoo_download
 from scanners.insider.parser import (
     MasterIndexEntry,
     NonDerivativeTransaction,
@@ -303,7 +302,7 @@ def _ny_business_dates_before(reference: datetime, count: int) -> list[date]:
 def _median_dollar_volume(ticker: str) -> tuple[float | None, float | None, list[str]]:
     risk_flags: list[str] = []
     try:
-        history = yf.download(ticker, period="6mo", auto_adjust=True, progress=False, threads=False)
+        history = yahoo_download(ticker, period="6mo", auto_adjust=True, progress=False, threads=False)
     except Exception:
         return None, None, ["market_data_unavailable"]
     if history is None or history.empty or "Close" not in history or "Volume" not in history:

@@ -78,6 +78,17 @@ def _value_line(label: str, value: Any, *, prefix: str = "- ") -> str | None:
     return f"{prefix}{label}: {text}"
 
 
+def _decimal_line(label: str, value: Any, *, places: int = 2) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return f"- {label}: {text}"
+    return f"- {label}: {number:.{places}f}"
+
+
 def build_review_message(candidate: dict[str, Any]) -> str:
     source_values = [
         _source_label(part)
@@ -113,8 +124,9 @@ def build_review_message(candidate: dict[str, Any]) -> str:
     lines.append("BTD BASIC GATE")
     lines.append(f"- Status: {_clean_text(candidate.get('BTD Gate')) or _clean_text(candidate.get('Status'))}")
     ratio = _clean_text(candidate.get("BTD Ratio")) or _clean_text(candidate.get("BTD Score"))
-    if ratio:
-        lines.append(f"- BTD ratio: {ratio}")
+    maybe_ratio_line = _decimal_line("BTD ratio", ratio, places=2)
+    if maybe_ratio_line:
+        lines.append(maybe_ratio_line)
     for maybe_line in (
         _ratio_percent_line("Gross margin", candidate.get("Gross Margin")),
         _ratio_percent_line("Revenue growth", candidate.get("Revenue Growth")),

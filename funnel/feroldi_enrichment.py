@@ -8,6 +8,7 @@ Collects all raw inputs needed for F01–S03 scoring from:
 """
 
 import logging
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -15,8 +16,18 @@ from funnel.feroldi_config import DEFAULT_REQUEST_TIMEOUT
 from funnel.feroldi_fmp import fetch_fmp_quarterly
 from funnel.feroldi_models import FeroldiDetailResult
 from funnel.feroldi_sec import extract_ceo_evidence, extract_filing_text, extract_mission_evidence
+from providers.yahoo_throttle import create_ticker, yahoo_call, yahoo_download
 
 logger = logging.getLogger(__name__)
+
+
+_SEC_ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"}
+_SEC_DILUTED_EPS_CONCEPTS = (
+    "us-gaap:EarningsPerShareDiluted",
+    "us-gaap:EarningsPerShareBasicAndDiluted",
+)
+_SPY_PRICE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_SPY_PRICE_CACHE_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -32,9 +43,68 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
 def _fiscal_year_end(info: dict) -> str:
     """Best-effort fiscal period string."""
     return str(info.get("lastFiscalYearEnd", "") or info.get("nextFiscalYearEnd", "") or "")
+
+
+def _load_sec_annual_diluted_eps(ticker: str) -> dict[str, float]:
+    """Best-effort annual diluted EPS fallback from SEC Company Facts.
+
+    Returns keys compatible with the quarterly dict used by Feroldi scoring:
+    `eps_current`, `eps_prior`, `eps_2y`.
+    """
+    from providers.sec import get_sec_provider
+
+    try:
+        company_facts = get_sec_provider().company_facts(ticker)
+    except Exception as exc:
+        logger.debug("SEC company facts unavailable for %s: %s", ticker, exc.__class__.__name__)
+        return {}
+
+    annual_facts = []
+    seen_periods: set[tuple[Any, ...]] = set()
+    for concept_name in _SEC_DILUTED_EPS_CONCEPTS:
+        for fact in company_facts.facts.get(concept_name, []):
+            if fact.form.upper() not in _SEC_ANNUAL_FORMS:
+                continue
+            if str(fact.fiscal_period or "").upper() not in {"FY", "CY"}:
+                continue
+            if fact.period_end is None:
+                continue
+            period_key = (
+                fact.fiscal_year,
+                fact.period_end.isoformat(),
+            )
+            if period_key in seen_periods:
+                continue
+            seen_periods.add(period_key)
+            annual_facts.append(fact)
+
+    annual_facts.sort(
+        key=lambda fact: (
+            fact.period_end.isoformat() if fact.period_end else "",
+            fact.filed_at.isoformat(),
+            fact.accession,
+        ),
+        reverse=True,
+    )
+
+    values = [_safe_float(fact.value) for fact in annual_facts[:3]]
+    keys = ("eps_current", "eps_prior", "eps_2y")
+    return {
+        key: value
+        for key, value in zip(keys, values)
+        if value is not None
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +112,12 @@ def _fiscal_year_end(info: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def collect_yfinance_metrics(ticker: str, *, timeout: float = DEFAULT_REQUEST_TIMEOUT) -> dict[str, Any]:
+def collect_yfinance_metrics(
+    ticker: str,
+    *,
+    timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    yf_ticker: Any | None = None,
+) -> dict[str, Any]:
     """Collect all financial and stock data from yfinance for Feroldi scoring.
 
     Returns a flat dict of raw inputs ready for scoring functions.
@@ -50,8 +125,8 @@ def collect_yfinance_metrics(ticker: str, *, timeout: float = DEFAULT_REQUEST_TI
     import yfinance as yf
 
     try:
-        yt = yf.Ticker(ticker)
-        info = yt.info or {}
+        yt = yf_ticker or create_ticker(ticker)
+        info = yahoo_call(lambda: yt.info or {}, label=f"feroldi-info:{ticker}") or {}
     except Exception as exc:
         logger.warning("yfinance Ticker(%s) failed: %s", ticker, exc.__class__.__name__)
         return {}
@@ -116,7 +191,7 @@ def collect_yfinance_metrics(ticker: str, *, timeout: float = DEFAULT_REQUEST_TI
 # ---------------------------------------------------------------------------
 
 
-def collect_quarterly_financials(ticker: str) -> dict[str, Any]:
+def collect_quarterly_financials(ticker: str, *, yf_ticker: Any | None = None) -> dict[str, Any]:
     """Collect quarterly financial statements and compute current vs prior TTM.
 
     Uses yfinance quarterly_income_stmt, quarterly_cashflow, quarterly_balance_sheet.
@@ -129,14 +204,14 @@ def collect_quarterly_financials(ticker: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     try:
-        yt = yf.Ticker(ticker)
+        yt = yf_ticker or create_ticker(ticker)
     except Exception as exc:
         logger.warning("yfinance Ticker(%s) failed for quarterly data: %s", ticker, exc.__class__.__name__)
         return result
 
     # --- Income Statement ---
     try:
-        income = yt.quarterly_income_stmt
+        income = yahoo_call(lambda: yt.quarterly_income_stmt, label=f"feroldi-income:{ticker}")
         if income is not None and not income.empty:
             income = income.fillna(0)
             # Net Income TTM
@@ -150,7 +225,7 @@ def collect_quarterly_financials(ticker: str) -> dict[str, Any]:
 
     # --- Cash Flow ---
     try:
-        cashflow = yt.quarterly_cashflow
+        cashflow = yahoo_call(lambda: yt.quarterly_cashflow, label=f"feroldi-cashflow:{ticker}")
         if cashflow is not None and not cashflow.empty:
             cashflow = cashflow.fillna(0)
             # Operating Cash Flow TTM
@@ -170,7 +245,7 @@ def collect_quarterly_financials(ticker: str) -> dict[str, Any]:
 
     # --- Balance Sheet ---
     try:
-        balance = yt.quarterly_balance_sheet
+        balance = yahoo_call(lambda: yt.quarterly_balance_sheet, label=f"feroldi-balance:{ticker}")
         if balance is not None and not balance.empty:
             balance = balance.fillna(0)
             # Total Equity
@@ -240,7 +315,7 @@ def _snapshot(df, label: str, offset: int = 0) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def collect_earnings_surprise(ticker: str) -> dict[str, Any]:
+def collect_earnings_surprise(ticker: str, *, yf_ticker: Any | None = None) -> dict[str, Any]:
     """Collect last 4 quarters of earnings estimates vs reported EPS from yfinance.
 
     Returns a dict with q1–q4 reported EPS, estimated EPS, fiscal period, and report date.
@@ -250,8 +325,8 @@ def collect_earnings_surprise(ticker: str) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     try:
-        yt = yf.Ticker(ticker)
-        earnings = yt.earnings_dates
+        yt = yf_ticker or create_ticker(ticker)
+        earnings = yahoo_call(lambda: yt.earnings_dates, label=f"feroldi-earnings:{ticker}")
         if earnings is None or earnings.empty:
             return result
 
@@ -321,11 +396,22 @@ def collect_price_history(ticker: str, years: int = 5) -> dict[str, Any]:
     end_date = date.today()
     start_date = end_date - timedelta(days=years * 365 + 10)  # Buffer for weekends
 
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
     try:
-        stock = yf.download(ticker, start=start_date.isoformat(), end=end_date.isoformat(),
-                            auto_adjust=True, progress=False, threads=False)
-        spy = yf.download("SPY", start=start_date.isoformat(), end=end_date.isoformat(),
-                         auto_adjust=True, progress=False, threads=False)
+        stock = yahoo_download(ticker, start=start_iso, end=end_iso,
+                               auto_adjust=True, progress=False, threads=False)
+        spy_cache_key = (start_iso, end_iso)
+        with _SPY_PRICE_CACHE_LOCK:
+            cached_spy = _SPY_PRICE_CACHE.get(spy_cache_key)
+        if cached_spy is None:
+            spy = yahoo_download("SPY", start=start_iso, end=end_iso,
+                                 auto_adjust=True, progress=False, threads=False)
+            cached_spy = spy
+            with _SPY_PRICE_CACHE_LOCK:
+                _SPY_PRICE_CACHE.setdefault(spy_cache_key, cached_spy)
+        else:
+            spy = cached_spy
     except Exception as exc:
         logger.warning("Price history for %s failed: %s", ticker, exc.__class__.__name__)
         return result
@@ -368,10 +454,6 @@ def enrich_feroldi_detail(
 
     The caller is responsible for running scoring via feroldi_scoring.
     """
-    import os
-
-    from providers.sec import get_sec_provider
-
     now = _now_iso()
     detail = FeroldiDetailResult(
         candidate_id=candidate_id,
@@ -382,8 +464,13 @@ def enrich_feroldi_detail(
         last_updated=now,
     )
 
+    try:
+        yf_ticker = create_ticker(ticker)
+    except Exception:
+        yf_ticker = None
+
     # Collect yfinance metrics
-    metrics = yfinance_metrics or collect_yfinance_metrics(ticker)
+    metrics = yfinance_metrics or collect_yfinance_metrics(ticker, yf_ticker=yf_ticker)
     if not metrics:
         detail.extraction_status = "YFINANCE_FAILED"
         detail.last_error = "yfinance data collection failed"
@@ -463,10 +550,29 @@ def enrich_feroldi_detail(
     # Collect quarterly financials for prior-period comparison (F03/F04/F05)
     # Also provides fallback data for F01 (long-term debt) and S02 (share repurchases)
     try:
-        quarterly = collect_quarterly_financials(ticker)
+        quarterly = collect_quarterly_financials(ticker, yf_ticker=yf_ticker)
     except Exception as exc:
         logger.warning("Quarterly financials for %s failed: %s", ticker, exc.__class__.__name__)
         quarterly = {}
+
+    # Use SEC annual diluted EPS only to backfill gaps that sparse yfinance
+    # quarterly history could not populate. This preserves quarterly-TTM data
+    # when available while lifting F05 completeness for names with shorter
+    # public histories or patchy vendor coverage.
+    if (
+        quarterly.get("eps_current") is None
+        or quarterly.get("eps_prior") is None
+        or quarterly.get("eps_2y") is None
+    ):
+        sec_eps = _load_sec_annual_diluted_eps(ticker)
+        if sec_eps:
+            if quarterly.get("eps_current") is None:
+                quarterly["eps_current"] = _coalesce(quarterly.get("eps_current"), sec_eps.get("eps_current"))
+                quarterly["eps_prior"] = _coalesce(quarterly.get("eps_prior"), sec_eps.get("eps_prior"))
+                quarterly["eps_2y"] = _coalesce(quarterly.get("eps_2y"), sec_eps.get("eps_2y"))
+            else:
+                quarterly["eps_prior"] = _coalesce(quarterly.get("eps_prior"), sec_eps.get("eps_current"))
+                quarterly["eps_2y"] = _coalesce(quarterly.get("eps_2y"), sec_eps.get("eps_prior"))
 
     # Apply quarterly fallbacks for F01 (long-term debt), S02 (share repurchases, total assets)
     if detail.f01.long_term_debt is None and quarterly:
@@ -482,7 +588,7 @@ def enrich_feroldi_detail(
 
     # Collect earnings surprise data (S03)
     try:
-        earnings_data = collect_earnings_surprise(ticker)
+        earnings_data = collect_earnings_surprise(ticker, yf_ticker=yf_ticker)
     except Exception as exc:
         logger.warning("Earnings surprise for %s failed: %s", ticker, exc.__class__.__name__)
         earnings_data = {}

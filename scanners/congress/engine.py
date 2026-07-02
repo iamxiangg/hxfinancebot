@@ -14,10 +14,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
-import yfinance as yf
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from providers.yahoo_throttle import create_ticker, yahoo_call, yahoo_download
 from scanners.congress.asset_intent import BROAD_MARKET_ETFS, classify_asset_intent
 from scanners.congress.company_classification import CompanyClassificationProvider
 from scanners.congress.models import PoliticalAuditBundle, PoliticalFiler
@@ -553,7 +553,7 @@ def batch_prices(symbols: list[str], start: date) -> dict[str, dict[str, pd.Seri
                 attempt,
                 YF_ATTEMPTS,
             )
-            frame = yf.download(
+            frame = yahoo_download(
                 tickers=symbols,
                 start=start.isoformat(),
                 end=(today() + timedelta(days=1)).isoformat(),
@@ -598,16 +598,19 @@ def prices(symbols: list[str], earliest: date) -> dict[str, dict[str, pd.Series]
         found.update(batch_prices(deduped[index : index + YF_BATCH_SIZE], start))
     for symbol in [item for item in deduped if item not in found][:YF_FALLBACK_LIMIT]:
         try:
-            history = yf.Ticker(symbol).history(
-                start=start.isoformat(),
-                end=(today() + timedelta(days=1)).isoformat(),
-                interval="1d",
-                auto_adjust=True,
-                actions=False,
-                repair=False,
-                keepna=False,
-                timeout=YF_TIMEOUT,
-                raise_errors=True,
+            history = yahoo_call(
+                lambda: create_ticker(symbol).history(
+                    start=start.isoformat(),
+                    end=(today() + timedelta(days=1)).isoformat(),
+                    interval="1d",
+                    auto_adjust=True,
+                    actions=False,
+                    repair=False,
+                    keepna=False,
+                    timeout=YF_TIMEOUT,
+                    raise_errors=True,
+                ),
+                label=f"congress-history:{symbol}",
             )
             close = series(history.get("Close"))
             volume = series(history.get("Volume"))

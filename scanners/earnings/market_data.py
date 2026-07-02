@@ -16,6 +16,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from providers.yahoo_throttle import yahoo_call
+
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +162,12 @@ class YahooEarningsDataSource:
 
         def _warm() -> None:
             try:
-                yf.Ticker(WARMUP_TICKER, session=session).info
+                yahoo_call(
+                    lambda: yf.Ticker(WARMUP_TICKER, session=session).info,
+                    label=f"earnings-warmup:{WARMUP_TICKER}",
+                    retries=0,
+                    pace=False,
+                )
             except Exception:
                 pass
 
@@ -284,7 +291,12 @@ class YahooEarningsDataSource:
         for attempt in range(max_retries):
             self._throttle()
             try:
-                history = self._ticker(ticker).history(period=period, auto_adjust=False)
+                history = yahoo_call(
+                    lambda: self._ticker(ticker).history(period=period, auto_adjust=False),
+                    label=f"earnings-history:{ticker}",
+                    retries=0,
+                    pace=False,
+                )
             except Exception as exc:
                 if _is_rate_limit_error(exc) and attempt < max_retries - 1:
                     logger.warning(
@@ -337,14 +349,19 @@ class YahooEarningsDataSource:
         for attempt in range(max_retries + 1):
             self._throttle()
             try:
-                raw = yf.download(
-                    tickers=tickers,
-                    period=period,
-                    auto_adjust=False,
-                    group_by="ticker",
-                    threads=False,  # outer pool owns concurrency
-                    progress=False,
-                    session=self.session,
+                raw = yahoo_call(
+                    lambda: yf.download(
+                        tickers=tickers,
+                        period=period,
+                        auto_adjust=False,
+                        group_by="ticker",
+                        threads=False,  # outer pool owns concurrency
+                        progress=False,
+                        session=self.session,
+                    ),
+                    label=f"earnings-batch-history:{len(tickers)}",
+                    retries=0,
+                    pace=False,
                 )
             except Exception as exc:
                 if _is_rate_limit_error(exc) and attempt < max_retries:
@@ -414,9 +431,19 @@ class YahooEarningsDataSource:
         self._throttle()
         yf_ticker = self._ticker(ticker)
         try:
-            frame = yf_ticker.get_earnings_dates(limit=limit)
+            frame = yahoo_call(
+                lambda: yf_ticker.get_earnings_dates(limit=limit),
+                label=f"earnings-dates:{ticker}",
+                retries=0,
+                pace=False,
+            )
         except Exception:
-            frame = getattr(yf_ticker, "earnings_dates", pd.DataFrame())
+            frame = yahoo_call(
+                lambda: getattr(yf_ticker, "earnings_dates", pd.DataFrame()),
+                label=f"earnings-dates-fallback:{ticker}",
+                retries=0,
+                pace=False,
+            )
         if frame is None or isinstance(frame, list):
             return pd.DataFrame()
         return frame.copy()
@@ -424,21 +451,42 @@ class YahooEarningsDataSource:
     def calendar(self, ticker: str) -> Any:
         self._throttle()
         try:
-            return self._ticker(ticker).calendar
+            return yahoo_call(
+                lambda: self._ticker(ticker).calendar,
+                label=f"earnings-calendar:{ticker}",
+                retries=0,
+                pace=False,
+            )
         except Exception:
             return None
 
     def info(self, ticker: str) -> dict[str, Any]:
         self._throttle()
         try:
-            return dict(self._ticker(ticker).info or {})
+            return dict(
+                yahoo_call(
+                    lambda: self._ticker(ticker).info or {},
+                    label=f"earnings-info:{ticker}",
+                    retries=0,
+                    pace=False,
+                )
+                or {}
+            )
         except Exception:
             return {}
 
     def option_expirations(self, ticker: str) -> list[date]:
         self._throttle()
         try:
-            expirations = list(self._ticker(ticker).options or [])
+            expirations = list(
+                yahoo_call(
+                    lambda: self._ticker(ticker).options or [],
+                    label=f"earnings-options:{ticker}",
+                    retries=0,
+                    pace=False,
+                )
+                or []
+            )
         except Exception:
             return []
         values: list[date] = []
@@ -451,7 +499,12 @@ class YahooEarningsDataSource:
 
     def option_chain(self, ticker: str, expiry: date) -> tuple[pd.DataFrame, pd.DataFrame]:
         self._throttle()
-        chain = self._ticker(ticker).option_chain(expiry.isoformat())
+        chain = yahoo_call(
+            lambda: self._ticker(ticker).option_chain(expiry.isoformat()),
+            label=f"earnings-option-chain:{ticker}:{expiry.isoformat()}",
+            retries=0,
+            pace=False,
+        )
         return chain.calls.copy(), chain.puts.copy()
 
     def spot_price(self, ticker: str) -> float | None:

@@ -10,8 +10,8 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 import requests
-import yfinance as yf
 
+from providers.yahoo_throttle import create_ticker, yahoo_call
 from scanners.congress.models import CompanyClassification
 
 
@@ -161,5 +161,10 @@ class CompanyClassificationProvider:
     def _metadata(self, ticker: str) -> dict[str, Any]:
         if callable(self.metadata_fetcher):
             return dict(self.metadata_fetcher(ticker))
-        return dict(getattr(yf.Ticker(ticker), "info", {}) or {})
-
+        return dict(
+            yahoo_call(
+                lambda: getattr(create_ticker(ticker), "info", {}) or {},
+                label=f"congress-company-info:{ticker}",
+            )
+            or {}
+        )
