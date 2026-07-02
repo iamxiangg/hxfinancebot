@@ -113,9 +113,30 @@ def _judgment_block(candidate: dict[str, Any]) -> list[str]:
     if confirmation_bits:
         lines.append(f"- Confirmation: {' | '.join(confirmation_bits)}")
 
+    forward_score = _clean_text(candidate.get("Forward Confirmation Score"))
+    forward_detail = _clean_text(candidate.get("Forward Confirmation Detail"))
+    if forward_score or forward_detail:
+        lines.append(
+            f"- Forward layer: {forward_score or '?'}"
+            + (f" | {forward_detail}" if forward_detail else "")
+        )
+
+    breaker = _clean_text(candidate.get("Thesis Breaker Severity"))
+    breaker_detail = _clean_text(candidate.get("Thesis Breaker Detail"))
+    if breaker or breaker_detail:
+        lines.append(
+            f"- Breaker load: {breaker or 'LOW'}"
+            + (f" | {breaker_detail}" if breaker_detail else "")
+        )
+
     risks = _clean_text(candidate.get("Risk Flags"))
     if risks:
         lines.append(f"- Breakers / gaps: {risks}")
+
+    rank = _clean_text(candidate.get("Research Rank"))
+    rank_bucket = _clean_text(candidate.get("Research Rank Bucket"))
+    if rank or rank_bucket:
+        lines.append(f"- Research rank: {rank or '?'} ({rank_bucket or 'UNRATED'})")
 
     lane_reason = _clean_text(candidate.get("Decision Lane Reason"))
     if lane_reason:

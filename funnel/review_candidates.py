@@ -153,6 +153,18 @@ def comparison_to_candidate(record: dict[str, Any], now: str) -> dict[str, Any]:
         "Insider Cluster Span Days": record.get("insider_cluster_span_days", ""),
         "Insider Weighted Purchase Price": record.get("insider_weighted_purchase_price", ""),
         "Insider Entry State": record.get("insider_entry_state", ""),
+        "Fundamental Inflection Classification": record.get("fundamental_inflection_classification", ""),
+        "Fundamental Inflection Score": record.get("fundamental_inflection_score", ""),
+        "Fundamental Inflection Pillars": record.get("fundamental_inflection_pillars", ""),
+        "Fundamental Inflection Revenue Growth": record.get("fundamental_inflection_revenue_growth", ""),
+        "Fundamental Inflection Growth Acceleration": record.get("fundamental_inflection_growth_acceleration", ""),
+        "Fundamental Inflection Gross Margin Change Bps": record.get("fundamental_inflection_gross_margin_change_bps", ""),
+        "Fundamental Inflection Operating Margin Change Bps": record.get("fundamental_inflection_operating_margin_change_bps", ""),
+        "Fundamental Inflection FCF Margin Change Bps": record.get("fundamental_inflection_fcf_margin_change_bps", ""),
+        "Fundamental Inflection Diluted Share Growth": record.get("fundamental_inflection_diluted_share_growth", ""),
+        "Fundamental Inflection Cash Runway Months": record.get("fundamental_inflection_cash_runway_months", ""),
+        "Fundamental Inflection Risk Flags": record.get("fundamental_inflection_risk_flags", ""),
+        "Fundamental Inflection Reason": record.get("fundamental_inflection_reason", ""),
         "First Seen": now,
         "Last Seen": record.get("observed_at", now),
         "Active?": "YES",
@@ -339,30 +351,50 @@ def _manual_override(candidate: dict[str, Any]) -> bool:
     return str(candidate.get("Manual Override") or "").strip().upper() == "YES"
 
 
+def apply_candidate_memory(candidate: dict[str, Any], now: str) -> dict[str, Any]:
+    candidate = dict(candidate)
+    previous_lane = str(candidate.get("Previous Decision Lane") or "").strip().upper()
+    current_lane = str(candidate.get("Decision Lane") or "").strip().upper()
+    if current_lane and previous_lane != current_lane:
+        candidate["Decision Lane Last Changed At"] = now
+
+    current_summary = str(candidate.get("Thesis Summary") or "").strip()
+    previous_summary = str(candidate.get("_previous_thesis_summary") or "").strip()
+    if current_summary and previous_summary != current_summary:
+        candidate["Thesis Last Changed At"] = now
+
+    if not candidate.get("Why Interesting"):
+        candidate["Why Interesting"] = candidate.get("Discovery Reason", "")
+    if not candidate.get("Manual Verdict"):
+        candidate["Manual Verdict"] = ""
+    return candidate
+
+
 def apply_candidate_workflow(candidate: dict[str, Any], now: str) -> dict[str, Any]:
     candidate = dict(candidate)
     lane = str(candidate.get("Decision Lane") or "").strip().upper()
     status = str(candidate.get("Status") or "").strip().upper()
+    rank_bucket = str(candidate.get("Research Rank Bucket") or "").strip().upper()
 
     if status in CANDIDATE_FINAL_STATUSES:
         return candidate
 
     if lane == "RESEARCH_NOW":
-        candidate["Review Priority"] = "URGENT"
+        candidate["Review Priority"] = "URGENT" if rank_bucket == "TOP" else "HIGH"
         candidate["Active?"] = "YES"
         candidate["Status"] = "RESEARCH_NOW"
         return candidate
 
     if lane == "WAITING_CONFIRMATION":
         if candidate.get("Review Priority") not in {"URGENT", "HIGH"}:
-            candidate["Review Priority"] = "HIGH"
+            candidate["Review Priority"] = "HIGH" if rank_bucket in {"TOP", "STRONG"} else "MEDIUM"
         candidate["Active?"] = "YES"
         candidate["Status"] = "WAITING_CONFIRMATION"
         return candidate
 
     if lane == "WATCH":
         if candidate.get("Review Priority") not in {"URGENT", "HIGH"}:
-            candidate["Review Priority"] = "MEDIUM"
+            candidate["Review Priority"] = "MEDIUM" if rank_bucket != "LOW" else "OPTIONAL"
         candidate["Active?"] = "YES"
         candidate["Status"] = "WATCH"
         return candidate
@@ -956,7 +988,14 @@ def run() -> None:
         else dict(candidate)
         for candidate in candidates
     ]
-    candidates = [apply_candidate_judgment(candidate) for candidate in candidates]
+    enriched_judgment: list[dict[str, Any]] = []
+    for candidate in candidates:
+        working = dict(candidate)
+        working["_previous_thesis_summary"] = working.get("Thesis Summary", "")
+        judged = apply_candidate_judgment(working)
+        judged = apply_candidate_memory(judged, now)
+        enriched_judgment.append(judged)
+    candidates = enriched_judgment
     candidates = [apply_candidate_workflow(candidate, now) for candidate in candidates]
 
     candidates = notify_candidates(candidates)

@@ -264,6 +264,34 @@ def _build_reason(
             parts.append(entry_state.title())
         return f"Insider: {', '.join(parts)}" if parts else "Insider"
 
+    if signal.scanner == "fundamental_inflection":
+        parts: list[str] = []
+        classification = str(details.get("inflection_classification") or "").strip().replace("_", " ")
+        pillars = details.get("positive_pillars") or []
+        score = details.get("total_score") or signal.score
+        growth = details.get("revenue_growth_yoy")
+        margin = details.get("gross_margin_change_bps")
+        if classification:
+            parts.append(classification.lower())
+        if score not in ("", None):
+            try:
+                parts.append(f"score {float(score):.1f}")
+            except (TypeError, ValueError):
+                pass
+        if pillars:
+            parts.append(f"Pillars: {_csv_text(pillars)}")
+        if growth not in ("", None):
+            try:
+                parts.append(f"growth {float(growth) * 100:.1f}%")
+            except (TypeError, ValueError):
+                pass
+        if margin not in ("", None):
+            try:
+                parts.append(f"gross margin +{float(margin):.0f} bps")
+            except (TypeError, ValueError):
+                pass
+        return f"Fundamental Inflection: {', '.join(parts)}" if parts else "Fundamental Inflection"
+
     parts = [
         signal.classification
         .replace("_", " ")
@@ -345,6 +373,27 @@ def _insider_details(signals: Iterable[Signal]) -> dict[str, Any]:
         "insider_cluster_span_days": _detail_value(insider_signal, "cluster_span_days"),
         "insider_weighted_purchase_price": _detail_value(insider_signal, "weighted_purchase_price"),
         "insider_entry_state": str(details.get("entry_state") or "").strip(),
+    }
+
+
+def _fundamental_inflection_details(signals: Iterable[Signal]) -> dict[str, Any]:
+    inflection_signal = next((signal for signal in signals if signal.scanner == "fundamental_inflection"), None)
+    if inflection_signal is None:
+        return {}
+    details = inflection_signal.details
+    return {
+        "fundamental_inflection_classification": str(details.get("inflection_classification") or "").strip(),
+        "fundamental_inflection_score": _detail_value(inflection_signal, "total_score"),
+        "fundamental_inflection_pillars": _csv_text(details.get("positive_pillars", [])),
+        "fundamental_inflection_revenue_growth": _detail_value(inflection_signal, "revenue_growth_yoy"),
+        "fundamental_inflection_growth_acceleration": _detail_value(inflection_signal, "growth_acceleration"),
+        "fundamental_inflection_gross_margin_change_bps": _detail_value(inflection_signal, "gross_margin_change_bps"),
+        "fundamental_inflection_operating_margin_change_bps": _detail_value(inflection_signal, "operating_margin_change_bps"),
+        "fundamental_inflection_fcf_margin_change_bps": _detail_value(inflection_signal, "ttm_fcf_margin_change_bps"),
+        "fundamental_inflection_diluted_share_growth": _detail_value(inflection_signal, "diluted_share_growth"),
+        "fundamental_inflection_cash_runway_months": _detail_value(inflection_signal, "cash_runway_months"),
+        "fundamental_inflection_risk_flags": _csv_text(details.get("risk_flags", [])),
+        "fundamental_inflection_reason": str(details.get("reason") or "").strip(),
     }
 
 
@@ -616,6 +665,7 @@ def classify_signals(
                 ),
                 **_congress_details(ticker_signals),
                 **_insider_details(ticker_signals),
+                **_fundamental_inflection_details(ticker_signals),
             }
         )
 

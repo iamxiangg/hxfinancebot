@@ -281,6 +281,7 @@ class ReviewCandidateRunTests(unittest.TestCase):
         self.assertIn("VPMA:", upsert_rows[0]["Discovery Reason"])
         self.assertEqual(upsert_rows[0]["Attention Family"], "TECHNICAL + OWNERSHIP")
         self.assertEqual(upsert_rows[0]["Decision Lane"], "WATCH")
+        self.assertIn("Research Rank", upsert_rows[0])
         self.assertEqual(upsert_rows[0]["Congress Unique Members"], 4)
         self.assertEqual(upsert_rows[0]["Congress Recent Cluster Members"], 3)
         self.assertEqual(upsert_rows[0]["Congress Active Purchases"], 6)

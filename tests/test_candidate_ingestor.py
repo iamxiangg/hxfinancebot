@@ -346,6 +346,37 @@ class CandidateIngestorTests(
         self.assertEqual(row["congress_unique_members"], "")
         self.assertEqual(row["congress_member_names"], "")
 
+    def test_fundamental_inflection_details_are_preserved(self) -> None:
+        signal = Signal(
+            ticker="APP",
+            scanner="fundamental_inflection",
+            classification="actionable",
+            score=81,
+            observed_at="2026-06-22T20:00:00+08:00",
+            valid_until="2026-07-01T20:00:00+08:00",
+            details={
+                "inflection_classification": "VALIDATED_INFLECTION",
+                "total_score": 81,
+                "positive_pillars": ["growth_acceleration", "operating_leverage"],
+                "revenue_growth_yoy": 0.29,
+                "growth_acceleration": 0.07,
+                "gross_margin_change_bps": 140,
+                "operating_margin_change_bps": 380,
+                "ttm_fcf_margin_change_bps": 240,
+                "diluted_share_growth": 0.03,
+                "cash_runway_months": 36,
+                "risk_flags": ["monitor_dilution"],
+                "reason": "Validated inflection: 3 pillars, score 81",
+            },
+        )
+
+        row = classify_signals([signal], self.records)[0]
+        self.assertIn("Fundamental Inflection:", row["discovery_reason"])
+        self.assertEqual(row["fundamental_inflection_classification"], "VALIDATED_INFLECTION")
+        self.assertEqual(row["fundamental_inflection_score"], 81)
+        self.assertEqual(row["fundamental_inflection_pillars"], "growth_acceleration, operating_leverage")
+        self.assertEqual(row["fundamental_inflection_cash_runway_months"], 36)
+
 
 if __name__ == "__main__":
     unittest.main()

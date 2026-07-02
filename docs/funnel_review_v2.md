@@ -80,6 +80,13 @@ The scanner stack is treated as:
 - forward confirmation: Fundamental inflection and future estimate-revision layers
 - risk / thesis-breaker layer: mixed signals, thin quality coverage, red flags
 
+The current implementation now surfaces the existing `fundamental_inflection`
+scanner into candidate review as the first explicit forward-confirmation layer.
+That means the funnel can distinguish between:
+
+- cheap and merely interesting
+- cheap and operationally improving
+
 Each active candidate gets a suggested `Decision Lane`:
 
 - `RESEARCH_NOW`: BTD passed and the thesis has enough independent confirmation
@@ -90,6 +97,16 @@ Each active candidate gets a suggested `Decision Lane`:
 Telegram review cards now surface this judgment block before the raw BTD and
 Feroldi detail so the human review starts from an investing decision, not just
 from raw fields.
+
+Each candidate also carries:
+
+- `Forward Confirmation Score`
+- `Forward Confirmation Detail`
+- `Thesis Breaker Severity`
+- `Thesis Breaker Detail`
+- `Research Rank`
+- `Research Rank Bucket`
+- basic candidate-memory fields such as previous lane and thesis-change timing
 
 ## Workflow Behaviour By Lane
 
