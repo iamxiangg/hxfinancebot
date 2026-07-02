@@ -89,6 +89,41 @@ def _decimal_line(label: str, value: Any, *, places: int = 2) -> str | None:
     return f"- {label}: {number:.{places}f}"
 
 
+def _judgment_block(candidate: dict[str, Any]) -> list[str]:
+    lane = _clean_text(candidate.get("Decision Lane"))
+    if not lane:
+        return []
+
+    lines = ["JUDGMENT LAYER", f"- Suggested lane: {lane}"]
+
+    attention = _clean_text(candidate.get("Attention Family"))
+    if attention:
+        lines.append(f"- Attention family: {attention}")
+
+    technical = _clean_text(candidate.get("Technical Confirmation"))
+    ownership = _clean_text(candidate.get("Ownership Confirmation"))
+    forward = _clean_text(candidate.get("Forward Confirmation"))
+    confirmation_bits = []
+    if technical:
+        confirmation_bits.append(f"technical {technical.lower()}")
+    if ownership:
+        confirmation_bits.append(f"ownership {ownership.lower()}")
+    if forward:
+        confirmation_bits.append(f"forward {forward.lower()}")
+    if confirmation_bits:
+        lines.append(f"- Confirmation: {' | '.join(confirmation_bits)}")
+
+    risks = _clean_text(candidate.get("Risk Flags"))
+    if risks:
+        lines.append(f"- Breakers / gaps: {risks}")
+
+    lane_reason = _clean_text(candidate.get("Decision Lane Reason"))
+    if lane_reason:
+        lines.append(f"- Why this lane: {lane_reason}")
+
+    return lines
+
+
 def build_review_message(candidate: dict[str, Any]) -> str:
     source_values = [
         _source_label(part)
@@ -119,6 +154,11 @@ def build_review_message(candidate: dict[str, Any]) -> str:
     reason = candidate.get("Discovery Reason")
     if reason:
         lines.append(f"Signal: {reason}")
+
+    judgment_lines = _judgment_block(candidate)
+    if judgment_lines:
+        lines.append("")
+        lines.extend(judgment_lines)
 
     lines.append("")
     lines.append("BTD BASIC GATE")

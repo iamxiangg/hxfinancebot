@@ -14,6 +14,7 @@ import requests
 from googleapiclient.errors import HttpError
 
 from funnel.btd_enrichment import fetch_yfinance_metrics, metrics_to_candidate_updates, to_float
+from funnel.candidate_judgment import apply_candidate_judgment
 from funnel.candidate_ingestor import classify_signals, get_pending_new_ticker_records
 from funnel.congress_adapter import run_congress_adapter
 from funnel.feroldi_ai import draft_to_candidate_updates, request_feroldi_draft
@@ -891,6 +892,7 @@ def run() -> None:
         else dict(candidate)
         for candidate in candidates
     ]
+    candidates = [apply_candidate_judgment(candidate) for candidate in candidates]
 
     candidates = notify_candidates(candidates)
 

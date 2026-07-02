@@ -78,6 +78,12 @@ class TelegramReviewTests(unittest.TestCase):
                 "Gross Margin": 0.72,
                 "Revenue Growth": 0.24,
                 "Discovery Reason": "Political Disclosures: 4 unique members",
+                "Decision Lane": "WAITING_CONFIRMATION",
+                "Attention Family": "OWNERSHIP",
+                "Technical Confirmation": "NO",
+                "Ownership Confirmation": "POLITICAL",
+                "Forward Confirmation": "NO",
+                "Risk Flags": "Feroldi first cut pending",
                 "Congress Unique Members": 4,
                 "Congress Recent Cluster Members": 3,
                 "Congress Active Purchases": 6,
@@ -85,6 +91,8 @@ class TelegramReviewTests(unittest.TestCase):
             }
         )
 
+        self.assertIn("JUDGMENT LAYER", message)
+        self.assertIn("Suggested lane: WAITING_CONFIRMATION", message)
         self.assertIn("BTD BASIC GATE", message)
         self.assertIn("BTD ratio: 0.40", message)
         self.assertIn("Gross margin: 72.0%", message)
@@ -114,11 +122,18 @@ class TelegramReviewTests(unittest.TestCase):
                 "Insider Cluster Span Days": 12,
                 "Insider Weighted Purchase Price": 42.8,
                 "Insider Entry State": "trend_confirmed",
+                "Decision Lane": "RESEARCH_NOW",
+                "Attention Family": "TECHNICAL + OWNERSHIP",
+                "Technical Confirmation": "YES",
+                "Ownership Confirmation": "INSIDER",
+                "Forward Confirmation": "NO",
             }
         )
 
         self.assertIn("Sources: Corporate Insider, VPMA / PEAD", message)
         self.assertIn("Corroboration: STRONG", message)
+        self.assertIn("Suggested lane: RESEARCH_NOW", message)
+        self.assertIn("Attention family: TECHNICAL + OWNERSHIP", message)
         self.assertIn("Corporate insider:", message)
         self.assertIn("Total score: 82", message)
 

@@ -15,7 +15,9 @@ promoted into `Stock Summary USD`.
   signals.
 - `BTD_Candidates`: review queue with yfinance BTD enrichment and optional AI
   Feroldi draft fields. It includes an `Active?` column so open candidates can
-  be filtered separately from approved/rejected/archive history.
+  be filtered separately from approved/rejected/archive history. It now also
+  carries a judgment layer: attention family, confirmation by source family,
+  risk flags, a suggested decision lane, and a one-line thesis summary.
 - `Feroldi_AI_Drafts`: append-only log of generated AI drafts when
   `OPENAI_API_KEY` exists.
 - `Bot_State`: stores `telegram_last_update_id` so GitHub Actions polling does
@@ -67,3 +69,24 @@ BTD scoring is lower-is-better:
 
 The candidate sheet stores both the final score and the visible components used
 to calculate it.
+
+## Judgment Layer
+
+The scanner stack is treated as:
+
+- attention generators: VPMA / PEAD / Political disclosures / Insider
+- economic gate: BTD
+- business quality filter: Feroldi first cut
+- forward confirmation: Fundamental inflection and future estimate-revision layers
+- risk / thesis-breaker layer: mixed signals, thin quality coverage, red flags
+
+Each active candidate gets a suggested `Decision Lane`:
+
+- `RESEARCH_NOW`: BTD passed and the thesis has enough independent confirmation
+- `WAITING_CONFIRMATION`: promising, but still needs another confirming layer
+- `WATCH`: worth monitoring, but quality or completeness is still weak
+- `REJECT`: economics did not pass the current minimum hurdle
+
+Telegram review cards now surface this judgment block before the raw BTD and
+Feroldi detail so the human review starts from an investing decision, not just
+from raw fields.
