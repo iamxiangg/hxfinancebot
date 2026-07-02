@@ -92,13 +92,12 @@ jobs:
       - name: Check Python syntax
         run: |
           set -euo pipefail
-          python -m compileall -q funnel tests
+          python -m compileall -q funnel scanners tests providers
           echo "Python syntax checks passed."
 
-      - name: Run unit tests
-        run: |
-          set -euo pipefail
-          python -m unittest discover -s tests -v
+      # NOTE: unit-test gate was moved to `.github/workflows/ci-tests.yml`
+      # (runs on push / pull_request only) so the cron flow ships without
+      # spending ~30-90s of its 60-minute budget on the test suite.
 
       # Restore the previous production run's SEC disk cache so today's run
       # starts warm. Uses `actions/cache/restore@v4` (split sub-action) so we

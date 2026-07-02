@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from funnel.feroldi_ai import draft_to_candidate_updates, request_feroldi_draft
 from funnel.feroldi_gate import apply_feroldi_gate
 from funnel.feroldi_scoring import detail_to_candidate_updates, run_feroldi_first_cut
 from funnel.feroldi_sheet_writer import detail_to_sheet_row
+from funnel.fundamental_inflection_adapter import run_fundamental_inflection_adapter  # hoisted from lazy import inside the elif branch for thread-pool safety
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.insider_adapter import run_insider_adapter
 from funnel.review_schema import (
@@ -635,43 +637,81 @@ def run() -> None:
     successful_sources: list[str] = []
     failed_sources: dict[str, str] = {}
 
+    # Network-bound adapters (congress / vpma / insider / fundamental_inflection)
+    # are safe -- and significantly faster -- to run in parallel. Their combined
+    # SEC request rate is capped process-globally by the ``_THROTTLE_LOCK`` in
+    # ``providers/sec/official.py``, so 4 parallel adapters cannot collectively
+    # bust the SEC EDGAR 10 req/sec per-IP limit. The pool is sized at
+    # ``min(4, N)`` so a single-source run does not spawn idle workers.
+    _REMOTE_SOURCES = ("congress", "vpma", "insider", "fundamental_inflection")
+    remote_sources = [source for source in requested_sources if source in _REMOTE_SOURCES]
+
+    # Sequential first pass: ``manual`` reads the sheet through ``service``;
+    # unknown source strings are logged-and-skipped. Both must NOT execute
+    # inside the pool so the Sheets OAuth ``service`` object is never shared
+    # across worker threads concurrently (Google API clients are not safe to
+    # mutate from multiple threads simultaneously).
     for source in requested_sources:
-        try:
-            if source == "manual":
+        if source == "manual":
+            try:
                 manual_records = read_table(service, spreadsheet_id, MANUAL_SEED_SHEET, MANUAL_SEED_HEADERS)
                 source_signals = manual_seed_signals(manual_records, now)
                 signals.extend(source_signals)
                 successful_sources.append(source)
                 logger.info("Manual source returned %d signals.", len(source_signals))
-            elif source == "congress":
-                congress_signals, analysed_count = run_congress_adapter(
-                    min_conviction=_float_value(os.getenv("MIN_CONVICTION"), 15.0),
-                    observed_at=now,
-                )
-                logger.info("Congress adapter returned %d signals from %d tickers.", len(congress_signals), analysed_count)
-                signals.extend(congress_signals)
-                successful_sources.append(source)
-            elif source == "vpma":
-                vpma_signals, analysed_count = run_vpma_adapter(observed_at=now)
-                logger.info("VPMA adapter returned %d signals from %d tickers.", len(vpma_signals), analysed_count)
-                signals.extend(vpma_signals)
-                successful_sources.append(source)
-            elif source == "insider":
-                insider_signals, analysed_count = run_insider_adapter(observed_at=now)
-                logger.info("Insider adapter returned %d signals from %d tickers.", len(insider_signals), analysed_count)
-                signals.extend(insider_signals)
-                successful_sources.append(source)
-            elif source == "fundamental_inflection":
-                from funnel.fundamental_inflection_adapter import run_fundamental_inflection_adapter
-                fi_signals, analysed_count = run_fundamental_inflection_adapter(observed_at=now)
-                logger.info("Fundamental inflection adapter returned %d signals from %d tickers.", len(fi_signals), analysed_count)
-                signals.extend(fi_signals)
-                successful_sources.append(source)
-            else:
-                logger.warning("Unknown review source '%s' ignored.", source)
-        except Exception as exc:
-            failed_sources[source] = exc.__class__.__name__
-            logger.exception("Review source '%s' failed.", source)
+            except Exception as exc:
+                failed_sources[source] = exc.__class__.__name__
+                logger.exception("Review source '%s' failed.", source)
+        elif source not in _REMOTE_SOURCES:
+            logger.warning("Unknown review source '%s' ignored.", source)
+
+    # Parallel second pass: dispatch each remote source to a worker. Per-future
+    # try/except preserves the per-source failure isolation the sequential loop
+    # provided; results are stashed per-source then appended to ``signals`` in
+    # ``requested_sources`` order so the downstream ``classify_signals`` doesn't
+    # randomly reshuffle based on per-source completion latency.
+    if remote_sources:
+        min_conviction_remote = _float_value(os.getenv("MIN_CONVICTION"), 15.0)
+        max_workers = min(4, len(remote_sources))
+        future_to_source: dict[Future, str] = {}
+        remote_results: dict[str, list[Signal]] = {}
+        remote_analysed: dict[str, int] = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="review-src") as executor:
+            for source in remote_sources:
+                if source == "congress":
+                    future = executor.submit(
+                        run_congress_adapter,
+                        min_conviction=min_conviction_remote,
+                        observed_at=now,
+                    )
+                elif source == "vpma":
+                    future = executor.submit(run_vpma_adapter, observed_at=now)
+                elif source == "insider":
+                    future = executor.submit(run_insider_adapter, observed_at=now)
+                else:  # fundamental_inflection (guarded by ``_REMOTE_SOURCES`` membership above)
+                    future = executor.submit(run_fundamental_inflection_adapter, observed_at=now)
+                future_to_source[future] = source
+
+            for future in as_completed(future_to_source):
+                source = future_to_source[future]
+                try:
+                    source_signals, analysed_count = future.result()
+                    remote_results[source] = source_signals
+                    remote_analysed[source] = analysed_count
+                    successful_sources.append(source)
+                    logger.info(
+                        "%s adapter returned %d signals from %d tickers.",
+                        source,
+                        len(source_signals),
+                        analysed_count,
+                    )
+                except Exception as exc:
+                    failed_sources[source] = exc.__class__.__name__
+                    logger.exception("Review source '%s' failed.", source)
+
+        for source in remote_sources:
+            if source in remote_results:
+                signals.extend(remote_results[source])
 
     if not successful_sources and requested_sources:
         raise RuntimeError(
@@ -680,9 +720,12 @@ def run() -> None:
         )
 
     if failed_sources:
+        # Sort ``successful_sources`` for deterministic log output: the
+        # upstream ThreadPoolExecutor / ``as_completed`` loop populates it in
+        # non-deterministic per-source completion order.
         logger.warning(
             "Continuing with partial source success. Successful=%s Failed=%s",
-            ",".join(successful_sources),
+            ",".join(sorted(successful_sources)),
             ",".join(f"{source}:{error}" for source, error in sorted(failed_sources.items())),
         )
 

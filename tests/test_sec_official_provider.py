@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+import time
 import unittest
 from unittest.mock import patch
 
@@ -38,6 +40,125 @@ class _FakeSession:
         if not queue:
             raise AssertionError(f"Unexpected URL: {url}")
         return queue.pop(0)
+
+
+class ModuleGlobalThrottleTests(unittest.TestCase):
+    """Behaviour tests for the process-global SEC throttle lock implemented in
+    ``providers/sec/official.py``.
+
+    Without the lock, two ``OfficialSECProvider`` instances in two threads
+    share no rate-limit knowledge: each one sees its own
+    ``self._last_request_at`` (the old per-instance attribute) and so each
+    holds an isolated view of "last request". With ``max_requests_per_second=1``
+    and 3 calls each, two isolated instances both complete their three
+    requests in ~3 seconds; with the module-global lock the two instances share
+    a single 1 req/sec slot and the same 3-each workload takes ~6 seconds.
+
+    ``setUp`` resets ``_PROCESS_LAST_REQUEST_AT`` so test order is decoupled
+    from any previous test that might have advanced the global tracker.
+    """
+
+    def setUp(self) -> None:
+        from providers.sec import official as official_module
+        official_module._PROCESS_LAST_REQUEST_AT = 0.0
+
+    def _make_provider(self, *, kind: str) -> tuple[OfficialSECProvider, _FakeSession]:
+        """Two independent sessions, each with 3 canned responses so a thread
+        can fire 3 calls back-to-back without exhausting its queue."""
+        responses = [
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+        ]
+        session = _FakeSession({TICKER_MAP_URL: responses})
+        provider = OfficialSECProvider(
+            user_agent="hxfinancebot-tests/test@example.com",
+            session=session,
+            cache=JSONDiskCache(Path("unused"), default_ttl=timedelta(hours=1), enabled=False),
+            cache_enabled=False,
+            max_requests_per_second=1,
+        )
+        return provider, session
+
+    def test_two_instances_share_process_global_throttle(self) -> None:
+        """Two providers in two threads firing 3 calls each at
+        ``max_requests_per_second=1`` must take at least 5 seconds total (six
+        slots at 1Hz numbered 1..6 implies 5 inter-slot gaps of ~1s). Isolated
+        per-instance throttles would finish at ~3s; the global lock holds the
+        schedule.
+        """
+        provider_a, session_a = self._make_provider(kind="A")
+        provider_b, session_b = self._make_provider(kind="B")
+
+        def fire(p: OfficialSECProvider, n: int) -> None:
+            for _ in range(n):
+                p.company_profile("TEAM")
+
+        start = time.monotonic()
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="throttle-test") as pool:
+            pool.submit(fire, provider_a, 3)
+            pool.submit(fire, provider_b, 3)
+        elapsed = time.monotonic() - start
+
+        # Both providers served their 3 calls (no spurious request counts).
+        self.assertEqual(len(session_a.calls), 3)
+        self.assertEqual(len(session_b.calls), 3)
+
+        # Global lock holds the schedule: 6 calls at 1 req/sec = >= ~5.5s of
+        # cumulative slot-space. We assert >= 5.0 to tolerate small jitter
+        # while still ruling out the ~3s the per-instance throttle would yield.
+        self.assertGreaterEqual(
+            elapsed,
+            5.0,
+            f"Expected ~6s of wall-clock for shared throttle; got {elapsed:.2f}s. "
+            "If this is closer to ~3s the process-global lock has regressed.",
+        )
+
+    def test_pre_reservation_records_slot_at_throttle_start(self) -> None:
+        """The new ``_throttle`` reserves its slot at the START of the request
+        via ``_PROCESS_LAST_REQUEST_AT``, not on response completion. A single
+        provider firing 5 back-to-back requests at 10 req/sec must advance the
+        global tracker by ~0.5s, proving reservations are timestamped
+        regardless of how long each request took to complete.
+        """
+        from providers.sec import official as official_module
+
+        responses = [
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+            _FakeResponse(json_data={"0": {"ticker": "TEAM", "cik_str": 1650372, "title": "Atlassian Corp"}}),
+        ]
+        session = _FakeSession({TICKER_MAP_URL: responses})
+        provider = OfficialSECProvider(
+            user_agent="hxfinancebot-tests/test@example.com",
+            session=session,
+            cache=JSONDiskCache(Path("unused"), default_ttl=timedelta(hours=1), enabled=False),
+            cache_enabled=False,
+            max_requests_per_second=10,
+        )
+
+        start = time.monotonic()
+        for _ in range(5):
+            provider.company_profile("TEAM")
+        elapsed = time.monotonic() - start
+
+        # 5 reservations at 10 req/sec (0.1s slot spacing) means the global
+        # tracker has advanced by >= ~0.5s above ``start``. Network IO is
+        # mocked at sub-millisecond, so wall-clock should mostly reflect the
+        # serialised throttle slots + the tiny sleep outside the lock. We
+        # assert ``start + 0.4`` instead of the theoretical ``start + 0.5``
+        # to tolerate timer-jitter noise from GitHub-hosted runners.
+        self.assertGreater(
+            official_module._PROCESS_LAST_REQUEST_AT,
+            start + 0.4,
+            "Expected the global tracker to record request slots, not idle time.",
+        )
+        # Sanity: 5 calls at 10/sec means a ~0.4s minimum gap. Allow a generous
+        # upper bound (CI runners are noisy) -- the meaningful assertion is
+        # the LOW FLOOR proving the throttle is engaged.
+        self.assertLess(elapsed, 5.0, "Throttle should still be fast under mock latency.")
 
 
 class OfficialSECProviderTests(unittest.TestCase):
@@ -107,6 +228,9 @@ class OfficialSECProviderTests(unittest.TestCase):
         self.assertEqual(profile.ticker, "TEAM")
         self.assertEqual(profile.cik, "0001650372")
         self.assertEqual([item.form for item in filings], ["10-K", "10-Q", "8-K", "4", "4/A"])
+        # ``_normalize_accession`` reformats an 18-digit un-hyphenated string
+        # into the canonical ``CIK-YY-NNNNNN`` shape; the fixture feeds an
+        # 18-digit raw value so we expect the hyphen-reformatted result here.
         self.assertEqual(filings[0].accession, "0001650372-24-000123")
         self.assertTrue(filings[-1].is_amendment)
 

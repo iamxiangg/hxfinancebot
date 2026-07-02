@@ -1,0 +1,75 @@
+# Runs the unit-test gate that previously lived inside each funnel workflow.
+# Moving it out of the cron-bound workflows reclaims ~30-90s of the 40-60min
+# GitHub Actions time budget on every scheduled run; the cron flows still
+# run ``python -m compileall`` as a fast pre-flight syntax check. CI coverage
+# is preserved because this workflow runs on ``push`` to ``main`` AND every
+# ``pull_request`` targeting ``main``.
+name: CI Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch so PR push-back retries don't
+# queue stale test invocations behind a fresh one.
+concurrency:
+  group: ci-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Install the FULL test-dep surface (requirements.txt includes torch /
+      # transformers / scipy which the funnel cron installs inline; here we
+      # take the canonical path so PRs catch dep regressions too).
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # ``requirements.txt`` already pins the funnel / scanner / sheets /
+          # telegram / yfinance / lxml / torch(transformers CPU) dependencies
+          # the tests rely on. We add the funnel workflows' inline installs
+          # for parity with the cron runners.
+          python -m pip install -r requirements.txt
+          python -m pip install google-api-python-client google-auth
+          python -m pip install python-telegram-bot lxml
+
+      - name: Check Python syntax
+        run: |
+          set -euo pipefail
+          python -m compileall -q funnel scanners tests providers
+          echo "Python syntax checks passed."
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: On failure, capture failing test names for triage
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          echo "::group::re-running failing tests with verbose output"
+          python -m unittest discover -s tests -v 2>&1 | tail -200
+          echo "::endgroup::"

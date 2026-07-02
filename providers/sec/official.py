@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,27 @@ logger = logging.getLogger(__name__)
 # enrichment pass, once for the insider ingestion); without dedup, this
 # fires once per constructor and floods the log on every cron run.
 _USER_AGENT_WARN_EMITTED = False
+
+
+# --- Process-global SEC throttle state --------------------------------------
+# The SEC EDGAR fair-access rule (https://www.sec.gov/os/accessing-edgar-data)
+# caps requests at 10 per second **per IP**, not per Python instance. When the
+# funnel review adapter fans out across 4 worker threads (congress / vpma /
+# insider / fundamental_inflection), each worker has historically constructed
+# its own ``OfficialSECProvider`` -- and each provider only saw its OWN
+# ``_last_request_at``. Four independent views of "last request" meant the
+# shared 9 req/sec cap silently became ~36 req/sec in aggregate, which is
+# what triggers SEC's 403 / IP-rate-limiter.
+#
+# We therefore anchor the throttle to process-global state, with the lock
+# held only across the read/compute/write window. ``time.sleep(wait)`` runs
+# OUTSIDE the lock so concurrent workers sleep in parallel rather than being
+# serialized behind the slowest wait. This is the minimum-grained design that
+# still gives process-wide rate coordination without re-introducing the
+# single-threaded bottleneck we deliberately removed by parallelising the
+# adapters.
+_THROTTLE_LOCK = threading.Lock()
+_PROCESS_LAST_REQUEST_AT: float = 0.0
 
 
 def _warn_user_agent_unconfigured_once(default_user_agent: str) -> None:
@@ -164,7 +186,11 @@ class OfficialSECProvider(SECProvider):
         ttl_hours = float(os.getenv("SEC_CACHE_TTL_HOURS", 24))
         cache_root = Path(os.getenv("SEC_CACHE_DIR", "funnel_output/sec_cache"))
         self.cache = cache or JSONDiskCache(cache_root, default_ttl=timedelta(hours=ttl_hours), enabled=cache_enabled)
-        self._last_request_at = 0.0
+        # NOTE: ``self._last_request_at`` was historically a per-instance
+        # attribute. As of the Move-1 perf refactor it has been promoted to
+        # ``_PROCESS_LAST_REQUEST_AT`` (module global) so parallel worker
+        # threads construct different ``OfficialSECProvider`` instances and
+        # still share a single, IP-respecting rate-limit slot.
 
     def company_profile(self, ticker: str) -> CompanyProfile:
         normalized = _normalize_ticker(ticker)
@@ -459,8 +485,29 @@ class OfficialSECProvider(SECProvider):
         return match.group(1).strip() if match else ""
 
     def _throttle(self) -> None:
+        """Reserve the next request slot in the process-global throttle queue.
+
+        Holds the ``_THROTTLE_LOCK`` only across the read/compute/write window
+        -- the actual ``time.sleep(wait)`` runs OUTSIDE the lock so workers
+        sleeping concurrently do not block each other on the lock. The slot is
+        reserved at the START of the request (not the completion), so a slow
+        single-request that takes ``minimum_interval`` to complete does not
+        silently consume a second rate-limit slot.
+
+        ``_PROCESS_LAST_REQUEST_AT`` is the latest START time of any request
+        ``OfficialSECProvider`` has reserved in this process; the next caller
+        must wait until at least ``latest + minimum_interval`` (or now, if
+        we are already past it). This ensures 4 parallel adapters (one per
+        instance) see the same ordered schedule of slots and cannot collectively
+        burst past ``max_requests_per_second``.
+        """
+        global _PROCESS_LAST_REQUEST_AT
         minimum_interval = 1.0 / self.max_requests_per_second
-        wait = minimum_interval - (time.time() - self._last_request_at)
+        with _THROTTLE_LOCK:
+            now = time.time()
+            target_time = max(_PROCESS_LAST_REQUEST_AT + minimum_interval, now)
+            _PROCESS_LAST_REQUEST_AT = target_time
+            wait = target_time - now
         if wait > 0:
             time.sleep(wait)
 
@@ -485,7 +532,13 @@ class OfficialSECProvider(SECProvider):
             self._throttle()
             try:
                 response = self.session.get(url, timeout=self.timeout_seconds)
-                self._last_request_at = time.time()
+                # The slot reservation in ``_throttle`` already anchored our
+                # start time to ``_PROCESS_LAST_REQUEST_AT``; we deliberately
+                # do NOT advance it again here. The historic per-instance
+                # ``self._last_request_at = time.time()`` line would race with
+                # sibling adapters in parallel workers and re-introduce the
+                # same "each instance has its own clock" bug the module-global
+                # state was introduced to fix.
             except requests.RequestException as exc:
                 if attempt >= self.retry_limit:
                     raise SECRequestError(f"SEC request failed for {url}: {exc.__class__.__name__}") from exc
