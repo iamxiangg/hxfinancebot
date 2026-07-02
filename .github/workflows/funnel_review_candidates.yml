@@ -168,6 +168,8 @@ jobs:
           echo "BTD_GATE_MANUAL_BYPASS=true" >> "$GITHUB_ENV"
           echo "BTD_ENRICH_WORKERS=2" >> "$GITHUB_ENV"
           echo "FEROLDI_ENRICH_WORKERS=2" >> "$GITHUB_ENV"
+          echo "FEROLDI_ALPHA_VANTAGE_MAX_CALLS=2" >> "$GITHUB_ENV"
+          echo "FEROLDI_ALPHA_VANTAGE_SLEEP_SECONDS=12" >> "$GITHUB_ENV"
           echo "YAHOO_MAX_CONCURRENT_REQUESTS=1" >> "$GITHUB_ENV"
           echo "YAHOO_MIN_INTERVAL_SECONDS=0.4" >> "$GITHUB_ENV"
           echo "YAHOO_RETRY_LIMIT=2" >> "$GITHUB_ENV"

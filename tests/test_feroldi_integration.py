@@ -417,6 +417,39 @@ class TestFeroldiZeroValueFallbacks(unittest.TestCase):
             self.assertIn("Last Error", result[0])
 
 
+class TestFeroldiEarningsFallback(unittest.TestCase):
+    @patch("funnel.feroldi_enrichment._fetch_alpha_vantage_earnings_surprise")
+    @patch("funnel.feroldi_enrichment.yahoo_call")
+    @patch("funnel.feroldi_enrichment.create_ticker")
+    def test_alpha_vantage_backfills_s03_when_yahoo_fails(
+        self,
+        mock_create_ticker,
+        mock_yahoo_call,
+        mock_alpha_fallback,
+    ) -> None:
+        from funnel.feroldi_enrichment import collect_earnings_surprise
+
+        mock_create_ticker.return_value = MagicMock()
+        mock_yahoo_call.side_effect = KeyError("chart")
+        mock_alpha_fallback.return_value = {
+            "q1_reported": 1.25,
+            "q1_estimated": 1.10,
+            "q1_report_date": "2026-06-30",
+            "q2_reported": 1.05,
+            "q2_estimated": 0.95,
+            "q2_report_date": "2026-03-31",
+        }
+
+        result = collect_earnings_surprise("BTSG")
+
+        self.assertEqual(result["q1_reported"], 1.25)
+        self.assertEqual(result["q1_estimated"], 1.10)
+        self.assertEqual(result["q1_report_date"], "2026-06-30")
+        self.assertEqual(result["q2_reported"], 1.05)
+        self.assertEqual(result["q2_estimated"], 0.95)
+        mock_alpha_fallback.assert_called_once_with("BTSG")
+
+
 class TestFeroldiSecFallbacks(unittest.TestCase):
     @patch("funnel.feroldi_enrichment.collect_yfinance_metrics")
     @patch("funnel.feroldi_enrichment.collect_quarterly_financials")

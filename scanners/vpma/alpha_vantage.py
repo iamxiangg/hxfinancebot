@@ -91,6 +91,25 @@ def _latest_forward_records(records: list[dict[str, Any]], *, limit: int = 2) ->
     return undated[:limit] or records[:limit]
 
 
+def _latest_historical_records(records: list[dict[str, Any]], *, limit: int = 4) -> list[dict[str, Any]]:
+    scored: list[tuple[date, dict[str, Any]]] = []
+    undated: list[dict[str, Any]] = []
+    for record in records:
+        record_date = _parse_date(
+            record.get("reportedDate")
+            or record.get("reported_date")
+            or record.get("fiscalDateEnding")
+            or record.get("fiscal_date_ending")
+        )
+        if record_date is None:
+            undated.append(record)
+            continue
+        scored.append((record_date, record))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = [record for _, record in scored[:limit]]
+    return selected or undated[:limit] or records[:limit]
+
+
 def _revision_direction(record: dict[str, Any], prefix: str) -> float | None:
     up = _to_float(
         record.get(f"{prefix}RevisionUp")
@@ -235,6 +254,26 @@ def parse_earnings_estimates(ticker: str, payload: dict[str, Any]) -> AlphaVanta
     )
 
 
+def parse_earnings_history(payload: dict[str, Any]) -> dict[str, Any]:
+    quarterly_records = _extract_records(payload, "quarterlyEarnings", "quarterly_earnings")
+    records = _latest_historical_records(quarterly_records, limit=4)
+    result: dict[str, Any] = {}
+    for idx, record in enumerate(records):
+        q_num = idx + 1
+        result[f"q{q_num}_reported"] = _to_float(record.get("reportedEPS") or record.get("reported_eps"))
+        result[f"q{q_num}_estimated"] = _to_float(record.get("estimatedEPS") or record.get("estimated_eps"))
+        report_date = _parse_date(record.get("reportedDate") or record.get("reported_date"))
+        if report_date is None:
+            report_date = _parse_date(record.get("fiscalDateEnding") or record.get("fiscal_date_ending"))
+        if report_date is not None:
+            result[f"q{q_num}_report_date"] = report_date.isoformat()
+    return {
+        key: value
+        for key, value in result.items()
+        if value not in (None, "")
+    }
+
+
 class AlphaVantageClient:
     def __init__(
         self,
@@ -254,6 +293,7 @@ class AlphaVantageClient:
         self.sleep_seconds = max(0.0, float(sleep_seconds))
         self.calls_made = 0
         self._cache: dict[str, AlphaVantageConfirmation] = {}
+        self._earnings_history_cache: dict[str, dict[str, Any]] = {}
 
     def fetch_earnings_estimates(self, ticker: str) -> AlphaVantageConfirmation:
         ticker = _clean_text(ticker).upper()
@@ -374,3 +414,64 @@ class AlphaVantageClient:
         )
         self._cache[ticker] = result
         return result
+
+    def fetch_earnings_history(self, ticker: str) -> dict[str, Any]:
+        ticker = _clean_text(ticker).upper()
+        cached = self._earnings_history_cache.get(ticker)
+        if cached is not None:
+            return dict(cached)
+
+        if not self.api_key or self.calls_made >= self.max_calls:
+            self._earnings_history_cache[ticker] = {}
+            return {}
+
+        params = {
+            "function": "EARNINGS",
+            "symbol": ticker,
+            "apikey": self.api_key,
+        }
+
+        for attempt in range(self.retry_limit + 1):
+            try:
+                self.calls_made += 1
+                response = self.session.get(
+                    BASE_URL,
+                    params=params,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except requests.Timeout:
+                if attempt >= self.retry_limit:
+                    break
+                if self.sleep_seconds:
+                    time.sleep(self.sleep_seconds)
+                continue
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Alpha Vantage earnings history request failed for %s: %s",
+                    ticker,
+                    exc.__class__.__name__,
+                )
+                if attempt >= self.retry_limit:
+                    break
+                if self.sleep_seconds:
+                    time.sleep(self.sleep_seconds)
+                continue
+            except ValueError:
+                break
+
+            if not isinstance(payload, dict):
+                break
+            if payload.get("Note") or payload.get("Information") or payload.get("Error Message"):
+                self._earnings_history_cache[ticker] = {}
+                return {}
+
+            result = parse_earnings_history(payload)
+            self._earnings_history_cache[ticker] = result
+            if self.sleep_seconds:
+                time.sleep(self.sleep_seconds)
+            return dict(result)
+
+        self._earnings_history_cache[ticker] = {}
+        return {}

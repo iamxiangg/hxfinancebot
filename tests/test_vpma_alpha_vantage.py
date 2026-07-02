@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 import requests
 
-from scanners.vpma.alpha_vantage import AlphaVantageClient, parse_earnings_estimates
+from scanners.vpma.alpha_vantage import (
+    AlphaVantageClient,
+    parse_earnings_estimates,
+    parse_earnings_history,
+)
 
 
 class _MockResponse:
@@ -73,6 +77,31 @@ class AlphaVantageTests(unittest.TestCase):
         result = parse_earnings_estimates("AAPL", {"quarterlyEstimates": [{"fiscalDateEnding": "2026-09-30"}]})
         self.assertEqual(result.status, "ENRICHED")
         self.assertIsNone(result.confirmation_score)
+
+    def test_parse_earnings_history_maps_latest_quarters(self) -> None:
+        payload = {
+            "quarterlyEarnings": [
+                {
+                    "reportedDate": "2026-06-30",
+                    "reportedEPS": "1.25",
+                    "estimatedEPS": "1.10",
+                },
+                {
+                    "reportedDate": "2026-03-31",
+                    "reportedEPS": "1.05",
+                    "estimatedEPS": "0.95",
+                },
+            ]
+        }
+
+        result = parse_earnings_history(payload)
+
+        self.assertEqual(result["q1_reported"], 1.25)
+        self.assertEqual(result["q1_estimated"], 1.10)
+        self.assertEqual(result["q1_report_date"], "2026-06-30")
+        self.assertEqual(result["q2_reported"], 1.05)
+        self.assertEqual(result["q2_estimated"], 0.95)
+        self.assertEqual(result["q2_report_date"], "2026-03-31")
 
     def test_quota_and_api_error_responses(self) -> None:
         quota_client = AlphaVantageClient(

@@ -8,6 +8,7 @@ Collects all raw inputs needed for F01–S03 scoring from:
 """
 
 import logging
+import os
 import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -28,6 +29,8 @@ _SEC_DILUTED_EPS_CONCEPTS = (
 )
 _SPY_PRICE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _SPY_PRICE_CACHE_LOCK = threading.Lock()
+_ALPHA_VANTAGE_CLIENT_LOCK = threading.Lock()
+_FEROLDI_ALPHA_VANTAGE_CLIENT = None
 
 
 def _now_iso() -> str:
@@ -41,6 +44,57 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _earnings_quarters_available(values: dict[str, Any]) -> int:
+    return sum(
+        1
+        for idx in range(1, 5)
+        if values.get(f"q{idx}_reported") is not None and values.get(f"q{idx}_estimated") is not None
+    )
+
+
+def _get_feroldi_alpha_vantage_client():
+    global _FEROLDI_ALPHA_VANTAGE_CLIENT
+    if _FEROLDI_ALPHA_VANTAGE_CLIENT is not None:
+        return _FEROLDI_ALPHA_VANTAGE_CLIENT
+
+    from scanners.vpma.alpha_vantage import AlphaVantageClient
+
+    max_calls_raw = os.getenv("FEROLDI_ALPHA_VANTAGE_MAX_CALLS", "5")
+    sleep_raw = os.getenv("FEROLDI_ALPHA_VANTAGE_SLEEP_SECONDS", "12")
+    try:
+        max_calls = max(0, int(float(max_calls_raw)))
+    except (TypeError, ValueError):
+        max_calls = 5
+    try:
+        sleep_seconds = max(0.0, float(sleep_raw))
+    except (TypeError, ValueError):
+        sleep_seconds = 12.0
+
+    _FEROLDI_ALPHA_VANTAGE_CLIENT = AlphaVantageClient(
+        max_calls=max_calls,
+        sleep_seconds=sleep_seconds,
+        retry_limit=0,
+    )
+    return _FEROLDI_ALPHA_VANTAGE_CLIENT
+
+
+def _fetch_alpha_vantage_earnings_surprise(ticker: str) -> dict[str, Any]:
+    try:
+        with _ALPHA_VANTAGE_CLIENT_LOCK:
+            client = _get_feroldi_alpha_vantage_client()
+            values = client.fetch_earnings_history(ticker)
+        if values:
+            logger.info(
+                "Alpha Vantage earnings fallback for %s: %d quarters collected",
+                ticker,
+                _earnings_quarters_available(values),
+            )
+        return values
+    except Exception as exc:
+        logger.debug("Alpha Vantage earnings fallback unavailable for %s: %s", ticker, exc.__class__.__name__)
+        return {}
 
 
 def _coalesce(*values: Any) -> Any:
@@ -345,6 +399,12 @@ def collect_earnings_surprise(ticker: str, *, yf_ticker: Any | None = None) -> d
         logger.debug("Earnings surprise unavailable for %s: %s", ticker, exc)
     except Exception as exc:
         logger.warning("Earnings surprise for %s failed: %s", ticker, exc.__class__.__name__)
+
+    if _earnings_quarters_available(result) < 4:
+        fallback = _fetch_alpha_vantage_earnings_surprise(ticker)
+        for key, value in fallback.items():
+            if result.get(key) in (None, "") and value not in (None, ""):
+                result[key] = value
 
     logger.info("Earnings surprise for %s: %d quarters collected", ticker, len(result) // 3)
     return result
