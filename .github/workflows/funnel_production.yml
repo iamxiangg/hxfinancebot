@@ -58,6 +58,7 @@ name: Funnel - Production
 
 permissions:
   contents: read
+  actions: read
 
 # Prevents production, pilot and promotion workflows
 # from writing to the Google Sheet simultaneously.
@@ -98,6 +99,22 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest discover -s tests -v
+
+      # Restore the previous production run's SEC disk cache so today's run
+      # starts warm. Uses `actions/cache/restore@v4` (split sub-action) so we
+      # can override the post-step failure behaviour independently below.
+      # ``restore-keys`` prefix-matches the most-recent cache saved under any
+      # ``sec-cache-prod-*`` key, so a missed/missed-evicted primary key still
+      # falls back to the latest production cache (covers weekend gaps and
+      # eviction). The cache save step later is ``if: always()`` so this
+      # restore continues to work even after a failed job.
+      - name: Restore SEC cache
+        uses: actions/cache/restore@v4
+        with:
+          path: funnel_output/sec_cache
+          key: sec-cache-prod-${{ github.run_id }}
+          restore-keys: |
+            sec-cache-prod-
 
       - name: Resolve scheduled or manual settings
         env:
@@ -171,6 +188,10 @@ jobs:
           TELEGRAM_MAX_ATTEMPTS: "3"
           TELEGRAM_TIMEOUT_SECONDS: "30"
           SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+          # SEC EDGAR fair-access allows up to 10 req/sec per IP. We bump the
+          # default 5 to 9 (below the published max) so TCP clock drift cannot
+          # land two requests in the same SEC ingress window and trigger a 403.
+          SEC_MAX_REQUESTS_PER_SECOND: "9"
           FUNNEL_OUTPUT_DIR: funnel_output
           PYTHONUNBUFFERED: "1"
 
@@ -315,6 +336,18 @@ jobs:
               "Telegram failure alert sent."
           )
           PY
+
+      # Save the SEC disk cache as a final, separate step so it persists even
+      # on job failure (``if: always()``) AND so future runs (incl. the 12:00
+      # UTC Review run on the same day) can pick it up as a warm cache via
+      # ``actions/cache/restore@v4``. ``upload-artifact`` below retains a
+      # separate, broader funnel dump for human inspection at 30-day retention.
+      - name: Save SEC cache
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
+        with:
+          path: funnel_output/sec_cache
+          key: sec-cache-prod-${{ github.run_id }}
 
       - name: Upload production artefacts
         if: ${{ always() }}
