@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -67,12 +68,13 @@ from providers.sec.official import OfficialSECProvider
 # surface the network-vs-cache delta cleanly without bloating the run time.
 DAYS_IN_SCAN = 7
 
-# SEC EDGAR fair-access: published max is 10 req/sec/IP. Production workflow
-# bumps the default 5 to 9 (just below the ceiling) so TCP clock drift cannot
-# collapse two requests into the same SEC ingress window. The benchmark keeps
-# SEC's exact env name so the workflow default and the bench pass through the
-# same throttle semantics whenever the value is wired in for real.
-SEC_MAX_REQUESTS_PER_SECOND_DEFAULT = 9
+# Production wires ``SEC_MAX_REQUESTS_PER_SECOND=9`` via workflow env var
+# (was the provider default of 5; bumped to 9 -- one unit below SEC EDGAR's
+# published 10 req/sec/IP ceiling -- so TCP clock drift cannot collapse two
+# requests into the same SEC ingress window and trigger a 403). The bench
+# does NOT use that production value directly because the throttle sleep
+# would otherwise dominate cold-pass wall-clock and the benchmark would
+# report a meaningless ratio. See ``SEC_RATE_LIMIT_FOR_BENCH`` below.
 
 # Benchmark-only knob: pin the throttle high so the cold / warm wall-clock
 # ratio is dominated by simulated SEC latency (or by ``time.sleep`` mock
@@ -227,8 +229,6 @@ def _force_expire_cache(root: Path) -> int:
     shard filter keeps us from silently clobbering it. This is ``*_``-safe
     against the existing ``cache_root`` convention without breaking it.
     """
-    import re  # local import keeps top of module clean
-
     shard_pattern = re.compile(r"^[0-9a-f]{2}$")
     expired_iso = _dt.datetime(2000, 1, 1, tzinfo=_dt.UTC).isoformat()
     touched = 0
