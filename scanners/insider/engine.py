@@ -309,18 +309,22 @@ def _median_dollar_volume(ticker: str) -> tuple[float | None, float | None, list
     if history is None or history.empty or "Close" not in history or "Volume" not in history:
         return None, None, ["market_data_unavailable"]
     # ``yfinance`` can return a multi-column DataFrame for certain tickers
-    # (e.g. when the exchange broadcasts via a fund wrapper).  ``iloc[-1]``
-    # then produces a ``Series`` rather than a scalar, and ``float(Series)``
-    # raises ``TypeError``.  ``.squeeze()`` safely reduces either a 1-element
-    # ``Series`` or a (1,1)-shaped ``DataFrame`` down to a Python scalar.
-    current_price = float(history["Close"].iloc[-1].squeeze())
-    series = (history["Close"] * history["Volume"]).tail(30)
+    # (e.g. when the exchange broadcasts via a fund wrapper with MultiIndex
+    # columns).  ``.squeeze()`` is a no-op on multi-element Series, so we
+    # explicitly take the first column (``.iloc[:, 0]``) when the data is a
+    # DataFrame rather than a simple Series.  After this reduction, ``.iloc[-1]``
+    # and ``.median()`` both produce scalars that ``float()`` can consume.
+    close_data = history["Close"]
+    if hasattr(close_data, "columns"):
+        close_data = close_data.iloc[:, 0]
+    current_price = float(close_data.iloc[-1])
+    volume_data = history["Volume"]
+    if hasattr(volume_data, "columns"):
+        volume_data = volume_data.iloc[:, 0]
+    series = (close_data * volume_data).tail(30)
     if series.empty:
         return current_price, None, ["market_data_unavailable"]
-    # ``series.median()`` can also return a ``Series`` (one median per column)
-    # when ``history["Close"] * history["Volume"]`` is a multi-column
-    # ``DataFrame`` rather than a single-column ``Series``.  Guard identically.
-    return current_price, float(series.median().squeeze()), risk_flags
+    return current_price, float(series.median()), risk_flags
 
 
 def owner_role(owner: ReportingOwner) -> str:
