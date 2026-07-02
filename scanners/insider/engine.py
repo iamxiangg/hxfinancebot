@@ -308,11 +308,19 @@ def _median_dollar_volume(ticker: str) -> tuple[float | None, float | None, list
         return None, None, ["market_data_unavailable"]
     if history is None or history.empty or "Close" not in history or "Volume" not in history:
         return None, None, ["market_data_unavailable"]
-    current_price = float(history["Close"].iloc[-1])
+    # ``yfinance`` can return a multi-column DataFrame for certain tickers
+    # (e.g. when the exchange broadcasts via a fund wrapper).  ``iloc[-1]``
+    # then produces a ``Series`` rather than a scalar, and ``float(Series)``
+    # raises ``TypeError``.  ``.squeeze()`` safely reduces either a 1-element
+    # ``Series`` or a (1,1)-shaped ``DataFrame`` down to a Python scalar.
+    current_price = float(history["Close"].iloc[-1].squeeze())
     series = (history["Close"] * history["Volume"]).tail(30)
     if series.empty:
         return current_price, None, ["market_data_unavailable"]
-    return current_price, float(series.median()), risk_flags
+    # ``series.median()`` can also return a ``Series`` (one median per column)
+    # when ``history["Close"] * history["Volume"]`` is a multi-column
+    # ``DataFrame`` rather than a single-column ``Series``.  Guard identically.
+    return current_price, float(series.median().squeeze()), risk_flags
 
 
 def owner_role(owner: ReportingOwner) -> str:
