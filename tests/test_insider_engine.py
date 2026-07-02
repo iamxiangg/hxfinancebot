@@ -761,6 +761,18 @@ class MedianDollarVolumeRegressionTests(unittest.TestCase):
         self.assertIsNone(mdv)
         self.assertIn("market_data_unavailable", flags)
 
+    def test_placeholder_symbol_skips_yahoo_call(self) -> None:
+        from scanners.insider.engine import _median_dollar_volume
+
+        with patch("yfinance.download") as mock_download:
+            price, mdv, flags = _median_dollar_volume("NONE")
+
+        self.assertIsNone(price)
+        self.assertIsNone(mdv)
+        self.assertIn("market_data_unavailable", flags)
+        self.assertIn("invalid_ticker_symbol", flags)
+        mock_download.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -144,6 +144,8 @@ class VpmaConfig:
 class YfinanceVpmaDataSource:
     def __init__(self, *, session: requests.Session | None = None) -> None:
         self.session = session
+        self._earnings_dates_cache: dict[str, pd.DataFrame] = {}
+        self._next_earnings_cache: dict[str, date | None] = {}
 
     def download_histories(
         self,
@@ -194,6 +196,12 @@ class YfinanceVpmaDataSource:
         return history.dropna(how="all").copy()
 
     def earnings_dates(self, ticker: str) -> pd.DataFrame:
+        cached = self._earnings_dates_cache.get(ticker)
+        if cached is not None:
+            try:
+                return cached.copy()
+            except Exception:
+                return pd.DataFrame()
         # Both ``get_earnings_dates`` and the lazy ``earnings_dates`` property
         # in yfinance can raise ``KeyError`` (and related lookup errors) for
         # tickers that lack a usable earnings calendar on Yahoo's side. The
@@ -216,13 +224,25 @@ class YfinanceVpmaDataSource:
             except Exception:
                 return pd.DataFrame()
         if frame is None or isinstance(frame, list):
+            self._earnings_dates_cache[ticker] = pd.DataFrame()
             return pd.DataFrame()
         try:
-            return frame.copy()
+            copied = frame.copy()
+            self._earnings_dates_cache[ticker] = copied
+            return copied.copy()
         except Exception:
+            self._earnings_dates_cache[ticker] = pd.DataFrame()
             return pd.DataFrame()
 
     def next_earnings_date(self, ticker: str) -> date | None:
+        if ticker in self._next_earnings_cache:
+            return self._next_earnings_cache[ticker]
+
+        derived = _next_future_earnings_date(self.earnings_dates(ticker))
+        if derived is not None:
+            self._next_earnings_cache[ticker] = derived
+            return derived
+
         yf_ticker = yf.Ticker(ticker, session=self.session)
         try:
             calendar = yahoo_call(
@@ -232,6 +252,7 @@ class YfinanceVpmaDataSource:
         except Exception:
             calendar = None
         if calendar is None:
+            self._next_earnings_cache[ticker] = None
             return None
         if isinstance(calendar, pd.DataFrame) and "Earnings Date" in calendar.index:
             value = calendar.loc["Earnings Date"].iloc[0]
@@ -244,11 +265,17 @@ class YfinanceVpmaDataSource:
         if isinstance(value, (list, tuple)) and value:
             value = value[0]
         if isinstance(value, pd.Timestamp):
-            return value.date()
+            result = value.date()
+            self._next_earnings_cache[ticker] = result
+            return result
         if isinstance(value, datetime):
-            return value.date()
+            result = value.date()
+            self._next_earnings_cache[ticker] = result
+            return result
         if isinstance(value, date):
+            self._next_earnings_cache[ticker] = value
             return value
+        self._next_earnings_cache[ticker] = None
         return None
 
 
@@ -273,6 +300,15 @@ def _env_float(name: str, default: float) -> float:
 
 def _now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _next_future_earnings_date(frame: pd.DataFrame, *, today: date | None = None) -> date | None:
+    if frame is None or frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return None
+    cutoff = today or datetime.now(UTC).date()
+    normalized = frame.index.tz_localize(None) if frame.index.tz is not None else frame.index
+    future_dates = sorted({timestamp.date() for timestamp in normalized if timestamp.date() >= cutoff})
+    return future_dates[0] if future_dates else None
 
 
 def normalise_universe_ticker(value: Any) -> str:

@@ -283,6 +283,15 @@ def _today() -> date:
     return datetime.now(UTC).date()
 
 
+def _yahoo_symbol_usable(ticker: str) -> bool:
+    clean = str(ticker or "").strip().upper()
+    if not clean:
+        return False
+    if clean in {"NONE", "NULL", "N/A", "NA", "UNKNOWN", "--"}:
+        return False
+    return True
+
+
 def _ny_business_dates_before(reference: datetime, count: int) -> list[date]:
     """Yield up to `count` US business days (Mon-Fri) before `reference` in Eastern time.
 
@@ -301,6 +310,8 @@ def _ny_business_dates_before(reference: datetime, count: int) -> list[date]:
 
 def _median_dollar_volume(ticker: str) -> tuple[float | None, float | None, list[str]]:
     risk_flags: list[str] = []
+    if not _yahoo_symbol_usable(ticker):
+        return None, None, ["market_data_unavailable", "invalid_ticker_symbol"]
     try:
         history = yahoo_download(ticker, period="6mo", auto_adjust=True, progress=False, threads=False)
     except Exception:

@@ -476,6 +476,29 @@ class YfinanceVpmaDataSourceErrorPathsTests(unittest.TestCase):
         self.assertIsInstance(result, pd.DataFrame)
         self.assertEqual(len(result), 1)
 
+    def test_next_earnings_date_reuses_cached_earnings_frame_before_calendar(self) -> None:
+        frame = pd.DataFrame(
+            {"EPS Estimate": [1.5, 1.7]},
+            index=[
+                pd.Timestamp("2026-06-15 16:30:00"),
+                pd.Timestamp("2099-06-30 16:30:00"),
+            ],
+        )
+
+        class _TickerWithFailingCalendar:
+            def get_earnings_dates(self, limit: int = 8) -> pd.DataFrame:  # noqa: ARG002
+                return frame
+
+            @property
+            def calendar(self) -> pd.DataFrame:
+                raise AssertionError("calendar should not be called when a future earnings date exists")
+
+        ds = YfinanceVpmaDataSource()
+        with patch("scanners.vpma.engine.yf.Ticker", return_value=_TickerWithFailingCalendar()):
+            next_date = ds.next_earnings_date("TEAM")
+
+        self.assertEqual(next_date, date(2099, 6, 30))
+
 
 class TzAwareTradingIndexInExtractEventTests(unittest.TestCase):
     """``yf.download`` returns a tz-aware ``DatetimeIndex`` for US session
