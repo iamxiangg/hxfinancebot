@@ -470,6 +470,10 @@ def add_optional_ai_drafts(
         # is acceptable, but wiping out the BTD_Candidates upsert that runs
         # later in ``run()`` is not.
         logger.exception("Failed to write Feroldi_AI_Drafts rows: %r", exc)
+    except OSError as exc:
+        # Same best-effort treatment for SSL drops and other OS-level
+        # transport errors (ssl.SSLEOFError is an OSError subclass).
+        logger.exception("Failed to write Feroldi_AI_Drafts rows (OS error): %r", exc)
     return updated
 
 
@@ -744,19 +748,35 @@ def run() -> None:
             SIGNAL_LOG_HEADERS,
             signal_log_rows(signals, run_id, now),
         )
-    except (_TRANSIENT_SHEETS_ERRORS, OSError) as exc:
+    except _TRANSIENT_SHEETS_ERRORS as exc:
         logger.warning("Signal log write failed (network transient); continuing: %r", exc)
+    except OSError as exc:
+        logger.warning("Signal log write failed (OS error); continuing: %r", exc)
 
-    master_records = get_stock_summary_ticker_records(service=service)
+    try:
+        master_records = get_stock_summary_ticker_records(service=service)
+    except _TRANSIENT_SHEETS_ERRORS as exc:
+        logger.exception("Failed to read Stock Summary (network transient): %r", exc)
+        raise RuntimeError("Stock Summary read failed due to transient network error") from exc
+    except OSError as exc:
+        logger.exception("Failed to read Stock Summary (OS error): %r", exc)
+        raise RuntimeError("Stock Summary read failed due to transient network error") from exc
     comparison = classify_signals(signals, master_records)
     pending = get_pending_new_ticker_records(comparison)
 
-    existing_candidates = read_table(
-        service,
-        spreadsheet_id,
-        BTD_CANDIDATES_SHEET,
-        BTD_CANDIDATE_HEADERS,
-    )
+    try:
+        existing_candidates = read_table(
+            service,
+            spreadsheet_id,
+            BTD_CANDIDATES_SHEET,
+            BTD_CANDIDATE_HEADERS,
+        )
+    except _TRANSIENT_SHEETS_ERRORS as exc:
+        logger.exception("Failed to read BTD_Candidates sheet (network transient): %r", exc)
+        raise RuntimeError("BTD_Candidates read failed due to transient network error") from exc
+    except OSError as exc:
+        logger.exception("Failed to read BTD_Candidates sheet (OS error): %r", exc)
+        raise RuntimeError("BTD_Candidates read failed due to transient network error") from exc
     existing_by_id = _candidate_index(existing_candidates)
 
     # Capture per-row fingerprints now so we can detect any parallel writer
@@ -865,15 +885,23 @@ def run() -> None:
         )
         return
 
-    upsert_records(
-        service,
-        spreadsheet_id,
-        BTD_CANDIDATES_SHEET,
-        BTD_CANDIDATE_HEADERS,
-        "Candidate ID",
-        candidates,
-    )
-    logger.info("Updated %d candidate rows.", len(candidates))
+    # Best-effort final write; losing one cycle's BTD_Candidates upsert after
+    # the signal log has already been persisted is acceptable. A transient SSL
+    # drop on the GitHub runner should not crash the entire ``run()`` here.
+    try:
+        upsert_records(
+            service,
+            spreadsheet_id,
+            BTD_CANDIDATES_SHEET,
+            BTD_CANDIDATE_HEADERS,
+            "Candidate ID",
+            candidates,
+        )
+        logger.info("Updated %d candidate rows.", len(candidates))
+    except _TRANSIENT_SHEETS_ERRORS as exc:
+        logger.warning("BTD_Candidates upsert failed (network transient); continuing: %r", exc)
+    except OSError as exc:
+        logger.warning("BTD_Candidates upsert failed (OS error); continuing: %r", exc)
 
 
 if __name__ == "__main__":
