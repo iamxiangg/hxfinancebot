@@ -57,6 +57,29 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
 
+    def test_telegram_sends_grouped_summary_without_material_change(self) -> None:
+        scan_result = _scan_result()
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {
+                "VP_AVWAP_DRY_RUN": "false",
+                "VP_AVWAP_WRITE_SHEETS": "false",
+                "VP_AVWAP_SEND_TELEGRAM": "true",
+                "VP_AVWAP_OUTPUT_DIR": tmpdir,
+            },
+            clear=False,
+        ), patch("tactical.vp_avwap_runner.get_stock_summary_ticker_records", return_value=[{"ticker": "AAA"}]), patch(
+            "tactical.vp_avwap_runner.run_vp_avwap_scan",
+            return_value=scan_result,
+        ), patch("tactical.vp_avwap_runner.send_telegram_text", return_value=True) as mock_send:
+            code = main()
+
+        self.assertEqual(code, 0)
+        mock_send.assert_called_once()
+        message = mock_send.call_args.args[0]
+        self.assertIn("VP/AVWAP TECHNICAL TIERS", message)
+        self.assertIn("AAA - TECHNICAL TIER 1", message)
+
     def test_invalid_configuration_returns_non_zero(self) -> None:
         with patch.dict(
             os.environ,

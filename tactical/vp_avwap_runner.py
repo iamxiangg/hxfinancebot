@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from funnel.sheet_reader import get_stock_summary_ticker_records
@@ -14,15 +15,20 @@ from tactical.earnings_telegram import send_telegram_text
 logger = logging.getLogger(__name__)
 
 
-def _material_telegram_message(scan_result) -> str | None:
+def _material_telegram_message(scan_result) -> str:
     changed = [
         result
         for result in scan_result.results
         if result.tier_change in {"IMPROVED", "DETERIORATED"} or result.preferred_route.status == "CONFIRMED"
     ]
-    if not changed:
-        return None
-    lines = [format_grouped_report(scan_result), ""]
+    lines = [format_grouped_report(scan_result)]
+    if changed:
+        lines.extend(["", "Material changes", ""])
+        for result in changed:
+            change_label = result.tier_change or result.preferred_route.status
+            lines.append(
+                f"{result.ticker} - {change_label} - Tier {result.final_tier} - {result.preferred_route.route_label}"
+            )
     tier_one = [result for result in scan_result.results if result.final_tier == 1]
     for result in tier_one:
         lines.extend(["", format_detailed_entry_map(result)])
@@ -68,17 +74,22 @@ def main() -> int:
 
     if config.send_telegram and not config.dry_run:
         try:
+            logger.info(
+                "VP/AVWAP Telegram enabled: test_mode=%s token_present=%s chat_id_present=%s",
+                config.telegram_test_mode,
+                bool(str(os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()),
+                bool(str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()),
+            )
             message = _material_telegram_message(scan_result)
-            if config.telegram_test_mode and message is None:
-                message = format_grouped_report(scan_result)
-            if message:
-                sent = send_telegram_text(message)
-                if not sent:
-                    logger.error("VP/AVWAP Telegram delivery failed.")
-            else:
-                logger.info("VP/AVWAP Telegram skipped; nothing material changed.")
+            if config.telegram_test_mode:
+                message = "\n".join(["VP/AVWAP TELEGRAM TEST MODE", "", message]).strip()
+            sent = send_telegram_text(message)
+            if not sent:
+                logger.error("VP/AVWAP Telegram delivery failed.")
         except Exception as exc:
             logger.error("VP/AVWAP Telegram send failed: %s", exc)
+    elif not config.dry_run:
+        logger.info("VP/AVWAP Telegram disabled; set VP_AVWAP_SEND_TELEGRAM=true to send notifications.")
 
     logger.info(
         "VP/AVWAP scan complete: processed=%d output_dir=%s",

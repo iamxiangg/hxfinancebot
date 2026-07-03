@@ -205,7 +205,7 @@ Telegram delivery is optional and controlled by:
 - `VP_AVWAP_SEND_TELEGRAM`
 - `VP_AVWAP_TELEGRAM_TEST_MODE`
 
-When enabled, the runner sends the grouped tier summary, detailed Tier 1 setups, and material changes such as improved tiers or confirmed routes. Telegram failure never blocks artefact generation or other ticker processing.
+When enabled, the runner sends the grouped tier summary on every non-dry run. Tier 1 setups are appended in detail, and material changes such as improved tiers or confirmed routes are highlighted when present. Telegram failure never blocks artefact generation or other ticker processing.
 
 ## Environment Variables
 
@@ -264,6 +264,16 @@ Schedule:
 - `23:30 UTC` Monday to Friday
 
 GitHub Actions cron uses UTC.
+
+For Telegram delivery from GitHub Actions, set these repository secrets:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+The workflow now defaults `VP_AVWAP_SEND_TELEGRAM` to `true`. You can override behavior with repository variables:
+
+- `VP_AVWAP_SEND_TELEGRAM`
+- `VP_AVWAP_TELEGRAM_TEST_MODE`
 
 ## Limitations
 
