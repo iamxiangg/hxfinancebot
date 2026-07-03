@@ -1,0 +1,54 @@
+name: VP/AVWAP Technical Tiers
+
+"on":
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron uses UTC.
+    - cron: "30 23 * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  vp-avwap-tiers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run VP/AVWAP tier scanner
+        env:
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VP_AVWAP_WRITE_SHEETS: "true"
+          VP_AVWAP_SEND_TELEGRAM: ${{ vars.VP_AVWAP_SEND_TELEGRAM || 'false' }}
+          VP_AVWAP_TELEGRAM_TEST_MODE: "false"
+          VP_AVWAP_OUTPUT_DIR: funnel_output/vp_avwap
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python -m tactical.vp_avwap_runner
+
+      - name: Upload VP/AVWAP artefacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vp-avwap-output
+          path: funnel_output/vp_avwap
+          if-no-files-found: warn

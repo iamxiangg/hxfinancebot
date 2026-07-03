@@ -60,6 +60,7 @@ Each scanner under `scanners/` is a self-contained engine with no GitHub Actions
 | **Congress** | Political disclosure trades (House/Senate) | `scanners/congress/engine.py` |
 | **Insider** | SEC Form 4 open-market insider purchases | `scanners/insider/engine.py` |
 | **VPMA** | Post-earnings-announcement drift (PEAD) setups | `scanners/vpma/engine.py` |
+| **VP/AVWAP** | Earnings-anchored volume-profile and AVWAP entry tiers | `scanners/vp_avwap/engine.py` |
 | **Earnings** | Short-volatility earnings plays | `scanners/earnings/engine.py` |
 | **Fundamental Inflection** | Revenue/earnings growth inflection points | `scanners/fundamental_inflection/engine.py` |
 | **Entity Master** | Canonical entity resolution (CIK-based) | `scanners/entity_master/engine.py` |
@@ -221,7 +222,29 @@ python tactical/congress_runner.py
 
 # Earnings scanner
 python tactical/earnings_runner.py
+
+# VP/AVWAP technical tier scanner
+VP_AVWAP_TEST_TICKERS="INTC,NVDA,AMD,DDOG" \
+VP_AVWAP_DRY_RUN=true \
+VP_AVWAP_WRITE_SHEETS=false \
+python -m tactical.vp_avwap_runner
 ```
+
+### VP/AVWAP technical tiers
+
+The VP/AVWAP scanner reads the monitored universe from `Stock Summary USD`, calculates earnings-anchored volume-profile and AVWAP levels, and writes only `VP_AVWAP_Tiers` and `VP_AVWAP_Entry_Map`.
+
+Production-style run:
+
+```bash
+VP_AVWAP_WRITE_SHEETS=true python -m tactical.vp_avwap_runner
+```
+
+Local artefacts are written under `funnel_output/vp_avwap/`.
+
+Detailed documentation:
+
+- `docs/vp_avwap_tier_scanner.md`
 
 ### Run tests
 
