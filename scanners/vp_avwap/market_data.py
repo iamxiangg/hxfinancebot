@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, time, timedelta
-import math
 
 import pandas as pd
 import yfinance as yf
@@ -172,7 +171,8 @@ def request_exceeds_intraday_retention(
     max_days = retention_days if retention_days is not None else intraday_retention_days(interval)
     if max_days is None:
         return False
-    requested_days = (end - start).total_seconds() / 86_400.0
-    if not math.isfinite(requested_days):
-        return True
+    # Yahoo receives date-only boundaries below, so compare those same calendar
+    # dates. This also supports the normal mixed input: a naive exchange-session
+    # start and a UTC-aware scan timestamp end.
+    requested_days = (end.date() - start.date()).days
     return requested_days > max_days

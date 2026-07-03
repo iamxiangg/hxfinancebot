@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -60,10 +60,26 @@ class MarketDataTests(unittest.TestCase):
             )
         )
 
+    def test_retention_helper_accepts_mixed_naive_and_aware_datetimes(self) -> None:
+        self.assertTrue(
+            request_exceeds_intraday_retention(
+                interval="30m",
+                start=datetime(2026, 4, 21),
+                end=datetime(2026, 7, 4, tzinfo=UTC),
+            )
+        )
+        self.assertFalse(
+            request_exceeds_intraday_retention(
+                interval="30m",
+                start=datetime(2026, 6, 1),
+                end=datetime(2026, 7, 4, tzinfo=UTC),
+            )
+        )
+
     def test_datasource_skips_unsupported_intraday_download_before_yahoo_call(self) -> None:
         source = VpAvwapYahooDataSource(config=_config())
         start = datetime(2026, 4, 21)
-        end = datetime(2026, 7, 4)
+        end = datetime(2026, 7, 4, tzinfo=UTC)
 
         with patch("scanners.vp_avwap.market_data.yahoo_download") as mocked_download:
             frame = source.intraday_history("TSLA", interval="30m", start=start, end=end)
