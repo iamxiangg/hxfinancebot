@@ -72,6 +72,9 @@ def _choose_profile_bars(
         skip_reason = data_source.intraday_skip_reason(ticker, interval=interval, start=start, end=end)
         if skip_reason:
             warnings.append(skip_reason)
+        if intraday.empty:
+            warnings.append(f"{interval} coverage incomplete from {reaction_session.date().isoformat()}; falling back.")
+            continue
         intraday = intraday.loc[intraday.index >= reaction_session]
         if has_full_session_coverage(intraday, reaction_session=reaction_session, latest_completed_session=latest_completed_session):
             return intraday, interval, quality, warnings

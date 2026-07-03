@@ -32,13 +32,16 @@ class StubDataSource:
         )
 
     def earnings_dates(self, ticker: str) -> pd.DataFrame:
-        return pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp("2026-06-05 08:00"), pd.Timestamp("2026-05-01 16:05")]))
+        return pd.DataFrame(
+            {"surprise": [1.0, 1.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-06-05 08:00"), pd.Timestamp("2026-05-01 16:05")]),
+        )
 
     def intraday_history(self, ticker: str, *, interval: str, start: datetime, end: datetime) -> pd.DataFrame:  # noqa: ARG002
         key = (ticker, interval)
         self.intraday_calls[key] = self.intraday_calls.get(key, 0) + 1
         if interval == "30m":
-            index = pd.date_range("2026-06-05 10:00", periods=6, freq="4H")
+            index = pd.date_range("2026-06-05 10:00", periods=6, freq="4h")
         else:
             index = pd.date_range("2026-06-05 10:00", periods=6, freq="D")
         return pd.DataFrame(
@@ -51,6 +54,16 @@ class StubDataSource:
             },
             index=index,
         )
+
+    def intraday_skip_reason(self, ticker: str, *, interval: str, start: datetime, end: datetime) -> str | None:  # noqa: ARG002
+        return None
+
+
+class EmptyIntradayDataSource(StubDataSource):
+    def intraday_history(self, ticker: str, *, interval: str, start: datetime, end: datetime) -> pd.DataFrame:  # noqa: ARG002
+        key = (ticker, interval)
+        self.intraday_calls[key] = self.intraday_calls.get(key, 0) + 1
+        return pd.DataFrame()
 
 
 def _config() -> VpAvwapConfig:
@@ -81,6 +94,21 @@ def _config() -> VpAvwapConfig:
 
 
 class EngineTests(unittest.TestCase):
+    def test_empty_intraday_frames_fall_back_to_daily_bars(self) -> None:
+        source = EmptyIntradayDataSource()
+        result = run_vp_avwap_scan(
+            [{"ticker": "AAA"}],
+            config=_config(),
+            data_source=source,
+            observed_at="2026-07-03T23:30:00Z",
+        )
+
+        item = result.results[0]
+        self.assertEqual(item.status, "OK")
+        self.assertEqual(item.data_interval_used, "daily")
+        self.assertFalse(item.error)
+        self.assertEqual(source.intraday_calls, {("AAA", "30m"): 1, ("AAA", "60m"): 1})
+
     def test_duplicate_tickers_are_processed_once_and_sorted(self) -> None:
         source = StubDataSource()
         result = run_vp_avwap_scan(
