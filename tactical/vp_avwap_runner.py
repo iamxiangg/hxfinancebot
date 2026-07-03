@@ -5,7 +5,13 @@ import os
 from pathlib import Path
 
 from funnel.sheet_reader import get_stock_summary_ticker_records
-from funnel.vp_avwap_report import detailed_results, format_detailed_entry_map, format_grouped_report, write_local_artifacts
+from funnel.vp_avwap_report import (
+    detailed_results,
+    format_detailed_entry_map,
+    format_grouped_report,
+    format_telegram_report,
+    write_local_artifacts,
+)
 from funnel.vp_avwap_sheet_writer import apply_previous_tiers, read_previous_tiers, write_vp_avwap_sheets
 from scanners.vp_avwap.config import VpAvwapConfig
 from scanners.vp_avwap.engine import run_vp_avwap_scan
@@ -16,23 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def _material_telegram_message(scan_result) -> str:
-    changed = [
-        result
-        for result in scan_result.results
-        if result.tier_change in {"IMPROVED", "DETERIORATED"} or result.preferred_route.status == "CONFIRMED"
-    ]
-    lines = [format_grouped_report(scan_result)]
-    if changed:
-        lines.extend(["", "Material changes", ""])
-        for result in changed:
-            change_label = result.tier_change or result.preferred_route.status
-            lines.append(
-                f"{result.ticker} - {change_label} - Tier {result.final_tier} - {result.preferred_route.route_label}"
-            )
-    tier_one = [result for result in scan_result.results if result.final_tier == 1]
-    for result in tier_one:
-        lines.extend(["", format_detailed_entry_map(result)])
-    return "\n".join(lines).strip()
+    return format_telegram_report(scan_result)
 
 
 def main() -> int:

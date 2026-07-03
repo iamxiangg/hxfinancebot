@@ -17,9 +17,55 @@ TIER_LABELS = {
     4: "No valid entry",
 }
 
+SHORT_ROUTE_LABELS = {
+    "VAH_DEFENDED_PULLBACK": "VAH Pullback",
+    "POC_AVWAP_RECOVERY": "POC/AVWAP Recovery",
+    "BREAKOUT_RETEST": "Breakout Retest",
+    "VAL_RECLAIM": "VAL Reclaim",
+}
+
 
 def _money(value: float | None) -> str:
     return "N/A" if value is None else f"${value:,.2f}"
+
+
+def _price_range(low: float | None, high: float | None) -> str:
+    if low is None and high is None:
+        return "N/A"
+    if low is None:
+        return _money(high)
+    if high is None:
+        return _money(low)
+    if abs(low - high) < 1e-9:
+        return _money(low)
+    return f"{_money(low)}-{_money(high)}"
+
+
+def _short_reason(text: str) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return "N/A"
+    for marker in (". ", "."):
+        if marker in cleaned:
+            sentence = cleaned.split(marker, 1)[0].strip()
+            return sentence if sentence.endswith(".") else f"{sentence}."
+    return cleaned
+
+
+def _telegram_trigger(result: TickerAnalysis) -> str:
+    route = result.preferred_route
+    trigger = _money(route.entry_trigger_price)
+    if route.entry_trigger_price is None:
+        return route.entry_trigger_condition
+    if route.route_code == "BREAKOUT_RETEST":
+        return f"Close > {trigger} after retest"
+    if route.route_code == "VAL_RECLAIM":
+        return f"Daily close > {trigger} after reclaim"
+    if route.route_code == "POC_AVWAP_RECOVERY":
+        return f"Daily close > {trigger} after recovery"
+    if route.route_code == "VAH_DEFENDED_PULLBACK":
+        return f"Daily close > {trigger} after VAH test"
+    return route.entry_trigger_condition
 
 
 def _clean_json(value: Any) -> Any:
@@ -93,6 +139,20 @@ def format_detailed_entry_map(result: TickerAnalysis) -> str:
     return "\n".join(lines)
 
 
+def format_telegram_entry(result: TickerAnalysis) -> str:
+    route = result.preferred_route
+    lines = [
+        f"{result.ticker} | Tier {result.final_tier} | {route.status}",
+        f"Route: {SHORT_ROUTE_LABELS.get(route.route_code, route.route_label)}",
+        f"Price: {_money(result.current_price)} | Zone: {_price_range(route.zone_low, route.zone_high)}",
+        f"Alert: {_money(route.advance_alert_price)} | Stop: {_money(route.route_invalidation)}",
+        f"Trigger: {_telegram_trigger(result)}",
+        f"Support: {(route.next_support_name or 'None')} {_money(route.next_support_price)}",
+        f"Why: {_short_reason(result.technical_reason or route.reason)}",
+    ]
+    return "\n".join(lines)
+
+
 def detailed_results(scan_result: VpAvwapScanResult) -> list[TickerAnalysis]:
     tier_one = [result for result in scan_result.results if result.final_tier == 1]
     top_tier_two = [result for result in scan_result.results if result.final_tier == 2][:5]
@@ -106,6 +166,35 @@ def detailed_results(scan_result: VpAvwapScanResult) -> list[TickerAnalysis]:
         seen.add(result.ticker)
         ordered.append(result)
     return ordered
+
+
+def format_telegram_report(scan_result: VpAvwapScanResult) -> str:
+    lines = ["VP/AVWAP TECHNICAL TIERS", ""]
+    for tier in (1, 2, 3, 4):
+        group = [result.ticker for result in scan_result.results if result.final_tier == tier]
+        tickers = ", ".join(group) if group else "None"
+        suffix = f" ({len(group)})" if group else ""
+        lines.append(f"Tier {tier}{suffix}: {tickers}")
+
+    changed = [
+        result
+        for result in scan_result.results
+        if result.tier_change in {"IMPROVED", "DETERIORATED"} or result.preferred_route.status == "CONFIRMED"
+    ]
+    if changed:
+        lines.extend(["", "Changes"])
+        for result in changed:
+            change_label = result.tier_change if result.tier_change in {"IMPROVED", "DETERIORATED"} else result.preferred_route.status
+            lines.append(
+                f"{result.ticker} | {change_label} | Tier {result.final_tier} | {SHORT_ROUTE_LABELS.get(result.preferred_route.route_code, result.preferred_route.route_label)}"
+            )
+
+    details = detailed_results(scan_result)
+    if details:
+        lines.extend(["", "Setups"])
+        for result in details:
+            lines.extend(["", format_telegram_entry(result)])
+    return "\n".join(lines).strip()
 
 
 def write_local_artifacts(scan_result: VpAvwapScanResult, *, output_dir: Path) -> dict[str, Path]:

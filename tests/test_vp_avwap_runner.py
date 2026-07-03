@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from scanners.vp_avwap.models import VpAvwapScanResult
-from tactical.vp_avwap_runner import main
+from tactical.vp_avwap_runner import _material_telegram_message, main
 from tests.test_vp_avwap_sheet_writer import _scan_result
 
 
@@ -78,7 +78,23 @@ class RunnerTests(unittest.TestCase):
         mock_send.assert_called_once()
         message = mock_send.call_args.args[0]
         self.assertIn("VP/AVWAP TECHNICAL TIERS", message)
-        self.assertIn("AAA - TECHNICAL TIER 1", message)
+        self.assertIn("AAA | Tier 1 | APPROACHING", message)
+        self.assertIn("Route: VAH Pullback", message)
+        self.assertIn("Price: $101.00 | Zone: $99.00-$100.00", message)
+
+    def test_telegram_message_uses_compact_mobile_friendly_layout(self) -> None:
+        scan_result = _scan_result()
+        scan_result.results[0].preferred_route.zone_low = 99.0
+        scan_result.results[0].preferred_route.zone_high = 99.0
+        scan_result.results[0].preferred_route.status = "CONFIRMED"
+        message = _material_telegram_message(scan_result)
+
+        self.assertIn("Tier 1 (1): AAA", message)
+        self.assertIn("Changes", message)
+        self.assertIn("AAA | CONFIRMED | Tier 1 | VAH Pullback", message)
+        self.assertIn("Zone: $99.00", message)
+        self.assertIn("Trigger: Daily close > $100.00 after VAH test", message)
+        self.assertNotIn("AAA - TECHNICAL TIER 1", message)
 
     def test_invalid_configuration_returns_non_zero(self) -> None:
         with patch.dict(

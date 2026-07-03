@@ -205,7 +205,7 @@ Telegram delivery is optional and controlled by:
 - `VP_AVWAP_SEND_TELEGRAM`
 - `VP_AVWAP_TELEGRAM_TEST_MODE`
 
-When enabled, the runner sends the grouped tier summary on every non-dry run. Tier 1 setups are appended in detail, and material changes such as improved tiers or confirmed routes are highlighted when present. Telegram failure never blocks artefact generation or other ticker processing.
+When enabled, the runner sends a Telegram-specific mobile-friendly summary on every non-dry run. The message includes compact tier counts, material changes, and concise Tier 1 or otherwise notable setup blocks with price, zone, stop, trigger, support, and a short reason. Telegram failure never blocks artefact generation or other ticker processing.
 
 ## Environment Variables
 
