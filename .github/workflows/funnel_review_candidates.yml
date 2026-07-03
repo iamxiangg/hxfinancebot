@@ -17,7 +17,7 @@ name: Funnel - Review Candidates
       review_sources:
         description: Comma-separated sources to include
         required: false
-        default: "congress,vpma,insider,manual"
+        default: "congress"
       send_telegram_reviews:
         description: Send Telegram review cards
         required: true
@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
           echo "MIN_CONVICTION=${INPUT_MIN_CONVICTION:-15}" >> "$GITHUB_ENV"
           echo "BTD_ENRICH_LIMIT=${INPUT_BTD_ENRICH_LIMIT:-10}" >> "$GITHUB_ENV"
-          echo "REVIEW_SOURCES=${INPUT_REVIEW_SOURCES:-congress,vpma,insider,manual}" >> "$GITHUB_ENV"
+          echo "REVIEW_SOURCES=${INPUT_REVIEW_SOURCES:-congress}" >> "$GITHUB_ENV"
           echo "SEND_TELEGRAM_REVIEWS=${INPUT_SEND_TELEGRAM_REVIEWS:-true}" >> "$GITHUB_ENV"
           echo "FORCE_TELEGRAM_REVIEW_RESEND=${INPUT_RESEND_TELEGRAM_REVIEWS:-false}" >> "$GITHUB_ENV"
           echo "FEROLDI_GATE_MODE=${INPUT_FEROLDI_GATE_MODE:-observe}" >> "$GITHUB_ENV"
