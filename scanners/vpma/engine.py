@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import io
 import logging
 import math
@@ -51,6 +52,12 @@ COMMON_STOCK_EXCLUDE_TOKENS = (
 )
 
 ADR_ALLOW_TOKENS = ("adr",)
+_YFINANCE_NOISY_LOGGERS = (
+    "yfinance",
+    "yfinance.base",
+    "yfinance.scrapers.quote",
+    "yfinance.scrapers.history",
+)
 
 
 @dataclass(frozen=True)
@@ -211,16 +218,18 @@ class YfinanceVpmaDataSource:
         # condition into an ``unexpected_errors`` bucket at the scan step.
         yf_ticker = yf.Ticker(ticker, session=self.session)
         try:
-            frame = yahoo_call(
-                lambda: yf_ticker.get_earnings_dates(limit=8),
-                label=f"vpma-earnings-dates:{ticker}",
-            )
+            with _suppress_yfinance_calendar_noise():
+                frame = yahoo_call(
+                    lambda: yf_ticker.get_earnings_dates(limit=8),
+                    label=f"vpma-earnings-dates:{ticker}",
+                )
         except Exception:
             try:
-                frame = yahoo_call(
-                    lambda: getattr(yf_ticker, "earnings_dates", pd.DataFrame()),
-                    label=f"vpma-earnings-dates-fallback:{ticker}",
-                )
+                with _suppress_yfinance_calendar_noise():
+                    frame = yahoo_call(
+                        lambda: getattr(yf_ticker, "earnings_dates", pd.DataFrame()),
+                        label=f"vpma-earnings-dates-fallback:{ticker}",
+                    )
             except Exception:
                 return pd.DataFrame()
         if frame is None or isinstance(frame, list):
@@ -234,7 +243,7 @@ class YfinanceVpmaDataSource:
             self._earnings_dates_cache[ticker] = pd.DataFrame()
             return pd.DataFrame()
 
-    def next_earnings_date(self, ticker: str) -> date | None:
+    def next_earnings_date(self, ticker: str, *, allow_calendar_fallback: bool | None = None) -> date | None:
         if ticker in self._next_earnings_cache:
             return self._next_earnings_cache[ticker]
 
@@ -243,12 +252,19 @@ class YfinanceVpmaDataSource:
             self._next_earnings_cache[ticker] = derived
             return derived
 
+        if allow_calendar_fallback is None:
+            allow_calendar_fallback = _env_bool("VPMA_USE_YAHOO_CALENDAR_FALLBACK", False)
+        if not allow_calendar_fallback:
+            self._next_earnings_cache[ticker] = None
+            return None
+
         yf_ticker = yf.Ticker(ticker, session=self.session)
         try:
-            calendar = yahoo_call(
-                lambda: yf_ticker.calendar,
-                label=f"vpma-calendar:{ticker}",
-            )
+            with _suppress_yfinance_calendar_noise():
+                calendar = yahoo_call(
+                    lambda: yf_ticker.calendar,
+                    label=f"vpma-calendar:{ticker}",
+                )
         except Exception:
             calendar = None
         if calendar is None:
@@ -300,6 +316,20 @@ def _env_float(name: str, default: float) -> float:
 
 def _now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+@contextmanager
+def _suppress_yfinance_calendar_noise():
+    previous: list[tuple[logging.Logger, bool]] = []
+    for logger_name in _YFINANCE_NOISY_LOGGERS:
+        target = logging.getLogger(logger_name)
+        previous.append((target, target.disabled))
+        target.disabled = True
+    try:
+        yield
+    finally:
+        for target, disabled in previous:
+            target.disabled = disabled
 
 
 def _next_future_earnings_date(frame: pd.DataFrame, *, today: date | None = None) -> date | None:
@@ -1573,7 +1603,13 @@ def _evaluate_single_ticker(
         )
         return
     counts["recent_event_tickers"] += 1
-    next_earnings = data_source.next_earnings_date(ticker.ticker)
+    # Reuse the already-fetched earnings frame first. Yahoo's separate
+    # ``calendar`` endpoint is much noisier and has been observed to emit
+    # false "symbol may be delisted" messages for healthy tickers, so we only
+    # touch it when explicitly enabled via ``VPMA_USE_YAHOO_CALENDAR_FALLBACK``.
+    next_earnings = _next_future_earnings_date(event_frame)
+    if next_earnings is None:
+        next_earnings = data_source.next_earnings_date(ticker.ticker)
     try:
         result = evaluate_ticker(
             ticker,

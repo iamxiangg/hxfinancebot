@@ -499,6 +499,46 @@ class YfinanceVpmaDataSourceErrorPathsTests(unittest.TestCase):
 
         self.assertEqual(next_date, date(2099, 6, 30))
 
+    def test_next_earnings_date_skips_calendar_fallback_by_default(self) -> None:
+        frame = pd.DataFrame(
+            {"EPS Estimate": [1.5]},
+            index=[pd.Timestamp("2026-06-15 16:30:00")],
+        )
+
+        class _TickerWithNoisyCalendar:
+            def get_earnings_dates(self, limit: int = 8) -> pd.DataFrame:  # noqa: ARG002
+                return frame
+
+            @property
+            def calendar(self) -> pd.DataFrame:
+                raise AssertionError("calendar fallback should stay disabled by default")
+
+        ds = YfinanceVpmaDataSource()
+        with patch("scanners.vpma.engine.yf.Ticker", return_value=_TickerWithNoisyCalendar()):
+            next_date = ds.next_earnings_date("TEAM")
+
+        self.assertIsNone(next_date)
+
+    def test_next_earnings_date_uses_calendar_only_when_explicitly_allowed(self) -> None:
+        frame = pd.DataFrame(
+            {"EPS Estimate": [1.5]},
+            index=[pd.Timestamp("2026-06-15 16:30:00")],
+        )
+
+        class _TickerWithCalendar:
+            def get_earnings_dates(self, limit: int = 8) -> pd.DataFrame:  # noqa: ARG002
+                return frame
+
+            @property
+            def calendar(self) -> dict[str, pd.Timestamp]:
+                return {"Earnings Date": pd.Timestamp("2099-07-15 16:30:00")}
+
+        ds = YfinanceVpmaDataSource()
+        with patch("scanners.vpma.engine.yf.Ticker", return_value=_TickerWithCalendar()):
+            next_date = ds.next_earnings_date("TEAM", allow_calendar_fallback=True)
+
+        self.assertEqual(next_date, date(2099, 7, 15))
+
 
 class TzAwareTradingIndexInExtractEventTests(unittest.TestCase):
     """``yf.download`` returns a tz-aware ``DatetimeIndex`` for US session
