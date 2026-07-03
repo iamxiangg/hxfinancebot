@@ -39,6 +39,7 @@ jobs:
           VP_AVWAP_WRITE_SHEETS: "true"
           VP_AVWAP_SEND_TELEGRAM: ${{ vars.VP_AVWAP_SEND_TELEGRAM || 'true' }}
           VP_AVWAP_TELEGRAM_TEST_MODE: ${{ vars.VP_AVWAP_TELEGRAM_TEST_MODE || 'false' }}
+          VP_AVWAP_TRADINGVIEW_CHART_ID: ${{ vars.VP_AVWAP_TRADINGVIEW_CHART_ID || '' }}
           VP_AVWAP_OUTPUT_DIR: funnel_output/vp_avwap
           PYTHONUNBUFFERED: "1"
         run: |

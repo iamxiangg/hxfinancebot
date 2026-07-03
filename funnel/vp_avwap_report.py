@@ -3,8 +3,10 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from funnel.vp_avwap_sheet_writer import build_entry_map_records, build_summary_records
 from scanners.vp_avwap.models import TickerAnalysis, VpAvwapScanResult
@@ -50,6 +52,17 @@ def _short_reason(text: str) -> str:
             sentence = cleaned.split(marker, 1)[0].strip()
             return sentence if sentence.endswith(".") else f"{sentence}."
     return cleaned
+
+
+def _tradingview_url(result: TickerAnalysis) -> str:
+    symbol = (result.google_ticker or result.ticker).strip()
+    if not symbol:
+        return "N/A"
+    chart_id = str(os.getenv("VP_AVWAP_TRADINGVIEW_CHART_ID", "")).strip().strip("/")
+    encoded_symbol = quote(symbol, safe="")
+    if chart_id:
+        return f"https://www.tradingview.com/chart/{chart_id}/?symbol={encoded_symbol}"
+    return f"https://www.tradingview.com/chart/?symbol={encoded_symbol}"
 
 
 def _telegram_trigger(result: TickerAnalysis) -> str:
@@ -149,6 +162,7 @@ def format_telegram_entry(result: TickerAnalysis) -> str:
         f"Trigger: {_telegram_trigger(result)}",
         f"Support: {(route.next_support_name or 'None')} {_money(route.next_support_price)}",
         f"Why: {_short_reason(result.technical_reason or route.reason)}",
+        f"Chart: {_tradingview_url(result)}",
     ]
     return "\n".join(lines)
 

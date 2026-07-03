@@ -94,7 +94,17 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("AAA | CONFIRMED | Tier 1 | VAH Pullback", message)
         self.assertIn("Zone: $99.00", message)
         self.assertIn("Trigger: Daily close > $100.00 after VAH test", message)
+        self.assertIn("Chart: https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAA", message)
         self.assertNotIn("AAA - TECHNICAL TIER 1", message)
+
+    def test_telegram_message_uses_configured_tradingview_chart_layout(self) -> None:
+        scan_result = _scan_result()
+        scan_result.results[0].ticker = "ZETA"
+        scan_result.results[0].google_ticker = "NYSE:ZETA"
+        with patch.dict(os.environ, {"VP_AVWAP_TRADINGVIEW_CHART_ID": "9OmQpc2c"}, clear=False):
+            message = _material_telegram_message(scan_result)
+
+        self.assertIn("Chart: https://www.tradingview.com/chart/9OmQpc2c/?symbol=NYSE%3AZETA", message)
 
     def test_invalid_configuration_returns_non_zero(self) -> None:
         with patch.dict(
