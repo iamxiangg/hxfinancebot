@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, time, timedelta
+import math
 
 import pandas as pd
 import yfinance as yf
@@ -18,6 +19,20 @@ except ImportError:
 logger = logging.getLogger(__name__)
 NY_TZ = ZoneInfo("America/New_York")
 
+# Yahoo intraday history is not available uniformly across every interval.
+# These caps are intentionally conservative and are used only to avoid
+# issuing requests that Yahoo will reject outright for the selected interval.
+_INTRADAY_RETENTION_DAYS: dict[str, int] = {
+    "1m": 7,
+    "2m": 60,
+    "5m": 60,
+    "15m": 60,
+    "30m": 60,
+    "60m": 730,
+    "90m": 60,
+    "1h": 730,
+}
+
 
 class VpAvwapYahooDataSource:
     def __init__(self, *, config: VpAvwapConfig) -> None:
@@ -25,6 +40,7 @@ class VpAvwapYahooDataSource:
         self._daily_cache: dict[tuple[str, str], pd.DataFrame] = {}
         self._intraday_cache: dict[tuple[str, str, str, str], pd.DataFrame] = {}
         self._earnings_cache: dict[str, pd.DataFrame] = {}
+        self._intraday_skip_reasons: dict[tuple[str, str, str, str], str] = {}
 
     def daily_history(self, ticker: str, *, period: str | None = None) -> pd.DataFrame:
         key = (ticker, period or self.config.daily_period)
@@ -43,6 +59,19 @@ class VpAvwapYahooDataSource:
     def intraday_history(self, ticker: str, *, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
         key = (ticker, interval, start.date().isoformat(), end.date().isoformat())
         if key not in self._intraday_cache:
+            retention_days = intraday_retention_days(interval)
+            if retention_days is not None and request_exceeds_intraday_retention(
+                interval=interval,
+                start=start,
+                end=end,
+                retention_days=retention_days,
+            ):
+                self._intraday_skip_reasons[key] = (
+                    f"{interval} history requested from {start.date().isoformat()} exceeds Yahoo's "
+                    f"conservative retention window of {retention_days} days."
+                )
+                self._intraday_cache[key] = pd.DataFrame()
+                return self._intraday_cache[key].copy()
             frame = yahoo_download(
                 ticker,
                 start=start.date().isoformat(),
@@ -55,6 +84,10 @@ class VpAvwapYahooDataSource:
             )
             self._intraday_cache[key] = self._clean_history(frame)
         return self._intraday_cache[key].copy()
+
+    def intraday_skip_reason(self, ticker: str, *, interval: str, start: datetime, end: datetime) -> str | None:
+        key = (ticker, interval, start.date().isoformat(), end.date().isoformat())
+        return self._intraday_skip_reasons.get(key)
 
     def earnings_dates(self, ticker: str, *, limit: int | None = None) -> pd.DataFrame:
         if ticker not in self._earnings_cache:
@@ -123,3 +156,23 @@ def has_full_session_coverage(frame: pd.DataFrame, *, reaction_session: pd.Times
         return False
     dates = {pd.Timestamp(index).date() for index in frame.index}
     return reaction_session.date() in dates and latest_completed_session.date() in dates
+
+
+def intraday_retention_days(interval: str) -> int | None:
+    return _INTRADAY_RETENTION_DAYS.get(str(interval).strip().lower())
+
+
+def request_exceeds_intraday_retention(
+    *,
+    interval: str,
+    start: datetime,
+    end: datetime,
+    retention_days: int | None = None,
+) -> bool:
+    max_days = retention_days if retention_days is not None else intraday_retention_days(interval)
+    if max_days is None:
+        return False
+    requested_days = (end - start).total_seconds() / 86_400.0
+    if not math.isfinite(requested_days):
+        return True
+    return requested_days > max_days
