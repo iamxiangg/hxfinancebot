@@ -20,11 +20,14 @@ TIER_LABELS = {
 }
 
 SHORT_ROUTE_LABELS = {
-    "VAH_DEFENDED_PULLBACK": "VAH Pullback",
-    "POC_AVWAP_RECOVERY": "POC/AVWAP Recovery",
-    "BREAKOUT_RETEST": "Breakout Retest",
-    "VAL_RECLAIM": "VAL Reclaim",
+    "VAH_DEFENDED_PULLBACK": "Hold Above VAH",
+    "POC_AVWAP_RECOVERY": "Recover POC/AVWAP",
+    "BREAKOUT_RETEST": "Breakout Hold",
+    "VAL_RECLAIM": "Reclaim VAL",
 }
+
+HIGH_SIGNAL_STATUSES = {"CONFIRMED", "TESTING", "APPROACHING"}
+TELEGRAM_MAX_SETUPS = 4
 
 
 def _money(value: float | None) -> str:
@@ -71,13 +74,13 @@ def _telegram_trigger(result: TickerAnalysis) -> str:
     if route.entry_trigger_price is None:
         return route.entry_trigger_condition
     if route.route_code == "BREAKOUT_RETEST":
-        return f"Close > {trigger} after retest"
+        return f"Close back above {trigger} after retest"
     if route.route_code == "VAL_RECLAIM":
-        return f"Daily close > {trigger} after reclaim"
+        return f"Close above {trigger} after reclaim"
     if route.route_code == "POC_AVWAP_RECOVERY":
-        return f"Daily close > {trigger} after recovery"
+        return f"Close above {trigger} after recovery"
     if route.route_code == "VAH_DEFENDED_PULLBACK":
-        return f"Daily close > {trigger} after VAH test"
+        return f"Close above {trigger} after VAH hold"
     return route.entry_trigger_condition
 
 
@@ -155,14 +158,11 @@ def format_detailed_entry_map(result: TickerAnalysis) -> str:
 def format_telegram_entry(result: TickerAnalysis) -> str:
     route = result.preferred_route
     lines = [
-        f"{result.ticker} | Tier {result.final_tier} | {route.status}",
-        f"Route: {SHORT_ROUTE_LABELS.get(route.route_code, route.route_label)}",
-        f"Price: {_money(result.current_price)} | Zone: {_price_range(route.zone_low, route.zone_high)}",
-        f"Alert: {_money(route.advance_alert_price)} | Stop: {_money(route.route_invalidation)}",
-        f"Trigger: {_telegram_trigger(result)}",
-        f"Support: {(route.next_support_name or 'None')} {_money(route.next_support_price)}",
-        f"Why: {_short_reason(result.technical_reason or route.reason)}",
-        f"Chart: {_tradingview_url(result)}",
+        f"{result.ticker} | {route.status} | {SHORT_ROUTE_LABELS.get(route.route_code, route.route_label)} | {result.technical_score:.0f}",
+        f"Price {_money(result.current_price)} | Zone {_price_range(route.zone_low, route.zone_high)} | Stop {_money(route.route_invalidation)}",
+        f"Trigger {_telegram_trigger(result)} | Support {(route.next_support_name or 'None')} {_money(route.next_support_price)}",
+        f"Why {_short_reason(result.technical_reason or route.reason)}",
+        f"Chart {_tradingview_url(result)}",
     ]
     return "\n".join(lines)
 
@@ -185,10 +185,13 @@ def detailed_results(scan_result: VpAvwapScanResult) -> list[TickerAnalysis]:
 def format_telegram_report(scan_result: VpAvwapScanResult) -> str:
     lines = ["VP/AVWAP TECHNICAL TIERS", ""]
     for tier in (1, 2, 3, 4):
-        group = [result.ticker for result in scan_result.results if result.final_tier == tier]
-        tickers = ", ".join(group) if group else "None"
-        suffix = f" ({len(group)})" if group else ""
-        lines.append(f"Tier {tier}{suffix}: {tickers}")
+        group = [result for result in scan_result.results if result.final_tier == tier]
+        if tier <= 2:
+            sample = ", ".join(result.ticker for result in group[:3]) if group else "None"
+            more = f" +{len(group) - 3} more" if len(group) > 3 else ""
+            lines.append(f"Tier {tier}: {len(group)} ({sample}{more})")
+        else:
+            lines.append(f"Tier {tier}: {len(group)}")
 
     changed = [
         result
@@ -203,11 +206,33 @@ def format_telegram_report(scan_result: VpAvwapScanResult) -> str:
                 f"{result.ticker} | {change_label} | Tier {result.final_tier} | {SHORT_ROUTE_LABELS.get(result.preferred_route.route_code, result.preferred_route.route_label)}"
             )
 
-    details = detailed_results(scan_result)
+    details = [
+        result
+        for result in scan_result.results
+        if result.final_tier == 1 and result.preferred_route.status in HIGH_SIGNAL_STATUSES
+    ]
+    details.sort(
+        key=lambda result: (
+            {"CONFIRMED": 0, "TESTING": 1, "APPROACHING": 2}.get(result.preferred_route.status, 9),
+            -result.technical_score,
+            result.ticker,
+        )
+    )
+    if not details:
+        details = [
+            result
+            for result in detailed_results(scan_result)
+            if result.final_tier in {1, 2}
+        ]
+    total_detail_count = len(details)
+    details = details[:TELEGRAM_MAX_SETUPS]
     if details:
-        lines.extend(["", "Setups"])
+        lines.extend(["", "High Signals"])
         for result in details:
             lines.extend(["", format_telegram_entry(result)])
+        hidden = total_detail_count - len(details)
+        if hidden > 0:
+            lines.extend(["", f"More candidates: {hidden} additional high-priority setups in sheets/artifacts."])
     return "\n".join(lines).strip()
 
 

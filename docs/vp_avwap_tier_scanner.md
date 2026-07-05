@@ -206,7 +206,7 @@ Telegram delivery is optional and controlled by:
 - `VP_AVWAP_TELEGRAM_TEST_MODE`
 - `VP_AVWAP_TRADINGVIEW_CHART_ID`
 
-When enabled, the runner sends a Telegram-specific mobile-friendly summary on every non-dry run. The message includes compact tier counts, material changes, and concise Tier 1 or otherwise notable setup blocks with price, zone, stop, trigger, support, and a short reason. Telegram failure never blocks artefact generation or other ticker processing.
+When enabled, the runner sends a Telegram-specific mobile-friendly summary on every non-dry run. The message includes compact tier counts, material changes, and only the highest-priority setup blocks, with emphasis on Tier 1 names in plain-English route labels such as `Hold Above VAH`, `Recover POC/AVWAP`, `Breakout Hold`, and `Reclaim VAL`. Telegram failure never blocks artefact generation or other ticker processing.
 If `Google Ticker` is present, each setup block also includes a TradingView chart URL. Set `VP_AVWAP_TRADINGVIEW_CHART_ID` to reuse a specific TradingView layout, for example `9OmQpc2c`, which yields links like `https://www.tradingview.com/chart/9OmQpc2c/?symbol=NYSE%3AZETA`.
 
 ## Environment Variables

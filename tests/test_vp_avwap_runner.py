@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import os
 from pathlib import Path
@@ -78,9 +79,8 @@ class RunnerTests(unittest.TestCase):
         mock_send.assert_called_once()
         message = mock_send.call_args.args[0]
         self.assertIn("VP/AVWAP TECHNICAL TIERS", message)
-        self.assertIn("AAA | Tier 1 | APPROACHING", message)
-        self.assertIn("Route: VAH Pullback", message)
-        self.assertIn("Price: $101.00 | Zone: $99.00-$100.00", message)
+        self.assertIn("AAA | APPROACHING | Hold Above VAH | 88", message)
+        self.assertIn("Price $101.00 | Zone $99.00-$100.00 | Stop $98.00", message)
 
     def test_telegram_message_uses_compact_mobile_friendly_layout(self) -> None:
         scan_result = _scan_result()
@@ -89,12 +89,13 @@ class RunnerTests(unittest.TestCase):
         scan_result.results[0].preferred_route.status = "CONFIRMED"
         message = _material_telegram_message(scan_result)
 
-        self.assertIn("Tier 1 (1): AAA", message)
+        self.assertIn("Tier 1: 1 (AAA)", message)
         self.assertIn("Changes", message)
-        self.assertIn("AAA | CONFIRMED | Tier 1 | VAH Pullback", message)
-        self.assertIn("Zone: $99.00", message)
-        self.assertIn("Trigger: Daily close > $100.00 after VAH test", message)
-        self.assertIn("Chart: https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAA", message)
+        self.assertIn("AAA | CONFIRMED | Tier 1 | Hold Above VAH", message)
+        self.assertIn("AAA | CONFIRMED | Hold Above VAH | 88", message)
+        self.assertIn("Zone $99.00", message)
+        self.assertIn("Trigger Close above $100.00 after VAH hold", message)
+        self.assertIn("Chart https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAA", message)
         self.assertNotIn("AAA - TECHNICAL TIER 1", message)
 
     def test_telegram_message_uses_configured_tradingview_chart_layout(self) -> None:
@@ -104,7 +105,32 @@ class RunnerTests(unittest.TestCase):
         with patch.dict(os.environ, {"VP_AVWAP_TRADINGVIEW_CHART_ID": "9OmQpc2c"}, clear=False):
             message = _material_telegram_message(scan_result)
 
-        self.assertIn("Chart: https://www.tradingview.com/chart/9OmQpc2c/?symbol=NYSE%3AZETA", message)
+        self.assertIn("Chart https://www.tradingview.com/chart/9OmQpc2c/?symbol=NYSE%3AZETA", message)
+
+    def test_telegram_message_limits_to_high_signal_setups(self) -> None:
+        scan_result = _scan_result()
+        base = scan_result.results[0]
+        extras = []
+        statuses = ["CONFIRMED", "TESTING", "APPROACHING", "APPROACHING", "WAITING"]
+        tickers = ["BBB", "CCC", "DDD", "EEE", "FFF"]
+        for ticker, status in zip(tickers, statuses):
+            item = copy.deepcopy(base)
+            item.ticker = ticker
+            item.google_ticker = f"NASDAQ:{ticker}"
+            item.preferred_route.status = status
+            extras.append(item)
+        scan_result.results.extend(extras)
+
+        message = _material_telegram_message(scan_result)
+
+        self.assertIn("High Signals", message)
+        self.assertIn("BBB | CONFIRMED", message)
+        self.assertIn("CCC | TESTING", message)
+        self.assertIn("AAA | APPROACHING", message)
+        self.assertIn("DDD | APPROACHING", message)
+        self.assertNotIn("EEE | APPROACHING", message)
+        self.assertNotIn("FFF | WAITING", message)
+        self.assertIn("More candidates: 1 additional high-priority setups in sheets/artifacts.", message)
 
     def test_invalid_configuration_returns_non_zero(self) -> None:
         with patch.dict(
