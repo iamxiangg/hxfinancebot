@@ -10,7 +10,9 @@ from zoneinfo import ZoneInfo
 import requests
 
 from funnel.congress_adapter import run_congress_adapter_detailed
+from funnel.political_archive import load_political_archive_state, persist_digest_rows
 from scanners.congress.engine import MODEL_VERSION
+from tactical.congress_digest import chunk_digest, digest_log_rows, render_digest, write_digest_preview
 
 
 TOKEN = str(os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
@@ -31,6 +33,22 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 for handler in (logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")):
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "true" if default else "false")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _digest_preview_path() -> Path:
+    audit_dir = str(os.getenv("CONGRESS_AUDIT_DIR", "")).strip()
+    if audit_dir:
+        path = Path(audit_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "political_digest_preview.txt"
+    path = Path("funnel_output")
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "political_digest_preview.txt"
 
 
 def money(value: float) -> str:
@@ -202,8 +220,9 @@ def failure(text: str) -> None:
 
 def main() -> int:
     if not TOKEN or not CHAT_ID:
-        logger.error("Missing TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID")
-        return 1
+        if _bool_env("POLITICAL_DIGEST_SEND_TELEGRAM", True):
+            logger.error("Missing TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID")
+            return 1
     if not lock():
         return 0
 
@@ -214,18 +233,60 @@ def main() -> int:
         if not scored:
             failure("No ticker produced usable price analytics.")
             return 0
+        digest_enabled = _bool_env("POLITICAL_DIGEST_ENABLED", True)
+        legacy_output = _bool_env("POLITICAL_DIGEST_LEGACY_OUTPUT", False)
+        send_telegram = _bool_env("POLITICAL_DIGEST_SEND_TELEGRAM", True)
+        preview_path = _digest_preview_path()
+        telegram_sent = False
+        sent_at = ""
+
+        if digest_enabled and not legacy_output:
+            digest_text = render_digest(run.digest_plan, now_sg=datetime.now(TZ))
+            write_digest_preview(preview_path, digest_text)
+            if digest_text is not None:
+                logger.info("Rendered political digest preview to %s", preview_path)
+            else:
+                logger.info("No political digest rendered for this run.")
+            if digest_text and send_telegram:
+                output = chunk_digest(digest_text)
+                send(output)
+                telegram_sent = True
+                sent_at = datetime.now(TZ).isoformat()
+                logger.info(
+                    "Sent %d Telegram digest part(s) | signals=%d | payload=%s",
+                    len(output),
+                    len(run.signals),
+                    run.scan.metadata.payload_sha256,
+                )
+            elif digest_text:
+                logger.info("Digest delivery skipped because POLITICAL_DIGEST_SEND_TELEGRAM=false")
+            digest_rows = digest_log_rows(
+                run.digest_plan,
+                run_id=str(os.getenv("GITHUB_RUN_ID", datetime.now(TZ).isoformat())),
+                payload_hash=run.payload_hash,
+                telegram_included=telegram_sent,
+                telegram_sent_at=sent_at,
+            )
+            persist_digest_rows(load_political_archive_state(), digest_rows)
+            return 0
+
         output = messages(scored)
-        send(output)
-        logger.info(
-            "Sent %d Telegram message(s) | signals=%d | payload=%s",
-            len(output),
-            len(run.signals),
-            run.scan.metadata.payload_sha256,
-        )
+        if send_telegram:
+            send(output)
+            logger.info(
+                "Sent %d Telegram message(s) | signals=%d | payload=%s",
+                len(output),
+                len(run.signals),
+                run.scan.metadata.payload_sha256,
+            )
+        else:
+            preview_path.write_text("\n\n".join(output) + "\n", encoding="utf-8")
+            logger.info("Legacy output rendered to %s without Telegram delivery", preview_path)
         return 0
     except Exception as exc:
         logger.exception("Unhandled failure: %s", exc)
-        failure(str(exc)[:500])
+        if _bool_env("POLITICAL_DIGEST_SEND_TELEGRAM", True):
+            failure(str(exc)[:500])
         return 1
     finally:
         unlock()

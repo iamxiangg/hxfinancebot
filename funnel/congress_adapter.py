@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +15,30 @@ import requests
 from googleapiclient.errors import HttpError
 
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
+from funnel.political_archive import (
+    build_archive_stats,
+    get_bootstrap_marker,
+    load_political_archive_state,
+    persist_raw_archive_updates,
+    persist_summary_rows,
+    prepare_raw_archive_upserts,
+    set_bootstrap_marker,
+    summary_row_from_history,
+)
 from funnel.review_schema import CONGRESS_LEDGER_HEADERS, CONGRESS_LEDGER_SHEET
 from funnel.review_setup import ensure_review_sheets
 from funnel.sheet_table import read_table, upsert_records
 from funnel.signal_schema import Signal
+from scanners.congress.digest_models import PoliticalDigestPlan
 from scanners.congress.engine import (
     MODEL_VERSION,
     CongressScanResult,
     CongressTickerResult,
     run_live_scan,
 )
+from scanners.congress.flag_ranker import build_digest_plan, classify_release_type, detect_backfill_status
+from scanners.congress.models import PoliticalArchiveStats, PoliticalBackfillStatus, TickerPoliticalHistory
+from scanners.congress.ticker_history import build_ticker_histories
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +70,18 @@ class CongressAdapterRun:
     scan: CongressScanResult
     signals: list[Signal]
     analysed_tickers: int
+    new_records: list[dict[str, Any]]
+    material_amendments: list[dict[str, Any]]
+    removed_records: list[dict[str, Any]]
+    affected_tickers: list[str]
+    current_ticker_histories: dict[str, TickerPoliticalHistory]
+    previous_ticker_states: dict[str, dict[str, Any]]
+    ranked_digest_flags: list[dict[str, Any]]
+    compact_digest_items: list[dict[str, Any]]
+    backfill_status: PoliticalBackfillStatus
+    archive_stats: PoliticalArchiveStats
+    digest_plan: PoliticalDigestPlan
+    payload_hash: str
 
 
 @dataclass(frozen=True)
@@ -358,7 +384,49 @@ def _save_ledger(
     )
 
 
-def _write_audit_bundle(scan: CongressScanResult, signals: list[Signal]) -> None:
+def _unique_transactions(scan: CongressScanResult) -> list[Any]:
+    seen: dict[str, Any] = {}
+    records = getattr(scan, "transactions", [])
+    if not isinstance(records, list):
+        return []
+    for record in records:
+        if record.trade_key not in seen:
+            seen[record.trade_key] = record
+    return [seen[key] for key in sorted(seen)]
+
+
+def _event_row_from_record(record: Any, *, bootstrap_run: bool = False) -> dict[str, Any]:
+    payload = {
+        "trade_key": record.trade_key,
+        "ticker": record.ticker,
+        "filer_id": record.filer_id,
+        "filer_name": record.filer_name,
+        "owner_relationship": record.owner_relationship,
+        "transaction_type": record.transaction_type,
+        "asset_name": record.asset_name,
+        "asset_class": record.asset_class,
+        "option_side": record.option_side,
+        "strike": record.strike,
+        "expiry": record.expiry,
+        "amount_low": record.amount_range_low,
+        "amount_mid_estimate": record.amount_range_mid,
+        "amount_high": record.amount_range_high,
+        "transaction_date": record.transaction_date,
+        "filing_date": record.filing_date,
+        "transaction_age": record.transaction_age,
+        "filing_age": record.filing_age,
+        "days_to_file": record.days_to_file,
+        "document_url": record.doc_url,
+        "filing_id": record.filing_id,
+        "trigger_type": record.trigger_type,
+        "is_new_discovery": record.is_new_discovery,
+        "is_materially_amended": record.is_materially_amended,
+    }
+    payload["release_type"] = classify_release_type(payload, bootstrap_run=bootstrap_run)
+    return payload
+
+
+def _write_audit_bundle(scan: CongressScanResult, signals: list[Signal], run: CongressAdapterRun | None = None) -> None:
     audit_dir = _audit_directory()
     if audit_dir is None:
         return
@@ -395,6 +463,24 @@ def _write_audit_bundle(scan: CongressScanResult, signals: list[Signal]) -> None
         json.dumps({"scope_used": scan.scope_used}, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    if run is not None:
+        (audit_dir / "political_digest_plan.json").write_text(
+            json.dumps(run.digest_plan.to_dict(), ensure_ascii=False, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        (audit_dir / "political_ticker_histories.json").write_text(
+            json.dumps(
+                {
+                    ticker: history.to_dict()
+                    for ticker, history in sorted(run.current_ticker_histories.items())
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
 
 
 def run_congress_adapter_detailed(
@@ -410,7 +496,9 @@ def run_congress_adapter_detailed(
     can be suppressed on subsequent runs. Google Sheets is preferred when
     credentials are available; otherwise a local JSON fallback is used.
     """
+    observed_datetime = _normalise_datetime(observed_at or datetime.now(UTC).isoformat())
     ledger, ledger_context = _load_ledger()
+    archive_state = load_political_archive_state()
     scan = run_live_scan(
         prior_ledger=ledger,
         branch_scope=os.getenv("POLITICAL_DISCLOSURE_SCOPE", "all"),
@@ -441,7 +529,83 @@ def run_congress_adapter_detailed(
         if signal is not None:
             signals.append(signal)
 
-    _write_audit_bundle(scan, signals)
+    bootstrap_marker = get_bootstrap_marker(archive_state)
+    bootstrap_run = not bootstrap_marker
+    unique_records = _unique_transactions(scan)
+    raw_update = prepare_raw_archive_upserts(
+        unique_records,
+        existing_rows=archive_state.raw_rows,
+        observed_at=observed_datetime,
+        payload_hash=scan.metadata.payload_sha256,
+    )
+    persist_raw_archive_updates(archive_state, raw_update)
+
+    new_records = [
+        _event_row_from_record(record, bootstrap_run=bootstrap_run)
+        for record in unique_records
+        if record.is_new_discovery
+    ]
+    material_amendments = [
+        _event_row_from_record(record, bootstrap_run=bootstrap_run)
+        for record in unique_records
+        if record.is_materially_amended
+    ]
+    removed_records = list(raw_update.removed_events)
+    trigger_events_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for event in [*new_records, *material_amendments, *removed_records]:
+        ticker = str(event.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        trigger_events_by_ticker.setdefault(ticker, []).append(event)
+
+    ticker_results_by_ticker = {result.ticker: result for result in scan.ticker_results}
+    histories = build_ticker_histories(
+        unique_records,
+        observed_at=observed_datetime,
+        ticker_results=ticker_results_by_ticker,
+        previous_summary_rows=archive_state.summary_rows,
+        trigger_events=trigger_events_by_ticker,
+    )
+
+    affected_tickers = sorted(
+        {
+            ticker
+            for ticker, events in trigger_events_by_ticker.items()
+            if events
+        }
+    )
+    backfill_status = detect_backfill_status(
+        bootstrap_run=bootstrap_run,
+        new_records=new_records,
+        material_amendments=material_amendments,
+        removed_events=removed_records,
+        affected_tickers=affected_tickers,
+    )
+
+    summary_rows = [
+        summary_row_from_history(history, updated_at=observed_datetime.isoformat())
+        for _, history in sorted(histories.items())
+    ]
+    persist_summary_rows(archive_state, summary_rows)
+
+    archive_stats = build_archive_stats(
+        raw_update,
+        summary_written=len(summary_rows),
+        digest_logged=0,
+        bootstrap_completed=bootstrap_run,
+    )
+    digest_plan = build_digest_plan(
+        histories=histories,
+        affected_tickers=affected_tickers,
+        backfill_status=backfill_status,
+        previous_digest_rows=archive_state.digest_rows,
+        digest_date=observed_datetime.date().isoformat(),
+        archive_stats=archive_stats,
+    )
+
+    if bootstrap_run:
+        set_bootstrap_marker(archive_state, scan.metadata.payload_sha256)
+
     breakdown = _signal_breakdown(
         scan.ticker_results,
         signals,
@@ -463,11 +627,25 @@ def run_congress_adapter_detailed(
         scan.metadata.payload_sha256,
     )
 
-    return CongressAdapterRun(
+    run = CongressAdapterRun(
         scan=scan,
         signals=signals,
         analysed_tickers=scan.counts.get("scored_tickers", len(scan.ticker_results)),
+        new_records=new_records,
+        material_amendments=material_amendments,
+        removed_records=removed_records,
+        affected_tickers=affected_tickers,
+        current_ticker_histories=histories,
+        previous_ticker_states=archive_state.summary_rows,
+        ranked_digest_flags=[flag.to_dict() for flag in digest_plan.detailed_flags],
+        compact_digest_items=[flag.to_dict() for flag in digest_plan.compact_flags],
+        backfill_status=backfill_status,
+        archive_stats=archive_stats,
+        digest_plan=digest_plan,
+        payload_hash=scan.metadata.payload_sha256,
     )
+    _write_audit_bundle(scan, signals, run)
+    return run
 
 
 def run_congress_adapter(

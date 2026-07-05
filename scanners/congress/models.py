@@ -127,3 +127,103 @@ class PoliticalAuditBundle:
     role_relevance_calculations: list[dict[str, Any]] = field(default_factory=list)
     excluded_record_reasons: list[dict[str, Any]] = field(default_factory=list)
 
+
+@dataclass(frozen=True)
+class PoliticalWindowSummary:
+    window_days: int
+    purchase_count: int = 0
+    partial_sale_count: int = 0
+    full_sale_count: int = 0
+    unique_buyer_count: int = 0
+    unique_seller_count: int = 0
+    repeat_buyer_count: int = 0
+    stock_purchase_low: float = 0.0
+    stock_purchase_mid_estimate: float = 0.0
+    stock_purchase_high: float = 0.0
+    call_purchase_low: float = 0.0
+    call_purchase_mid_estimate: float = 0.0
+    call_purchase_high: float = 0.0
+    put_purchase_low: float = 0.0
+    put_purchase_mid_estimate: float = 0.0
+    put_purchase_high: float = 0.0
+    sale_low: float = 0.0
+    sale_mid_estimate: float = 0.0
+    sale_high: float = 0.0
+    largest_bullish_trade_low: float = 0.0
+    largest_bullish_trade_high: float = 0.0
+    largest_buyer_share_lower_bound: float = 0.0
+    largest_buyer_share_midpoint_estimate: float = 0.0
+    unique_record_count: int = 0
+    unique_filer_count: int = 0
+    unique_household_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TickerPoliticalHistory:
+    ticker: str
+    primary_classification: str
+    structure_classification: str
+    bullish_evidence_score: float
+    distribution_evidence_score: float
+    breadth_score: float
+    concentration_score: float
+    inference_confidence: str
+    data_confidence: str
+    windows: dict[int, PoliticalWindowSummary]
+    new_events: list[dict[str, Any]] = field(default_factory=list)
+    notable_history: list[dict[str, Any]] = field(default_factory=list)
+    flag_reasons: list[str] = field(default_factory=list)
+    risk_flags: list[str] = field(default_factory=list)
+    previous_classification: str = "INSUFFICIENT_EVIDENCE"
+    classification_changed: bool = False
+    summary_hash: str = ""
+    latest_transaction_date: str = ""
+    latest_filing_date: str = ""
+    latest_trigger_type: str = ""
+    latest_trigger_trade_keys: tuple[str, ...] = ()
+    release_types: tuple[str, ...] = ()
+    political_conviction: float = 0.0
+    entry_quality: float = 0.0
+    signal_category: str = "other"
+    existing_status: str = "other"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["windows"] = {
+            str(window): summary.to_dict()
+            for window, summary in sorted(self.windows.items())
+        }
+        return payload
+
+
+@dataclass(frozen=True)
+class PoliticalBackfillStatus:
+    probable_backfill: bool
+    bootstrap_run: bool
+    new_trade_count: int
+    amended_trade_count: int
+    removed_trade_count: int
+    new_filing_count: int
+    affected_ticker_count: int
+    reasons: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PoliticalArchiveStats:
+    raw_inserted: int = 0
+    raw_amended: int = 0
+    raw_idempotent: int = 0
+    raw_deactivated: int = 0
+    raw_seen_updates: int = 0
+    summary_written: int = 0
+    digest_logged: int = 0
+    bootstrap_completed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)

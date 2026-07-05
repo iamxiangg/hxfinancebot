@@ -175,6 +175,19 @@ Copy these to your GitHub Actions repository variables or a local `.env` file:
 | `BTD_GATE_THRESHOLD` | 1.0 | BTD ratio threshold |
 | `FEROLDI_GATE_MODE` | `observe` | `observe` or `enforce` |
 | `SEND_TELEGRAM_REVIEWS` | `true` | Enable/disable Telegram notifications |
+| `POLITICAL_DIGEST_ENABLED` | `true` | Enable the daily political-trading digest |
+| `POLITICAL_DIGEST_LEGACY_OUTPUT` | `false` | Use the legacy Congress formatter instead of the digest |
+| `POLITICAL_DIGEST_SEND_TELEGRAM` | `true` | Render the digest but skip Telegram when false |
+| `POLITICAL_DIGEST_MAX_DETAILED_FLAGS` | `3` | Default detailed dossier cap |
+| `POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS` | `5` | Absolute detailed dossier cap |
+| `POLITICAL_BACKFILL_TRADE_THRESHOLD` | `200` | Probable backfill threshold by new rows |
+| `POLITICAL_BACKFILL_FILING_THRESHOLD` | `25` | Probable backfill threshold by filings |
+| `POLITICAL_BACKFILL_TICKER_THRESHOLD` | `50` | Probable backfill threshold by tickers |
+| `POLITICAL_FLAG_PURCHASE_LOW` | `100000` | Lower-bound purchase flag threshold |
+| `POLITICAL_FLAG_CALL_LOW` | `100000` | Lower-bound call-purchase flag threshold |
+| `POLITICAL_FLAG_SALE_LOW` | `100000` | Lower-bound sale flag threshold |
+| `POLITICAL_BROAD_MIN_BUYERS` | `2` | Independent-household minimum for broad accumulation |
+| `POLITICAL_CONCENTRATION_THRESHOLD` | `0.70` | Concentration threshold for single-filer dominance |
 
 **SEC provider:**
 
@@ -294,6 +307,10 @@ A single ticker with bad data, a malformed symbol, or a calculation error cannot
 
 The insider scanner persists all processed SEC accessions and qualified purchases to Google Sheets (`Insider_Ledger` sheet) or local JSON (`funnel_output/insider_state/`). Processed accessions are deduplicated across runs. Form 4/A amendments supersede prior versions. Purchases are clustered across 21-day windows for scoring.
 
+### Political digest
+
+The Congress scanner now maintains a durable raw archive (`Political_Trades_Raw`), deterministic ticker history summaries (`Political_Ticker_Summary`), and a repeat-suppressed daily political digest (`Political_Digest_Log`). The existing `Congress_Ledger` remains the lightweight deduplication layer, while the new archive and digest state can also fall back to local JSON under `CONGRESS_STATE_DIR`.
+
 ---
 
 ## Generated / ignored files
@@ -311,6 +328,7 @@ Committed by GitHub Actions:
 - `docs/no_llm_decision_architecture.md` — No-LLM guardrails specification
 - `docs/entity_master.md` — Entity Master architecture and API
 - `docs/congress_scanner_refactor.md` — Congress scanner refactor notes
+- `docs/political_digest.md` — Political archive, backfill, digest, and dry-run operations
 
 ---
 
