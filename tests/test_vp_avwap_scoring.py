@@ -60,6 +60,30 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(scored.route_score, 100.0)
         self.assertEqual(raw_score_tier(scored.route_score), 1)
 
+    def test_confirmed_setup_above_zone_loses_price_points(self) -> None:
+        route = RouteEvaluation(
+            route_code="POC_AVWAP_RECOVERY",
+            route_label="Best technical value",
+            eligible=True,
+            status="CONFIRMED",
+            zone_low=100.0,
+            zone_high=101.0,
+            advance_alert_price=103.0,
+            entry_trigger_price=101.0,
+            entry_trigger_condition="Close above 101",
+            route_invalidation=98.0,
+            next_support_name="VAL",
+            next_support_price=96.0,
+            distance_to_zone_pct=4.95,
+            risk_pct=2.97,
+            level_basis=["POC", "AVWAP"],
+            metadata={"confluence": True},
+        )
+
+        scored = score_routes([route], profile_state_code=3, avwap_slope_pct=1.0, latest_close=106.0)[0]
+        self.assertEqual(scored.price_points, 10.0)
+        self.assertEqual(scored.route_score, 95.0)
+
     def test_preferred_route_tie_breaker_prefers_vah_route(self) -> None:
         first = RouteEvaluation(
             route_code="VAH_DEFENDED_PULLBACK",

@@ -28,6 +28,7 @@ SHORT_ROUTE_LABELS = {
 
 HIGH_SIGNAL_STATUSES = {"CONFIRMED", "TESTING", "APPROACHING"}
 TELEGRAM_MAX_SETUPS = 4
+CONFIRMED_ACTIONABLE_MAX_DISTANCE_PCT = 2.0
 
 
 def _money(value: float | None) -> str:
@@ -66,6 +67,18 @@ def _tradingview_url(result: TickerAnalysis) -> str:
     if chart_id:
         return f"https://www.tradingview.com/chart/{chart_id}/?symbol={encoded_symbol}"
     return f"https://www.tradingview.com/chart/?symbol={encoded_symbol}"
+
+
+def _is_actionable_now(result: TickerAnalysis) -> bool:
+    status = result.preferred_route.status
+    distance = result.preferred_route.distance_to_zone_pct
+    if status == "TESTING":
+        return True
+    if status == "APPROACHING" and (distance is None or distance <= 2.0):
+        return True
+    if status == "CONFIRMED" and distance is not None and distance <= CONFIRMED_ACTIONABLE_MAX_DISTANCE_PCT:
+        return True
+    return False
 
 
 def _telegram_trigger(result: TickerAnalysis) -> str:
@@ -206,28 +219,19 @@ def format_telegram_report(scan_result: VpAvwapScanResult) -> str:
                 f"{result.ticker} | {change_label} | Tier {result.final_tier} | {SHORT_ROUTE_LABELS.get(result.preferred_route.route_code, result.preferred_route.route_label)}"
             )
 
-    details = [
-        result
-        for result in scan_result.results
-        if result.final_tier == 1 and result.preferred_route.status in HIGH_SIGNAL_STATUSES
-    ]
+    details = [result for result in scan_result.results if result.final_tier == 1 and _is_actionable_now(result)]
     details.sort(
         key=lambda result: (
-            {"CONFIRMED": 0, "TESTING": 1, "APPROACHING": 2}.get(result.preferred_route.status, 9),
+            {"TESTING": 0, "CONFIRMED": 1, "APPROACHING": 2}.get(result.preferred_route.status, 9),
+            result.preferred_route.distance_to_zone_pct if result.preferred_route.distance_to_zone_pct is not None else math.inf,
             -result.technical_score,
             result.ticker,
         )
     )
-    if not details:
-        details = [
-            result
-            for result in detailed_results(scan_result)
-            if result.final_tier in {1, 2}
-        ]
     total_detail_count = len(details)
     details = details[:TELEGRAM_MAX_SETUPS]
     if details:
-        lines.extend(["", "High Signals"])
+        lines.extend(["", "Actionable Now"])
         for result in details:
             lines.extend(["", format_telegram_entry(result)])
         hidden = total_detail_count - len(details)

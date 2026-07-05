@@ -118,19 +118,33 @@ class RunnerTests(unittest.TestCase):
             item.ticker = ticker
             item.google_ticker = f"NASDAQ:{ticker}"
             item.preferred_route.status = status
+            item.preferred_route.distance_to_zone_pct = {"CONFIRMED": 0.5, "TESTING": 0.0, "APPROACHING": 1.0, "WAITING": 3.0}[status]
             extras.append(item)
         scan_result.results.extend(extras)
 
         message = _material_telegram_message(scan_result)
 
-        self.assertIn("High Signals", message)
-        self.assertIn("BBB | CONFIRMED", message)
+        self.assertIn("Actionable Now", message)
         self.assertIn("CCC | TESTING", message)
         self.assertIn("AAA | APPROACHING", message)
         self.assertIn("DDD | APPROACHING", message)
+        self.assertIn("BBB | CONFIRMED", message)
         self.assertNotIn("EEE | APPROACHING", message)
         self.assertNotIn("FFF | WAITING", message)
         self.assertIn("More candidates: 1 additional high-priority setups in sheets/artifacts.", message)
+
+    def test_telegram_message_excludes_stretched_confirmed_setup(self) -> None:
+        scan_result = _scan_result()
+        scan_result.results[0].ticker = "DUOL"
+        scan_result.results[0].google_ticker = "NASDAQ:DUOL"
+        scan_result.results[0].preferred_route.status = "CONFIRMED"
+        scan_result.results[0].preferred_route.distance_to_zone_pct = 3.5
+
+        message = _material_telegram_message(scan_result)
+
+        self.assertIn("Changes", message)
+        self.assertIn("DUOL | CONFIRMED | Tier 1 | Hold Above VAH", message)
+        self.assertNotIn("Actionable Now\n\nDUOL | CONFIRMED", message)
 
     def test_invalid_configuration_returns_non_zero(self) -> None:
         with patch.dict(

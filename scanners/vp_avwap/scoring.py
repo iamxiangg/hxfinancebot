@@ -55,7 +55,7 @@ def _price_points(route: RouteEvaluation, latest_close: float | None) -> float:
         return 0.0
     if latest_close < route.zone_low and route.status != "CONFIRMED":
         return 0.0
-    if route.status == "CONFIRMED" or route.zone_low <= latest_close <= route.zone_high:
+    if route.zone_low <= latest_close <= route.zone_high:
         return 15.0
     pct_above = ((latest_close / route.zone_high) - 1.0) * 100.0 if route.zone_high > 0 else math.inf
     if pct_above <= 2.0:
