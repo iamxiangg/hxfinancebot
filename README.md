@@ -247,6 +247,12 @@ python -m tactical.vp_avwap_runner
 
 The VP/AVWAP scanner reads the monitored universe from `Stock Summary USD`, calculates earnings-anchored volume-profile and AVWAP levels, and writes only `VP_AVWAP_Tiers` and `VP_AVWAP_Entry_Map`.
 
+Its Telegram alert is a presentation-only execution queue layered on top of the same internal scan results:
+
+- `BUY SIGNALS` are Grade A / Tier 1 names with a confirmed daily trigger and a current price no more than 2% above the trigger.
+- `WAIT FOR DAILY CLOSE` are Grade A / Tier 1 names currently testing the intended buy zone but still missing the required completed daily confirmation.
+- All other names remain available in Google Sheets and local artefacts instead of being listed individually in Telegram.
+
 Production-style run:
 
 ```bash
