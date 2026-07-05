@@ -162,6 +162,73 @@ class CongressDigestTests(unittest.TestCase):
         )
         self.assertEqual(histories["MSFT"].primary_classification, "BROAD_ACCUMULATION")
 
+    def test_small_repeat_single_filer_buys_do_not_qualify_for_digest(self) -> None:
+        payload = [
+            {
+                "id": "small-1",
+                "ticker": "VLTO",
+                "asset_name": "Veralto Common Stock",
+                "asset_type": "Common Stock",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-06-24",
+                "filing_date": "2026-07-02",
+                "amount_range_low": 1000,
+                "amount_range_high": 15000,
+                "filer_name": "Gilbert Cisneros",
+                "filer_id": "house_gilbert_cisneros",
+                "owner": "Self",
+                "branch": "Legislative",
+                "chamber": "House",
+            },
+            {
+                "id": "small-2",
+                "ticker": "VLTO",
+                "asset_name": "Veralto Common Stock",
+                "asset_type": "Common Stock",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-06-10",
+                "filing_date": "2026-06-12",
+                "amount_range_low": 1000,
+                "amount_range_high": 15000,
+                "filer_name": "Gilbert Cisneros",
+                "filer_id": "house_gilbert_cisneros",
+                "owner": "Self",
+                "branch": "Legislative",
+                "chamber": "House",
+            },
+        ]
+        scan = run_scan_from_payload(payload, observed_at="2026-07-05T12:00:00+08:00", price_fetcher=lambda symbols, earliest: {})
+        events = _trigger_events(scan)
+        histories = build_ticker_histories(
+            scan.transactions,
+            observed_at=datetime.fromisoformat("2026-07-05T12:00:00+08:00"),
+            trigger_events=events,
+        )
+        backfill = detect_backfill_status(
+            bootstrap_run=False,
+            new_records=[event for ticker_events in events.values() for event in ticker_events],
+            material_amendments=[],
+            removed_events=[],
+            affected_tickers=["VLTO"],
+        )
+        plan = build_digest_plan(
+            histories=histories,
+            affected_tickers=["VLTO"],
+            backfill_status=backfill,
+            previous_digest_rows=[],
+            digest_date="2026-07-05",
+            archive_stats=build_archive_stats(
+                type("RawUpdate", (), {"new_rows": 2, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 2})(),
+                summary_written=1,
+                digest_logged=0,
+                bootstrap_completed=False,
+            ),
+        )
+        self.assertEqual(histories["VLTO"].primary_classification, "SINGLE_FILER_BULLISH_BET")
+        self.assertEqual(len(plan.detailed_flags), 0)
+        self.assertEqual(len(plan.compact_flags), 0)
+        self.assertFalse(plan.send_digest)
+
     def test_sales_are_not_automatically_bearish(self) -> None:
         scan = _scan()
         histories = build_ticker_histories(

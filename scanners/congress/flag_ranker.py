@@ -117,9 +117,54 @@ def _flag_category(history: TickerPoliticalHistory) -> str:
     return "purchase_flag"
 
 
+def _is_material_purchase(history: TickerPoliticalHistory) -> bool:
+    purchase_threshold = _float_env("POLITICAL_FLAG_PURCHASE_LOW", 100000.0)
+    call_threshold = _float_env("POLITICAL_FLAG_CALL_LOW", 100000.0)
+    window = history.windows.get(90) or history.windows.get(45)
+    if window is None:
+        return False
+    return window.stock_purchase_low >= purchase_threshold or window.call_purchase_low >= call_threshold
+
+
+def _is_material_sale(history: TickerPoliticalHistory) -> bool:
+    sale_threshold = _float_env("POLITICAL_FLAG_SALE_LOW", 100000.0)
+    window = history.windows.get(90) or history.windows.get(45)
+    if window is None:
+        return False
+    return window.sale_low >= sale_threshold or history.distribution_evidence_score >= 45.0
+
+
+def _is_material_classification_change(history: TickerPoliticalHistory) -> bool:
+    if not history.classification_changed:
+        return False
+    if history.primary_classification in {"BROAD_ACCUMULATION", "DISTRIBUTION", "MIXED_HIGH_ACTIVITY"}:
+        return True
+    if history.primary_classification == "SINGLE_FILER_BULLISH_BET":
+        return _is_material_purchase(history)
+    if history.primary_classification == "REPEAT_FILER_ACCUMULATION":
+        return _is_material_purchase(history)
+    return False
+
+
+def _qualifies_for_digest(history: TickerPoliticalHistory) -> bool:
+    if {"MATERIAL_AMENDMENT", "DATA_CORRECTION"} & set(history.release_types):
+        return True
+    if _is_material_classification_change(history):
+        return True
+    if history.primary_classification == "BROAD_ACCUMULATION":
+        return True
+    if history.primary_classification in {"DISTRIBUTION", "MIXED_HIGH_ACTIVITY"} and _is_material_sale(history):
+        return True
+    if history.primary_classification == "SINGLE_FILER_BULLISH_BET" and _is_material_purchase(history):
+        return True
+    if history.primary_classification == "REPEAT_FILER_ACCUMULATION" and _is_material_purchase(history):
+        return True
+    return False
+
+
 def _exceptional(history: TickerPoliticalHistory) -> bool:
     return (
-        history.classification_changed
+        _is_material_classification_change(history)
         or "LIVE_DISCLOSURE" in history.release_types
         or "MATERIAL_AMENDMENT" in history.release_types
         or history.primary_classification in {"BROAD_ACCUMULATION", "DISTRIBUTION", "MIXED_HIGH_ACTIVITY"}
@@ -147,6 +192,7 @@ def build_digest_plan(
         for history in relevant_histories
         if history.summary_hash != previous_hash_by_ticker.get(history.ticker.upper()) or history.classification_changed
     ]
+    relevant_histories = [history for history in relevant_histories if _qualifies_for_digest(history)]
     if backfill_status.bootstrap_run:
         relevant_histories = [
             history
