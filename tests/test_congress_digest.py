@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from funnel.political_archive import build_archive_stats
 from scanners.congress.flag_ranker import build_digest_plan, classify_release_type, detect_backfill_status
@@ -378,6 +380,32 @@ class CongressDigestTests(unittest.TestCase):
             ),
         )
         self.assertIsNone(render_digest(plan, now_sg=datetime.fromisoformat("2026-06-24T12:00:00+08:00")))
+
+    def test_no_new_event_run_can_send_success_notification_when_enabled(self) -> None:
+        with patch.dict(os.environ, {"POLITICAL_DIGEST_SEND_EMPTY": "true"}, clear=False):
+            plan = build_digest_plan(
+                histories={},
+                affected_tickers=[],
+                backfill_status=detect_backfill_status(
+                    bootstrap_run=False,
+                    new_records=[],
+                    material_amendments=[],
+                    removed_events=[],
+                    affected_tickers=[],
+                ),
+                previous_digest_rows=[],
+                digest_date="2026-06-24",
+                archive_stats=build_archive_stats(
+                    type("RawUpdate", (), {"new_rows": 0, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 0})(),
+                    summary_written=0,
+                    digest_logged=0,
+                    bootstrap_completed=False,
+                ),
+            )
+            digest = render_digest(plan, now_sg=datetime.fromisoformat("2026-06-24T12:00:00+08:00"))
+        assert digest is not None
+        self.assertIn("Scan completed successfully.", digest)
+        self.assertIn("No political disclosures met the digest criteria in this run.", digest)
 
     def test_digest_log_rows_capture_summary_hashes(self) -> None:
         scan = _scan()

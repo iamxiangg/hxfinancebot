@@ -138,6 +138,28 @@ def render_digest(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> str 
     if not plan.send_digest:
         return None
     today = now_sg.date() if isinstance(now_sg, datetime) else now_sg
+    if not plan.detailed_flags and not plan.compact_flags:
+        lines = [
+            "DAILY POLITICAL-TRADING DIGEST",
+            today.strftime("%d %B %Y"),
+            "",
+            "Scan completed successfully.",
+            "No political disclosures met the digest criteria in this run.",
+            "",
+            "DATA STATUS",
+            f"New records {plan.data_status.get('new_records', 0)}",
+            f"Material amendments {plan.data_status.get('material_amendments', 0)}",
+            f"Historical backfills {plan.data_status.get('historical_backfills', 0)}",
+            f"Affected tickers {plan.data_status.get('affected_tickers', 0)}",
+            f"Recorded-only count {plan.data_status.get('recorded_only_count', 0)}",
+        ]
+        if plan.backfill_status and plan.backfill_status.probable_backfill:
+            lines.extend(
+                [
+                    f"Backfill status probable ({', '.join(plan.backfill_status.reasons) or 'bootstrap'})",
+                ]
+            )
+        return "\n".join(lines).strip()
     lines = [
         "DAILY POLITICAL-TRADING DIGEST",
         today.strftime("%d %B %Y"),
