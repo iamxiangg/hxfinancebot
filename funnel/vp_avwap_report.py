@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import datetime
 import math
 import os
 from pathlib import Path
@@ -26,25 +27,56 @@ SHORT_ROUTE_LABELS = {
     "VAL_RECLAIM": "Reclaim VAL",
 }
 
-HIGH_SIGNAL_STATUSES = {"CONFIRMED", "TESTING", "APPROACHING"}
 TELEGRAM_MAX_SETUPS = 4
 CONFIRMED_ACTIONABLE_MAX_DISTANCE_PCT = 2.0
+TELEGRAM_BUCKET_BUY_SIGNAL = "BUY_SIGNAL"
+TELEGRAM_BUCKET_WAIT_FOR_DAILY_CLOSE = "WAIT_FOR_DAILY_CLOSE"
+TELEGRAM_BUCKET_OTHER = "OTHER"
+TELEGRAM_DIVIDER = "\u2501" * 18
+ICON_HEADER = "\U0001F4CA"
+ICON_BUY = "\U0001F7E2"
+ICON_WAIT = "\U0001F7E1"
+ICON_OTHER = "\u26AA"
+ICON_BUY_ACTIVE = "\u2705"
+ICON_WAITING = "\u23F3"
+ICON_GRADE_CHANGE = "\U0001F504"
+BULLET = "\u2022"
+MIDDLE_DOT = "\u00B7"
+
+GRADE_LABELS = {
+    1: "Grade A",
+    2: "Grade B",
+    3: "Grade C",
+    4: "Grade D",
+}
 
 
 def _money(value: float | None) -> str:
     return "N/A" if value is None else f"${value:,.2f}"
 
 
+def _finite_number(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _price_range(low: float | None, high: float | None) -> str:
-    if low is None and high is None:
+    safe_low = _finite_number(low)
+    safe_high = _finite_number(high)
+    if safe_low is None and safe_high is None:
         return "N/A"
-    if low is None:
-        return _money(high)
-    if high is None:
-        return _money(low)
-    if abs(low - high) < 1e-9:
-        return _money(low)
-    return f"{_money(low)}-{_money(high)}"
+    if safe_low is None:
+        return _money(safe_high)
+    if safe_high is None:
+        return _money(safe_low)
+    if abs(safe_low - safe_high) < 1e-9:
+        return _money(safe_low)
+    return f"{_money(safe_low)}-{_money(safe_high)}"
 
 
 def _short_reason(text: str) -> str:
@@ -69,32 +101,105 @@ def _tradingview_url(result: TickerAnalysis) -> str:
     return f"https://www.tradingview.com/chart/?symbol={encoded_symbol}"
 
 
-def _is_actionable_now(result: TickerAnalysis) -> bool:
-    status = result.preferred_route.status
-    distance = result.preferred_route.distance_to_zone_pct
-    if status == "TESTING":
-        return True
-    if status == "APPROACHING" and (distance is None or distance <= 2.0):
-        return True
-    if status == "CONFIRMED" and distance is not None and distance <= CONFIRMED_ACTIONABLE_MAX_DISTANCE_PCT:
-        return True
-    return False
+def telegram_grade(tier: int | None) -> str:
+    return GRADE_LABELS.get(tier or 0, "Grade ?")
 
 
-def _telegram_trigger(result: TickerAnalysis) -> str:
-    route = result.preferred_route
-    trigger = _money(route.entry_trigger_price)
-    if route.entry_trigger_price is None:
-        return route.entry_trigger_condition
-    if route.route_code == "BREAKOUT_RETEST":
-        return f"Close back above {trigger} after retest"
-    if route.route_code == "VAL_RECLAIM":
-        return f"Close above {trigger} after reclaim"
-    if route.route_code == "POC_AVWAP_RECOVERY":
-        return f"Close above {trigger} after recovery"
-    if route.route_code == "VAH_DEFENDED_PULLBACK":
-        return f"Close above {trigger} after VAH hold"
-    return route.entry_trigger_condition
+def telegram_execution_distance_pct(result: TickerAnalysis) -> float | None:
+    current_price = _finite_number(result.current_price)
+    entry_trigger = _finite_number(result.preferred_route.entry_trigger_price)
+    if current_price is None or entry_trigger in (None, 0.0):
+        return None
+    return ((current_price / entry_trigger) - 1.0) * 100.0
+
+
+def telegram_gap_to_trigger_pct(result: TickerAnalysis) -> float | None:
+    current_price = _finite_number(result.current_price)
+    entry_trigger = _finite_number(result.preferred_route.entry_trigger_price)
+    if current_price is None or entry_trigger in (None, 0.0):
+        return None
+    return max(0.0, ((entry_trigger - current_price) / entry_trigger) * 100.0)
+
+
+def telegram_max_execution_price(result: TickerAnalysis) -> float | None:
+    entry_trigger = _finite_number(result.preferred_route.entry_trigger_price)
+    if entry_trigger in (None, 0.0):
+        return None
+    return entry_trigger * (1.0 + (CONFIRMED_ACTIONABLE_MAX_DISTANCE_PCT / 100.0))
+
+
+def telegram_execution_bucket(result: TickerAnalysis) -> str:
+    if result.final_tier != 1:
+        return TELEGRAM_BUCKET_OTHER
+    if result.preferred_route.status == "CONFIRMED":
+        execution_distance_pct = telegram_execution_distance_pct(result)
+        if execution_distance_pct is not None and 0.0 <= execution_distance_pct <= (CONFIRMED_ACTIONABLE_MAX_DISTANCE_PCT + 1e-9):
+            return TELEGRAM_BUCKET_BUY_SIGNAL
+        return TELEGRAM_BUCKET_OTHER
+    if result.preferred_route.status == "TESTING":
+        current_price = _finite_number(result.current_price)
+        entry_trigger = _finite_number(result.preferred_route.entry_trigger_price)
+        if current_price is not None and entry_trigger not in (None, 0.0):
+            return TELEGRAM_BUCKET_WAIT_FOR_DAILY_CLOSE
+    return TELEGRAM_BUCKET_OTHER
+
+
+def telegram_setup_sort_key(result: TickerAnalysis, bucket: str) -> tuple[float, float, str]:
+    if bucket == TELEGRAM_BUCKET_BUY_SIGNAL:
+        metric = telegram_execution_distance_pct(result)
+    elif bucket == TELEGRAM_BUCKET_WAIT_FOR_DAILY_CLOSE:
+        metric = telegram_gap_to_trigger_pct(result)
+    else:
+        metric = None
+    return (
+        metric if metric is not None else math.inf,
+        -result.technical_score,
+        result.ticker,
+    )
+
+
+def _route_label(result: TickerAnalysis) -> str:
+    return SHORT_ROUTE_LABELS.get(result.preferred_route.route_code, result.preferred_route.route_label)
+
+
+def telegram_route_trigger_text(result: TickerAnalysis, *, confirmed: bool) -> str:
+    trigger = _money(_finite_number(result.preferred_route.entry_trigger_price))
+    route_code = result.preferred_route.route_code
+    if confirmed:
+        mapping = {
+            "VAH_DEFENDED_PULLBACK": f"Daily close confirmed above {trigger} after VAH hold.",
+            "POC_AVWAP_RECOVERY": f"Daily close confirmed above {trigger} after recovery.",
+            "BREAKOUT_RETEST": f"Daily close confirmed back above {trigger} after retest.",
+            "VAL_RECLAIM": f"Daily close confirmed above {trigger} after reclaim.",
+        }
+    else:
+        mapping = {
+            "VAH_DEFENDED_PULLBACK": f"Above {trigger} after VAH hold",
+            "POC_AVWAP_RECOVERY": f"Above {trigger} after recovery",
+            "BREAKOUT_RETEST": f"Back above {trigger} after retest",
+            "VAL_RECLAIM": f"Above {trigger} after reclaim",
+        }
+    return mapping.get(route_code, result.preferred_route.entry_trigger_condition or "N/A")
+
+
+def _support_text(result: TickerAnalysis) -> str:
+    name = (result.preferred_route.next_support_name or "").strip()
+    price = _finite_number(result.preferred_route.next_support_price)
+    if name and price is not None:
+        return f"{name} {_money(price)}"
+    if name:
+        return f"{name} N/A"
+    if price is not None:
+        return _money(price)
+    return "None"
+
+
+def _scan_date_text(observed_at_utc: str) -> str:
+    try:
+        stamp = datetime.fromisoformat(str(observed_at_utc).replace("Z", "+00:00"))
+    except ValueError:
+        return str(observed_at_utc)
+    return f"{stamp.day} {stamp.strftime('%b %Y')}"
 
 
 def _clean_json(value: Any) -> Any:
@@ -168,18 +273,6 @@ def format_detailed_entry_map(result: TickerAnalysis) -> str:
     return "\n".join(lines)
 
 
-def format_telegram_entry(result: TickerAnalysis) -> str:
-    route = result.preferred_route
-    lines = [
-        f"{result.ticker} | {route.status} | {SHORT_ROUTE_LABELS.get(route.route_code, route.route_label)} | {result.technical_score:.0f}",
-        f"Price {_money(result.current_price)} | Zone {_price_range(route.zone_low, route.zone_high)} | Stop {_money(route.route_invalidation)}",
-        f"Trigger {_telegram_trigger(result)} | Support {(route.next_support_name or 'None')} {_money(route.next_support_price)}",
-        f"Why {_short_reason(result.technical_reason or route.reason)}",
-        f"Chart {_tradingview_url(result)}",
-    ]
-    return "\n".join(lines)
-
-
 def detailed_results(scan_result: VpAvwapScanResult) -> list[TickerAnalysis]:
     tier_one = [result for result in scan_result.results if result.final_tier == 1]
     top_tier_two = [result for result in scan_result.results if result.final_tier == 2][:5]
@@ -195,48 +288,164 @@ def detailed_results(scan_result: VpAvwapScanResult) -> list[TickerAnalysis]:
     return ordered
 
 
-def format_telegram_report(scan_result: VpAvwapScanResult) -> str:
-    lines = ["VP/AVWAP TECHNICAL TIERS", ""]
-    for tier in (1, 2, 3, 4):
-        group = [result for result in scan_result.results if result.final_tier == tier]
-        if tier <= 2:
-            sample = ", ".join(result.ticker for result in group[:3]) if group else "None"
-            more = f" +{len(group) - 3} more" if len(group) > 3 else ""
-            lines.append(f"Tier {tier}: {len(group)} ({sample}{more})")
-        else:
-            lines.append(f"Tier {tier}: {len(group)}")
+def telegram_grade_change_text(result: TickerAnalysis) -> str | None:
+    if result.tier_change not in {"IMPROVED", "DETERIORATED"}:
+        return None
+    previous_tier = result.previous_technical_tier
+    if previous_tier is None or previous_tier == result.final_tier:
+        return None
+    return f"{result.ticker} {MIDDLE_DOT} {telegram_grade(previous_tier)} -> {telegram_grade(result.final_tier)} {MIDDLE_DOT} {_route_label(result)}"
 
-    changed = [
-        result
-        for result in scan_result.results
-        if result.tier_change in {"IMPROVED", "DETERIORATED"} or result.preferred_route.status == "CONFIRMED"
+
+def format_telegram_entry(result: TickerAnalysis, bucket: str, *, position: int | None = None) -> str:
+    route = result.preferred_route
+    title_prefix = ICON_BUY if bucket == TELEGRAM_BUCKET_BUY_SIGNAL else f"{ICON_WAIT} {position}."
+    lines = [
+        f"{title_prefix} {result.ticker} {MIDDLE_DOT} {_route_label(result)} {MIDDLE_DOT} {telegram_grade(result.final_tier)} {MIDDLE_DOT} Score {result.technical_score:.0f}",
+        "",
+        f"Price: {_money(_finite_number(result.current_price))}",
     ]
-    if changed:
-        lines.extend(["", "Changes"])
-        for result in changed:
-            change_label = result.tier_change if result.tier_change in {"IMPROVED", "DETERIORATED"} else result.preferred_route.status
-            lines.append(
-                f"{result.ticker} | {change_label} | Tier {result.final_tier} | {SHORT_ROUTE_LABELS.get(result.preferred_route.route_code, result.preferred_route.route_label)}"
-            )
+    if bucket == TELEGRAM_BUCKET_BUY_SIGNAL:
+        lines.extend(
+            [
+                f"Entry trigger: {_money(_finite_number(route.entry_trigger_price))}",
+                f"Max execution: {_money(telegram_max_execution_price(result))}",
+                f"Buy zone: {_price_range(route.zone_low, route.zone_high)}",
+                "",
+                f"{ICON_BUY_ACTIVE} BUY SIGNAL ACTIVE",
+                "",
+                "Confirmed:",
+                telegram_route_trigger_text(result, confirmed=True),
+            ]
+        )
+    else:
+        gap_to_trigger_pct = telegram_gap_to_trigger_pct(result)
+        lines.extend(
+            [
+                f"Buy zone: {_price_range(route.zone_low, route.zone_high)}",
+                f"Required close: {telegram_route_trigger_text(result, confirmed=False)}",
+                f"Gap to trigger: {gap_to_trigger_pct:.2f}%" if gap_to_trigger_pct is not None else "Gap to trigger: N/A",
+                "",
+                f"{ICON_WAITING} NO BUY SIGNAL YET",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Setup fails on daily close below:",
+            _money(_finite_number(route.route_invalidation)),
+            "",
+            "Next support:",
+            _support_text(result),
+            "",
+            "Chart:",
+            _tradingview_url(result),
+        ]
+    )
+    return "\n".join(lines)
 
-    details = [result for result in scan_result.results if result.final_tier == 1 and _is_actionable_now(result)]
-    details.sort(
+
+def format_telegram_report(scan_result: VpAvwapScanResult) -> str:
+    total_results = len(scan_result.results)
+    buy_signals = sorted(
+        [result for result in scan_result.results if telegram_execution_bucket(result) == TELEGRAM_BUCKET_BUY_SIGNAL],
+        key=lambda result: telegram_setup_sort_key(result, TELEGRAM_BUCKET_BUY_SIGNAL),
+    )
+    wait_for_daily_close = sorted(
+        [result for result in scan_result.results if telegram_execution_bucket(result) == TELEGRAM_BUCKET_WAIT_FOR_DAILY_CLOSE],
+        key=lambda result: telegram_setup_sort_key(result, TELEGRAM_BUCKET_WAIT_FOR_DAILY_CLOSE),
+    )
+    other_count = max(0, total_results - len(buy_signals) - len(wait_for_daily_close))
+
+    displayed_buy_signals = buy_signals[:TELEGRAM_MAX_SETUPS]
+    remaining_slots = max(0, TELEGRAM_MAX_SETUPS - len(displayed_buy_signals))
+    displayed_wait_for_daily_close = wait_for_daily_close[:remaining_slots]
+    hidden_setup_count = (len(buy_signals) + len(wait_for_daily_close)) - (
+        len(displayed_buy_signals) + len(displayed_wait_for_daily_close)
+    )
+
+    grade_change_results = sorted(
+        [
+            result
+            for result in scan_result.results
+            if telegram_grade_change_text(result) is not None
+        ],
         key=lambda result: (
-            {"TESTING": 0, "CONFIRMED": 1, "APPROACHING": 2}.get(result.preferred_route.status, 9),
-            result.preferred_route.distance_to_zone_pct if result.preferred_route.distance_to_zone_pct is not None else math.inf,
+            0 if result.tier_change == "IMPROVED" else 1,
+            -abs((result.previous_technical_tier or result.final_tier) - result.final_tier),
             -result.technical_score,
             result.ticker,
-        )
+        ),
     )
-    total_detail_count = len(details)
-    details = details[:TELEGRAM_MAX_SETUPS]
-    if details:
-        lines.extend(["", "Actionable Now"])
-        for result in details:
-            lines.extend(["", format_telegram_entry(result)])
-        hidden = total_detail_count - len(details)
-        if hidden > 0:
-            lines.extend(["", f"More candidates: {hidden} additional high-priority setups in sheets/artifacts."])
+
+    lines = [
+        f"{ICON_HEADER} VP/AVWAP ENTRY ALERT",
+        _scan_date_text(scan_result.observed_at_utc),
+        "",
+        f"{ICON_BUY} BUY SIGNALS: {len(buy_signals)}",
+        f"{ICON_WAIT} WAIT FOR DAILY CLOSE: {len(wait_for_daily_close)}",
+        f"{ICON_OTHER} OTHER WATCHLIST TICKERS: {other_count}",
+        "",
+        TELEGRAM_DIVIDER,
+        f"{ICON_BUY} BUY SIGNALS",
+        TELEGRAM_DIVIDER,
+        "",
+        "Confirmed daily signal has occurred.",
+        "Only enter while price remains within 2% of the trigger.",
+        "",
+    ]
+
+    if displayed_buy_signals:
+        for index, result in enumerate(displayed_buy_signals):
+            if index:
+                lines.extend(["", TELEGRAM_DIVIDER, ""])
+            lines.append(format_telegram_entry(result, TELEGRAM_BUCKET_BUY_SIGNAL))
+    else:
+        lines.append("None currently within the execution range.")
+
+    lines.extend(
+        [
+            "",
+            TELEGRAM_DIVIDER,
+            f"{ICON_WAIT} WAIT FOR DAILY CLOSE",
+            TELEGRAM_DIVIDER,
+            "",
+            "Price is at the intended entry zone.",
+            "No buy signal exists until the daily trigger is met.",
+            "",
+        ]
+    )
+
+    if displayed_wait_for_daily_close:
+        for index, result in enumerate(displayed_wait_for_daily_close, start=1):
+            if index > 1:
+                lines.extend(["", TELEGRAM_DIVIDER, ""])
+            lines.append(
+                format_telegram_entry(
+                    result,
+                    TELEGRAM_BUCKET_WAIT_FOR_DAILY_CLOSE,
+                    position=index,
+                )
+            )
+    elif wait_for_daily_close:
+        lines.append("Additional waiting setups were omitted by the Telegram detail limit.")
+    else:
+        lines.append("None currently testing a Grade A buy zone.")
+
+    if grade_change_results:
+        lines.extend(["", TELEGRAM_DIVIDER, f"{ICON_GRADE_CHANGE} GRADE CHANGES", TELEGRAM_DIVIDER, ""])
+        for result in grade_change_results:
+            lines.append(telegram_grade_change_text(result) or "")
+
+    if hidden_setup_count > 0:
+        lines.extend(
+            [
+                "",
+                f"{hidden_setup_count} additional high-priority setups are available in:",
+                f"{BULLET} VP_AVWAP_Tiers",
+                f"{BULLET} VP_AVWAP_Entry_Map",
+            ]
+        )
     return "\n".join(lines).strip()
 
 

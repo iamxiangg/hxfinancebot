@@ -206,7 +206,73 @@ Telegram delivery is optional and controlled by:
 - `VP_AVWAP_TELEGRAM_TEST_MODE`
 - `VP_AVWAP_TRADINGVIEW_CHART_ID`
 
-When enabled, the runner sends a Telegram-specific mobile-friendly summary on every non-dry run. The message includes compact tier counts, material changes, and only the most actionable current setups, with emphasis on Tier 1 names in plain-English route labels such as `Hold Above VAH`, `Recover POC/AVWAP`, `Breakout Hold`, and `Reclaim VAL`. Stretched `CONFIRMED` names can still appear under material changes, but they are excluded from the `Actionable Now` block once price has moved too far above the preferred zone. Telegram failure never blocks artefact generation or other ticker processing.
+When enabled, the runner sends a Telegram-specific execution queue on every non-dry run. The Telegram layer does not change scanner mathematics, technical scores, tiers, or Sheets output. It is a presentation-only view over the existing VP/AVWAP scan results.
+
+Telegram setup-grade mapping:
+
+- Technical Tier 1 -> `Grade A`
+- Technical Tier 2 -> `Grade B`
+- Technical Tier 3 -> `Grade C`
+- Technical Tier 4 -> `Grade D`
+
+Setup grade means technical quality only. A `Grade A` ticker is not automatically a live buy signal.
+
+Telegram detailed execution buckets:
+
+- `BUY SIGNAL`
+- `WAIT FOR DAILY CLOSE`
+- `OTHER`
+
+`BUY SIGNAL` means:
+
+- internal Technical Tier 1 / Telegram `Grade A`
+- preferred route status is `CONFIRMED`
+- completed daily trigger has already occurred
+- current price is at or above the entry trigger
+- current price is no more than 2% above that trigger
+
+`WAIT FOR DAILY CLOSE` means:
+
+- internal Technical Tier 1 / Telegram `Grade A`
+- preferred route status is `TESTING`
+- price is currently at the intended buy zone
+- no completed daily buy confirmation exists yet
+
+`OTHER` means every remaining ticker, including approaching names, extended names, confirmed but already-stretched names, lower-grade names, failed routes, invalid routes, and unavailable data.
+
+Telegram shows detailed entries only for:
+
+- `BUY SIGNALS`
+- `WAIT FOR DAILY CLOSE`
+
+It does not show detailed entries for:
+
+- `APPROACHING`
+- `WAITING`
+- `EXTENDED`
+- `FAILED`
+- `INVALID`
+- `DATA_UNAVAILABLE`
+- `CONFIRMED` setups already more than 2% above the trigger
+
+The Telegram header date is derived from `observed_at_utc`, so the displayed alert date reflects the scan timestamp in UTC rather than the local machine clock.
+
+Telegram wording notes:
+
+- `BUY SIGNAL` is not an instruction to submit an unrestricted market order.
+- `Setup fails on daily close below` refers to route invalidation, not automatically to a portfolio stop-loss.
+- Position sizing and portfolio risk remain separate decisions outside this scanner.
+- Telegram intentionally omits approaching and extended setups to reduce noise.
+- Full results remain available in `VP_AVWAP_Tiers`, `VP_AVWAP_Entry_Map`, and the local JSON/CSV artefacts.
+
+Plain-English route labels used in Telegram:
+
+- `VAH_DEFENDED_PULLBACK` -> `Hold Above VAH`
+- `POC_AVWAP_RECOVERY` -> `Recover POC/AVWAP`
+- `BREAKOUT_RETEST` -> `Breakout Hold`
+- `VAL_RECLAIM` -> `Reclaim VAL`
+
+Telegram failure never blocks artefact generation or other ticker processing.
 If `Google Ticker` is present, each setup block also includes a TradingView chart URL. Set `VP_AVWAP_TRADINGVIEW_CHART_ID` to reuse a specific TradingView layout, for example `9OmQpc2c`, which yields links like `https://www.tradingview.com/chart/9OmQpc2c/?symbol=NYSE%3AZETA`.
 
 ## Environment Variables
@@ -284,7 +350,7 @@ The workflow now defaults `VP_AVWAP_SEND_TELEGRAM` to `true`. You can override b
 - DGT is protected-source.
 - This code does not reproduce or use DGT source code.
 - Exact DGT numerical matching is not guaranteed.
-- Yahoo and TradingView feeds may differ.
+- Yahoo-derived levels may differ from TradingView or DGT.
 - Lower-timeframe availability can change POC, VAH, and VAL.
 - Daily fallback has reduced data quality.
 - Technical Tier is separate from Feroldi and other fundamental scores.
