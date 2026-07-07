@@ -37,6 +37,7 @@ def _make_result(
     next_support_name: str | None = "VAL",
     next_support_price: float | None = 95.0,
     route_code: str = "VAH_DEFENDED_PULLBACK",
+    route_metadata: dict | None = None,
     previous_tier: int | None = None,
     tier_change: str = "UNCHANGED",
 ) -> TickerAnalysis:
@@ -57,6 +58,7 @@ def _make_result(
     result.preferred_route.route_invalidation = route_invalidation
     result.preferred_route.next_support_name = next_support_name
     result.preferred_route.next_support_price = next_support_price
+    result.preferred_route.metadata = route_metadata or {}
     return result
 
 
@@ -208,6 +210,41 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Setup fails on daily close below:", message)
         self.assertNotIn("✅ BUY SIGNAL ACTIVE", message)
         self.assertNotIn("Stop $36.39", message)
+
+    def test_breakout_hold_buy_signal_uses_exact_telegram_wording(self) -> None:
+        result = _make_result(
+            ticker="FOUR",
+            google_ticker="FOUR",
+            score=85.0,
+            current_price=51.38,
+            zone_low=50.37,
+            zone_high=50.87,
+            entry_trigger=50.87,
+            route_invalidation=50.12,
+            next_support_name="Previous Anchor VWAP Close",
+            next_support_price=46.01,
+            route_code="BREAKOUT_RETEST",
+            route_metadata={
+                "breakout_level": 50.62,
+                "breakout_reference_date": "2026-05-07T00:00:00",
+                "breakout_confirmation_date": "2026-07-02T00:00:00",
+                "breakout_confirmation_close": 51.35,
+                "retest_confirmation_date": "2026-07-06T00:00:00",
+            },
+        )
+        message = format_telegram_report(_make_scan(result))
+        self.assertIn("Price: $51.38", message)
+        self.assertIn("Retest zone: $50.37-$50.87", message)
+        self.assertIn("Stored breakout level: $50.62", message)
+        self.assertIn("Max execution: $51.89", message)
+        self.assertIn("Breakout reference:", message)
+        self.assertIn("Prior post-earnings high from 7 May 2026 at $50.62", message)
+        self.assertIn("Breakout confirmed:", message)
+        self.assertIn("2 Jul 2026 daily close at $51.35 cleared the breakout level", message)
+        self.assertIn("Retest confirmed:", message)
+        self.assertIn("6 Jul 2026 daily close held the breakout zone and stayed above $50.62", message)
+        self.assertNotIn("Entry trigger:", message)
+        self.assertNotIn("Buy zone:", message)
 
     def test_missing_support_and_zone_render_cleanly(self) -> None:
         result = _make_result(

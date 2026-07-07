@@ -314,6 +314,7 @@ def evaluate_routes(
             retest_frame = current_period_daily.iloc[breakout_index + 1 : breakout_index + 1 + config.breakout_retest_window]
             confirmed_retest = False
             testing = False
+            retest_confirmation_date = None
             for bar in retest_frame.itertuples():
                 bar_low = float(bar.Low)
                 bar_high = float(bar.High)
@@ -321,6 +322,8 @@ def evaluate_routes(
                 if _is_in_zone(bar_low, bar_high, zone_low=zone_low, zone_high=zone_high):
                     if bar_close > breakout_level:
                         confirmed_retest = True
+                        retest_confirmation_date = getattr(bar, "Index", None)
+                        break
                     else:
                         testing = True
             if confirmed_retest:
@@ -354,7 +357,15 @@ def evaluate_routes(
                     level_basis=["Breakout Level"],
                     reason="Breakout level is stored from the prior post-earnings range high with no look-ahead.",
                     levels=structural_levels,
-                    metadata={"breakout_level": breakout_level, "breakout_index": breakout_index, "confirmed_retest": confirmed_retest},
+                    metadata={
+                        "breakout_level": breakout_level,
+                        "breakout_index": breakout_index,
+                        "confirmed_retest": confirmed_retest,
+                        "breakout_reference_date": current_period_daily["High"].iloc[:breakout_index].idxmax(),
+                        "breakout_confirmation_date": current_period_daily.index[breakout_index],
+                        "breakout_confirmation_close": float(current_period_daily["Close"].iloc[breakout_index]),
+                        "retest_confirmation_date": retest_confirmation_date,
+                    },
                 )
             )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime
+from datetime import date, datetime
 import math
 import os
 from pathlib import Path
@@ -202,6 +202,23 @@ def _scan_date_text(observed_at_utc: str) -> str:
     return f"{stamp.day} {stamp.strftime('%b %Y')}"
 
 
+def _event_date_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, date):
+        stamp = datetime.combine(value, datetime.min.time())
+    elif hasattr(value, "to_pydatetime"):
+        stamp = value.to_pydatetime()
+    else:
+        try:
+            stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return f"{stamp.day} {stamp.strftime('%b %Y')}"
+
+
 def _clean_json(value: Any) -> Any:
     if value is None:
         return None
@@ -305,7 +322,32 @@ def format_telegram_entry(result: TickerAnalysis, bucket: str, *, position: int 
         "",
         f"Price: {_money(_finite_number(result.current_price))}",
     ]
-    if bucket == TELEGRAM_BUCKET_BUY_SIGNAL:
+    is_breakout_hold = route.route_code == "BREAKOUT_RETEST"
+    if bucket == TELEGRAM_BUCKET_BUY_SIGNAL and is_breakout_hold:
+        breakout_level = _money(_finite_number(route.metadata.get("breakout_level")))
+        breakout_reference_date = _event_date_text(route.metadata.get("breakout_reference_date"))
+        breakout_confirmation_date = _event_date_text(route.metadata.get("breakout_confirmation_date"))
+        breakout_confirmation_close = _money(_finite_number(route.metadata.get("breakout_confirmation_close")))
+        retest_confirmation_date = _event_date_text(route.metadata.get("retest_confirmation_date"))
+        lines.extend(
+            [
+                f"Retest zone: {_price_range(route.zone_low, route.zone_high)}",
+                f"Stored breakout level: {breakout_level}",
+                f"Max execution: {_money(telegram_max_execution_price(result))}",
+                "",
+                f"{ICON_BUY_ACTIVE} BUY SIGNAL ACTIVE",
+                "",
+                "Breakout reference:",
+                f"Prior post-earnings high from {breakout_reference_date or 'N/A'} at {breakout_level}",
+                "",
+                "Breakout confirmed:",
+                f"{breakout_confirmation_date or 'N/A'} daily close at {breakout_confirmation_close} cleared the breakout level",
+                "",
+                "Retest confirmed:",
+                f"{retest_confirmation_date or 'N/A'} daily close held the breakout zone and stayed above {breakout_level}",
+            ]
+        )
+    elif bucket == TELEGRAM_BUCKET_BUY_SIGNAL:
         lines.extend(
             [
                 f"Entry trigger: {_money(_finite_number(route.entry_trigger_price))}",
