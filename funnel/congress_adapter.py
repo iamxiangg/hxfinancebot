@@ -78,6 +78,12 @@ class CongressAdapterRun:
     previous_ticker_states: dict[str, dict[str, Any]]
     ranked_digest_flags: list[dict[str, Any]]
     compact_digest_items: list[dict[str, Any]]
+    new_material_flags: list[dict[str, Any]]
+    material_updates: list[dict[str, Any]]
+    active_watchlist_items: list[dict[str, Any]]
+    other_new_activity: list[dict[str, Any]]
+    expired_watchlist_items: list[dict[str, Any]]
+    watchlist_state_changes: list[dict[str, Any]]
     backfill_status: PoliticalBackfillStatus
     archive_stats: PoliticalArchiveStats
     digest_plan: PoliticalDigestPlan
@@ -499,6 +505,7 @@ def run_congress_adapter_detailed(
     observed_datetime = _normalise_datetime(observed_at or datetime.now(UTC).isoformat())
     ledger, ledger_context = _load_ledger()
     archive_state = load_political_archive_state()
+    previous_summary_rows = dict(archive_state.summary_rows)
     scan = run_live_scan(
         prior_ledger=ledger,
         branch_scope=os.getenv("POLITICAL_DISCLOSURE_SCOPE", "all"),
@@ -581,10 +588,29 @@ def run_congress_adapter_detailed(
         removed_events=removed_records,
         affected_tickers=affected_tickers,
     )
+    digest_plan = build_digest_plan(
+        histories=histories,
+        affected_tickers=affected_tickers,
+        backfill_status=backfill_status,
+        previous_digest_rows=archive_state.digest_rows,
+        previous_summary_rows=previous_summary_rows,
+        digest_date=observed_datetime.date().isoformat(),
+        archive_stats=build_archive_stats(
+            raw_update,
+            summary_written=len(histories),
+            digest_logged=0,
+            bootstrap_completed=bootstrap_run,
+        ),
+        observed_at=observed_datetime,
+    )
 
     summary_rows = [
-        summary_row_from_history(history, updated_at=observed_datetime.isoformat())
-        for _, history in sorted(histories.items())
+        summary_row_from_history(
+            history,
+            updated_at=observed_datetime.isoformat(),
+            watchlist_state=digest_plan.current_watchlist_states.get(ticker),
+        )
+        for ticker, history in sorted(histories.items())
     ]
     persist_summary_rows(archive_state, summary_rows)
 
@@ -593,14 +619,6 @@ def run_congress_adapter_detailed(
         summary_written=len(summary_rows),
         digest_logged=0,
         bootstrap_completed=bootstrap_run,
-    )
-    digest_plan = build_digest_plan(
-        histories=histories,
-        affected_tickers=affected_tickers,
-        backfill_status=backfill_status,
-        previous_digest_rows=archive_state.digest_rows,
-        digest_date=observed_datetime.date().isoformat(),
-        archive_stats=archive_stats,
     )
 
     if bootstrap_run:
@@ -636,9 +654,15 @@ def run_congress_adapter_detailed(
         removed_records=removed_records,
         affected_tickers=affected_tickers,
         current_ticker_histories=histories,
-        previous_ticker_states=archive_state.summary_rows,
-        ranked_digest_flags=[flag.to_dict() for flag in digest_plan.detailed_flags],
-        compact_digest_items=[flag.to_dict() for flag in digest_plan.compact_flags],
+        previous_ticker_states=previous_summary_rows,
+        ranked_digest_flags=[flag.to_dict() for flag in digest_plan.new_material_flags],
+        compact_digest_items=[flag.to_dict() for flag in digest_plan.other_new_activity],
+        new_material_flags=[flag.to_dict() for flag in digest_plan.new_material_flags],
+        material_updates=[flag.to_dict() for flag in digest_plan.material_updates],
+        active_watchlist_items=[flag.to_dict() for flag in digest_plan.active_watchlist_items],
+        other_new_activity=[flag.to_dict() for flag in digest_plan.other_new_activity],
+        expired_watchlist_items=[flag.to_dict() for flag in digest_plan.expired_watchlist_items],
+        watchlist_state_changes=[flag.to_dict() for flag in digest_plan.watchlist_state_changes],
         backfill_status=backfill_status,
         archive_stats=archive_stats,
         digest_plan=digest_plan,

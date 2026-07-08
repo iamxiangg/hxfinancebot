@@ -285,6 +285,7 @@ class PoliticalArchiveTests(unittest.TestCase):
             affected_tickers=["OLD"],
             backfill_status=backfill,
             previous_digest_rows=[],
+            previous_summary_rows={},
             digest_date="2026-06-24",
             archive_stats=build_archive_stats(
                 prepare_raw_archive_upserts(scan.transactions[:1], existing_rows={}, observed_at="2026-06-24T12:00:00+08:00", payload_hash="payload"),
@@ -292,6 +293,7 @@ class PoliticalArchiveTests(unittest.TestCase):
                 digest_logged=0,
                 bootstrap_completed=True,
             ),
+            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
         )
         self.assertFalse(plan.send_digest)
 

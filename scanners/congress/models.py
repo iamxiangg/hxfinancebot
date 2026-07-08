@@ -180,6 +180,7 @@ class TickerPoliticalHistory:
     previous_classification: str = "INSUFFICIENT_EVIDENCE"
     classification_changed: bool = False
     summary_hash: str = ""
+    entry_category: str = "OTHER"
     latest_transaction_date: str = ""
     latest_filing_date: str = ""
     latest_trigger_type: str = ""
@@ -197,6 +198,66 @@ class TickerPoliticalHistory:
             for window, summary in sorted(self.windows.items())
         }
         return payload
+
+
+@dataclass(frozen=True)
+class MaterialStateChange:
+    change_type: str
+    reason: str
+    previous_value: str = ""
+    current_value: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PoliticalWatchlistState:
+    ticker: str
+    structure_classification: str = ""
+    bullish_evidence_score: float = 0.0
+    distribution_evidence_score: float = 0.0
+    breadth_score: float = 0.0
+    concentration_score: float = 0.0
+    political_conviction: float = 0.0
+    entry_quality: float = 0.0
+    first_flagged_at: str = ""
+    last_flagged_at: str = ""
+    watchlist_started_at: str = ""
+    watchlist_until: str = ""
+    watchlist_status: str = ""
+    watchlist_priority: int = 0
+    watchlist_retention_type: str = ""
+    watchlist_reminder_count: int = 0
+    last_detailed_alert_at: str = ""
+    last_compact_reminder_at: str = ""
+    previous_entry_category: str = "OTHER"
+    current_entry_category: str = "OTHER"
+    entry_category_changed: bool = False
+    previous_political_classification: str = "INSUFFICIENT_EVIDENCE"
+    current_political_classification: str = "INSUFFICIENT_EVIDENCE"
+    political_classification_changed: bool = False
+    last_material_change_at: str = ""
+    last_material_change_type: str = ""
+    last_material_change_reason: str = ""
+    last_detailed_summary_hash: str = ""
+    last_compact_summary_hash: str = ""
+    last_trigger_trade_keys: tuple[str, ...] = ()
+    watchlist_day: int = 0
+    watchlist_total_days: int = 0
+    current_detailed_summary_hash: str = ""
+    current_compact_summary_hash: str = ""
+    latest_material_event: str = ""
+    primary_risk: str = "None"
+    material_change_types: tuple[str, ...] = ()
+    material_change_reasons: tuple[str, ...] = ()
+    eligible_for_watchlist: bool = False
+    reminder_due: bool = False
+    has_new_material_event: bool = False
+    has_other_new_activity: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)

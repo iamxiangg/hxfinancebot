@@ -20,7 +20,7 @@ from funnel.review_schema import (
 )
 from funnel.review_setup import ensure_review_sheets
 from funnel.sheet_table import append_records, read_table, upsert_records
-from scanners.congress.models import PoliticalArchiveStats, TickerPoliticalHistory
+from scanners.congress.models import PoliticalArchiveStats, PoliticalWatchlistState, TickerPoliticalHistory
 
 
 BOOTSTRAP_STATE_KEY = "political_archive_bootstrapped_payload_sha"
@@ -307,10 +307,16 @@ def _history_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def summary_row_from_history(history: TickerPoliticalHistory, *, updated_at: str) -> dict[str, Any]:
+def summary_row_from_history(
+    history: TickerPoliticalHistory,
+    *,
+    updated_at: str,
+    watchlist_state: PoliticalWatchlistState | None = None,
+) -> dict[str, Any]:
     w45 = history.windows[45]
     w90 = history.windows[90]
     w365 = history.windows[365]
+    state = watchlist_state or PoliticalWatchlistState(ticker=history.ticker)
     return {
         "Ticker": history.ticker,
         "Primary Classification": history.primary_classification,
@@ -376,6 +382,28 @@ def summary_row_from_history(history: TickerPoliticalHistory, *, updated_at: str
         "Political Conviction": round(history.political_conviction, 2),
         "Entry Quality": round(history.entry_quality, 2),
         "Summary Hash": history.summary_hash,
+        "First Flagged At": state.first_flagged_at,
+        "Last Flagged At": state.last_flagged_at,
+        "Watchlist Started At": state.watchlist_started_at,
+        "Watchlist Until": state.watchlist_until,
+        "Watchlist Status": state.watchlist_status,
+        "Watchlist Priority": state.watchlist_priority,
+        "Watchlist Retention Type": state.watchlist_retention_type,
+        "Watchlist Reminder Count": state.watchlist_reminder_count,
+        "Last Detailed Alert At": state.last_detailed_alert_at,
+        "Last Compact Reminder At": state.last_compact_reminder_at,
+        "Previous Entry Category": state.previous_entry_category,
+        "Current Entry Category": state.current_entry_category or history.entry_category,
+        "Entry Category Changed": _text_bool(state.entry_category_changed),
+        "Previous Political Classification": state.previous_political_classification or history.previous_classification,
+        "Current Political Classification": state.current_political_classification or history.primary_classification,
+        "Political Classification Changed": _text_bool(state.political_classification_changed),
+        "Last Material Change At": state.last_material_change_at,
+        "Last Material Change Type": state.last_material_change_type,
+        "Last Material Change Reason": state.last_material_change_reason,
+        "Last Detailed Summary Hash": state.last_detailed_summary_hash,
+        "Last Compact Summary Hash": state.last_compact_summary_hash,
+        "Last Trigger Trade Keys": _history_json(list(state.last_trigger_trade_keys or history.latest_trigger_trade_keys)),
         "Last Updated": updated_at,
     }
 
@@ -403,10 +431,10 @@ def persist_raw_archive_updates(state: PoliticalArchiveState, update: RawArchive
 def persist_summary_rows(state: PoliticalArchiveState, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
+    merged = dict(state.summary_rows)
+    for row in rows:
+        merged[str(row.get("Ticker") or "").strip().upper()] = row
     if state.context is None:
-        merged = dict(state.summary_rows)
-        for row in rows:
-            merged[str(row.get("Ticker") or "").strip().upper()] = row
         _save_json(_summary_path(), list(merged.values()))
         state.summary_rows = merged
         return
@@ -418,6 +446,7 @@ def persist_summary_rows(state: PoliticalArchiveState, rows: list[dict[str, Any]
         "Ticker",
         rows,
     )
+    state.summary_rows = merged
 
 
 def persist_digest_rows(state: PoliticalArchiveState, rows: list[dict[str, Any]]) -> None:

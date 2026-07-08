@@ -10,9 +10,10 @@ from zoneinfo import ZoneInfo
 import requests
 
 from funnel.congress_adapter import run_congress_adapter_detailed
-from funnel.political_archive import load_political_archive_state, persist_digest_rows
+from funnel.political_archive import load_political_archive_state, persist_digest_rows, persist_summary_rows, summary_row_from_history
+from scanners.congress.watchlist import apply_delivery
 from scanners.congress.engine import MODEL_VERSION
-from tactical.congress_digest import chunk_digest, digest_log_rows, render_digest, write_digest_preview
+from tactical.congress_digest import digest_log_rows, render_digest, render_digest_parts, write_digest_preview
 
 
 TOKEN = str(os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
@@ -200,6 +201,15 @@ def send(items: list[str]) -> None:
             time.sleep(1)
 
 
+def _all_digest_flags(plan):
+    return (
+        *plan.new_material_flags,
+        *plan.material_updates,
+        *plan.active_watchlist_items,
+        *plan.other_new_activity,
+    )
+
+
 def failure(text: str) -> None:
     if not TOKEN or not CHAT_ID:
         return
@@ -248,16 +258,53 @@ def main() -> int:
             else:
                 logger.info("No political digest rendered for this run.")
             if digest_text and send_telegram:
-                output = chunk_digest(digest_text)
-                send(output)
-                telegram_sent = True
-                sent_at = datetime.now(TZ).isoformat()
-                logger.info(
-                    "Sent %d Telegram digest part(s) | signals=%d | payload=%s",
-                    len(output),
-                    len(run.signals),
-                    run.scan.metadata.payload_sha256,
-                )
+                parts = render_digest_parts(run.digest_plan, now_sg=datetime.now(TZ))
+                delivered_tickers: set[str] = set()
+                flag_by_ticker = {flag.ticker: flag for flag in _all_digest_flags(run.digest_plan)}
+                try:
+                    for part in parts:
+                        send([part.text])
+                        part_sent_at = datetime.now(TZ).isoformat()
+                        delivered_tickers.update(part.tickers)
+                        delivery_rows = []
+                        for ticker in part.tickers:
+                            state = run.digest_plan.current_watchlist_states.get(ticker)
+                            history = run.current_ticker_histories.get(ticker)
+                            flag = flag_by_ticker.get(ticker)
+                            if state is None or history is None or flag is None:
+                                continue
+                            delivered_hash = (
+                                state.current_compact_summary_hash
+                                if flag.section == "ACTIVE_POLITICAL_WATCHLIST"
+                                else history.summary_hash
+                            )
+                            updated_state = apply_delivery(
+                                state,
+                                delivered_section=flag.section,
+                                delivered_hash=delivered_hash,
+                                sent_at=part_sent_at,
+                            )
+                            run.digest_plan.current_watchlist_states[ticker] = updated_state
+                            delivery_rows.append(
+                                summary_row_from_history(
+                                    history,
+                                    updated_at=part_sent_at,
+                                    watchlist_state=updated_state,
+                                )
+                            )
+                        if delivery_rows:
+                            persist_summary_rows(load_political_archive_state(), delivery_rows)
+                    telegram_sent = True
+                    sent_at = datetime.now(TZ).isoformat()
+                    logger.info(
+                        "Sent %d Telegram digest part(s) | signals=%d | payload=%s",
+                        len(parts),
+                        len(run.signals),
+                        run.scan.metadata.payload_sha256,
+                    )
+                except Exception:
+                    logger.exception("Telegram digest delivery failed after %d delivered ticker(s).", len(delivered_tickers))
+                    raise
             elif digest_text:
                 logger.info("Digest delivery skipped because POLITICAL_DIGEST_SEND_TELEGRAM=false")
             digest_rows = digest_log_rows(

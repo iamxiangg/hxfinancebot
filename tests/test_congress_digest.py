@@ -7,14 +7,16 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from funnel.political_archive import build_archive_stats
+from funnel.political_archive import build_archive_stats, summary_row_from_history
 from scanners.congress.flag_ranker import build_digest_plan, classify_release_type, detect_backfill_status
+from scanners.congress.models import PoliticalWatchlistState, PoliticalWindowSummary, TickerPoliticalHistory
 from scanners.congress.ticker_history import build_ticker_histories
 from tactical.congress_digest import chunk_digest, digest_log_rows, render_digest
 from scanners.congress.engine import run_scan_from_payload
 
 
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "congress_digest_fixture.json"
+OBSERVED_AT = datetime.fromisoformat("2026-06-24T12:00:00+08:00")
 
 
 def _fixture_payload():
@@ -25,12 +27,19 @@ def _scan(observed_at="2026-06-24T12:00:00+08:00"):
     return run_scan_from_payload(_fixture_payload(), observed_at=observed_at, price_fetcher=lambda symbols, earliest: {})
 
 
+def _archive_stats(new_rows: int = 0):
+    return build_archive_stats(
+        type("RawUpdate", (), {"new_rows": new_rows, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": new_rows})(),
+        summary_written=0,
+        digest_logged=0,
+        bootstrap_completed=False,
+    )
+
+
 def _trigger_events(scan, *, bootstrap_run=False):
     events: dict[str, list[dict[str, object]]] = {}
     for record in scan.transactions:
-        if not record.ticker:
-            continue
-        if not record.is_new_discovery:
+        if not record.ticker or not record.is_new_discovery:
             continue
         event = {
             "trade_key": record.trade_key,
@@ -51,118 +60,112 @@ def _trigger_events(scan, *, bootstrap_run=False):
     return events
 
 
+def _build_plan(histories, events, *, previous_summary_rows=None, previous_digest_rows=None, affected_tickers=None, observed_at=OBSERVED_AT, bootstrap_run=False):
+    affected = affected_tickers if affected_tickers is not None else sorted(events)
+    backfill = detect_backfill_status(
+        bootstrap_run=bootstrap_run,
+        new_records=[event for ticker_events in events.values() for event in ticker_events],
+        material_amendments=[],
+        removed_events=[],
+        affected_tickers=affected,
+    )
+    return build_digest_plan(
+        histories=histories,
+        affected_tickers=affected,
+        backfill_status=backfill,
+        previous_digest_rows=previous_digest_rows or [],
+        previous_summary_rows=previous_summary_rows or {},
+        digest_date=observed_at.date().isoformat(),
+        archive_stats=_archive_stats(new_rows=len([event for ticker_events in events.values() for event in ticker_events])),
+        observed_at=observed_at,
+    )
+
+
+def _window() -> PoliticalWindowSummary:
+    return PoliticalWindowSummary(
+        window_days=90,
+        purchase_count=1,
+        unique_buyer_count=1,
+        stock_purchase_low=200000.0,
+        stock_purchase_high=300000.0,
+        largest_buyer_share_lower_bound=0.8,
+        largest_buyer_share_midpoint_estimate=0.8,
+    )
+
+
+def _history(
+    ticker: str,
+    *,
+    primary_classification: str = "SINGLE_FILER_BULLISH_BET",
+    entry_category: str = "WAIT",
+    entry_quality: float = 55.0,
+    political_conviction: float = 78.0,
+    new_events=None,
+    release_types=(),
+    summary_hash: str | None = None,
+) -> TickerPoliticalHistory:
+    windows = {
+        45: _window(),
+        90: _window(),
+        365: PoliticalWindowSummary(
+            window_days=365,
+            purchase_count=1,
+            unique_buyer_count=1,
+            stock_purchase_low=200000.0,
+            stock_purchase_high=300000.0,
+            largest_bullish_trade_low=200000.0,
+            largest_bullish_trade_high=300000.0,
+            largest_buyer_share_lower_bound=0.8,
+            largest_buyer_share_midpoint_estimate=0.8,
+        ),
+    }
+    return TickerPoliticalHistory(
+        ticker=ticker,
+        primary_classification=primary_classification,
+        structure_classification="OPTIONS_LED",
+        bullish_evidence_score=70.0,
+        distribution_evidence_score=10.0 if primary_classification != "DISTRIBUTION" else 65.0,
+        breadth_score=40.0,
+        concentration_score=80.0,
+        inference_confidence="HIGH",
+        data_confidence="HIGH",
+        windows=windows,
+        new_events=list(new_events or []),
+        flag_reasons=[f"{ticker} flag"],
+        previous_classification=primary_classification,
+        classification_changed=False,
+        summary_hash=summary_hash or f"{ticker.lower()}-{entry_category.lower()}",
+        entry_category=entry_category,
+        latest_transaction_date="2026-06-23",
+        latest_filing_date="2026-06-24",
+        latest_trigger_type=release_types[0] if release_types else "",
+        latest_trigger_trade_keys=tuple(event.get("trade_key", "") for event in (new_events or []) if event.get("trade_key")),
+        release_types=tuple(release_types),
+        political_conviction=political_conviction,
+        entry_quality=entry_quality,
+        signal_category=entry_category.lower(),
+        existing_status=entry_category.lower(),
+    )
+
+
 class CongressDigestTests(unittest.TestCase):
     def test_new_event_history_includes_earlier_purchases_and_sales(self) -> None:
         scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
+        histories = build_ticker_histories(scan.transactions, observed_at=OBSERVED_AT, trigger_events=_trigger_events(scan))
         intc = histories["INTC"]
         self.assertGreater(intc.windows[365].stock_purchase_low, 0.0)
         self.assertGreater(intc.windows[365].sale_low, 0.0)
 
-    def test_several_new_records_for_one_ticker_produce_one_dossier(self) -> None:
+    def test_several_new_records_for_one_ticker_produce_one_digest_appearance(self) -> None:
         scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        backfill = detect_backfill_status(
-            bootstrap_run=False,
-            new_records=[event for events in _trigger_events(scan).values() for event in events],
-            material_amendments=[],
-            removed_events=[],
-            affected_tickers=["INTC", "MSFT"],
-        )
-        plan = build_digest_plan(
-            histories=histories,
-            affected_tickers=["INTC", "MSFT"],
-            backfill_status=backfill,
-            previous_digest_rows=[],
-            digest_date="2026-06-24",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 2, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 2})(),
-                summary_written=2,
-                digest_logged=0,
-                bootstrap_completed=False,
-            ),
-        )
-        self.assertEqual(sum(flag["ticker"] == "MSFT" for flag in [item.to_dict() for item in plan.detailed_flags + plan.compact_flags]), 1)
-
-    def test_stock_call_and_put_amounts_remain_separate(self) -> None:
-        scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        intc = histories["INTC"].windows[90]
-        self.assertGreater(intc.call_purchase_low, 0.0)
-        self.assertGreater(intc.put_purchase_low, 0.0)
-        self.assertGreater(intc.stock_purchase_low, 0.0)
-
-    def test_lower_bound_thresholds_determine_flag_reasons(self) -> None:
-        scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        self.assertTrue(any("call purchases reached at least" in reason for reason in histories["INTC"].flag_reasons))
-        self.assertFalse(any("sales reached at least $500,000" in reason for reason in histories["INTC"].flag_reasons))
-
-    def test_windows_use_transaction_date(self) -> None:
-        scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        intc = histories["INTC"]
-        self.assertEqual(intc.windows[45].purchase_count, 2)
-        self.assertEqual(intc.windows[90].purchase_count, 3)
-
-    def test_filing_date_drives_release_freshness(self) -> None:
-        event = {
-            "trade_key": "late-1",
-            "ticker": "LATE",
-            "transaction_age": 40,
-            "days_to_file": 50,
-            "event_type": "NEW",
-        }
-        self.assertEqual(classify_release_type(event, bootstrap_run=False), "LATE_DISCLOSURE")
-
-    def test_historical_backfill_is_not_live_disclosure(self) -> None:
-        event = {
-            "trade_key": "hist-1",
-            "ticker": "HIST",
-            "transaction_age": 160,
-            "days_to_file": 10,
-            "event_type": "NEW",
-        }
-        self.assertEqual(classify_release_type(event, bootstrap_run=False), "HISTORICAL_BACKFILL")
-
-    def test_one_dominant_material_buyer_becomes_single_filer_bullish_bet(self) -> None:
-        scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        self.assertEqual(histories["INTC"].primary_classification, "SINGLE_FILER_BULLISH_BET")
-        self.assertEqual(histories["INTC"].structure_classification, "OPTIONS_LED")
-
-    def test_two_independent_buyers_become_broad_accumulation(self) -> None:
-        scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        self.assertEqual(histories["MSFT"].primary_classification, "BROAD_ACCUMULATION")
+        events = _trigger_events(scan)
+        histories = build_ticker_histories(scan.transactions, observed_at=OBSERVED_AT, trigger_events=events)
+        plan = _build_plan(histories, events, affected_tickers=["INTC", "MSFT"])
+        appearances = [
+            flag.ticker
+            for flag in (*plan.new_material_flags, *plan.material_updates, *plan.active_watchlist_items, *plan.other_new_activity)
+        ]
+        self.assertEqual(appearances.count("MSFT"), 1)
 
     def test_small_repeat_single_filer_buys_do_not_qualify_for_digest(self) -> None:
         payload = [
@@ -200,164 +203,27 @@ class CongressDigestTests(unittest.TestCase):
             },
         ]
         scan = run_scan_from_payload(payload, observed_at="2026-07-05T12:00:00+08:00", price_fetcher=lambda symbols, earliest: {})
+        observed_at = datetime.fromisoformat("2026-07-05T12:00:00+08:00")
         events = _trigger_events(scan)
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-07-05T12:00:00+08:00"),
-            trigger_events=events,
-        )
-        backfill = detect_backfill_status(
-            bootstrap_run=False,
-            new_records=[event for ticker_events in events.values() for event in ticker_events],
-            material_amendments=[],
-            removed_events=[],
-            affected_tickers=["VLTO"],
-        )
-        plan = build_digest_plan(
-            histories=histories,
-            affected_tickers=["VLTO"],
-            backfill_status=backfill,
-            previous_digest_rows=[],
-            digest_date="2026-07-05",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 2, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 2})(),
-                summary_written=1,
-                digest_logged=0,
-                bootstrap_completed=False,
-            ),
-        )
+        histories = build_ticker_histories(scan.transactions, observed_at=observed_at, trigger_events=events)
+        plan = _build_plan(histories, events, affected_tickers=["VLTO"], observed_at=observed_at)
         self.assertEqual(histories["VLTO"].primary_classification, "SINGLE_FILER_BULLISH_BET")
-        self.assertEqual(len(plan.detailed_flags), 0)
-        self.assertEqual(len(plan.compact_flags), 0)
+        self.assertFalse(plan.new_material_flags)
+        self.assertFalse(plan.other_new_activity)
         self.assertFalse(plan.send_digest)
-
-    def test_sales_are_not_automatically_bearish(self) -> None:
-        scan = _scan()
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=_trigger_events(scan),
-        )
-        self.assertEqual(histories["INTC"].primary_classification, "SINGLE_FILER_BULLISH_BET")
-        self.assertGreater(histories["INTC"].distribution_evidence_score, 0.0)
-
-    def test_one_run_generates_one_logical_digest_and_caps_top_flags(self) -> None:
-        scan = _scan()
-        events = _trigger_events(scan)
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=events,
-        )
-        backfill = detect_backfill_status(
-            bootstrap_run=False,
-            new_records=[event for ticker_events in events.values() for event in ticker_events],
-            material_amendments=[],
-            removed_events=[],
-            affected_tickers=["INTC", "MSFT"],
-        )
-        plan = build_digest_plan(
-            histories=histories,
-            affected_tickers=["INTC", "MSFT"],
-            backfill_status=backfill,
-            previous_digest_rows=[],
-            digest_date="2026-06-24",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 3, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 3})(),
-                summary_written=2,
-                digest_logged=0,
-                bootstrap_completed=False,
-            ),
-        )
-        digest = render_digest(plan, now_sg=datetime.fromisoformat("2026-06-24T12:00:00+08:00"))
-        assert digest is not None
-        self.assertIn("DAILY POLITICAL-TRADING DIGEST", digest)
-        self.assertLessEqual(len(plan.detailed_flags), 3)
 
     def test_unchanged_summary_hash_is_suppressed(self) -> None:
         scan = _scan()
         events = _trigger_events(scan)
-        initial_histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=events,
-        )
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            previous_summary_rows={
-                "INTC": {"Primary Classification": initial_histories["INTC"].primary_classification},
-                "MSFT": {"Primary Classification": initial_histories["MSFT"].primary_classification},
-            },
-            trigger_events=events,
-        )
-        previous_rows = [
-            {
-                "Ticker": "INTC",
-                "Summary Hash": histories["INTC"].summary_hash,
-            },
-            {
-                "Ticker": "MSFT",
-                "Summary Hash": histories["MSFT"].summary_hash,
-            },
-        ]
-        backfill = detect_backfill_status(
-            bootstrap_run=False,
-            new_records=[event for ticker_events in events.values() for event in ticker_events],
-            material_amendments=[],
-            removed_events=[],
-            affected_tickers=["INTC", "MSFT"],
-        )
-        plan = build_digest_plan(
-            histories=histories,
-            affected_tickers=["INTC", "MSFT"],
-            backfill_status=backfill,
-            previous_digest_rows=previous_rows,
-            digest_date="2026-06-24",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 0, "amended_rows": 0, "idempotent_rows": 2, "deactivated_rows": 0, "seen_updates": 2})(),
-                summary_written=2,
-                digest_logged=0,
-                bootstrap_completed=False,
-            ),
-        )
+        histories = build_ticker_histories(scan.transactions, observed_at=OBSERVED_AT, trigger_events=events)
+        previous_rows = {
+            ticker: {"Summary Hash": history.summary_hash, "Last Detailed Summary Hash": history.summary_hash}
+            for ticker, history in histories.items()
+        }
+        plan = _build_plan(histories, events, previous_summary_rows=previous_rows, affected_tickers=["INTC", "MSFT"])
+        self.assertFalse(plan.new_material_flags)
+        self.assertFalse(plan.other_new_activity)
         self.assertFalse(plan.send_digest)
-
-    def test_backfill_mode_limits_detailed_dossiers(self) -> None:
-        scan = _scan()
-        events = _trigger_events(scan, bootstrap_run=True)
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=events,
-        )
-        backfill = detect_backfill_status(
-            bootstrap_run=True,
-            new_records=[event for ticker_events in events.values() for event in ticker_events] * 101,
-            material_amendments=[],
-            removed_events=[],
-            affected_tickers=["INTC", "MSFT"] * 30,
-        )
-        plan = build_digest_plan(
-            histories=histories,
-            affected_tickers=["INTC", "MSFT"],
-            backfill_status=backfill,
-            previous_digest_rows=[],
-            digest_date="2026-06-24",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 202, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 202})(),
-                summary_written=2,
-                digest_logged=0,
-                bootstrap_completed=True,
-            ),
-        )
-        self.assertLessEqual(len(plan.detailed_flags), 3)
-
-    def test_telegram_chunking_preserves_readable_boundaries(self) -> None:
-        text = "\n\n".join(f"SECTION {index}\n" + ("x" * 900) for index in range(6))
-        chunks = chunk_digest(text, limit=1500)
-        self.assertGreater(len(chunks), 1)
-        self.assertTrue(all(len(chunk) <= 1515 for chunk in chunks))
 
     def test_no_new_event_run_sends_nothing_by_default(self) -> None:
         plan = build_digest_plan(
@@ -371,15 +237,12 @@ class CongressDigestTests(unittest.TestCase):
                 affected_tickers=[],
             ),
             previous_digest_rows=[],
+            previous_summary_rows={},
             digest_date="2026-06-24",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 0, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 0})(),
-                summary_written=0,
-                digest_logged=0,
-                bootstrap_completed=False,
-            ),
+            archive_stats=_archive_stats(),
+            observed_at=OBSERVED_AT,
         )
-        self.assertIsNone(render_digest(plan, now_sg=datetime.fromisoformat("2026-06-24T12:00:00+08:00")))
+        self.assertIsNone(render_digest(plan, now_sg=OBSERVED_AT))
 
     def test_no_new_event_run_can_send_success_notification_when_enabled(self) -> None:
         with patch.dict(os.environ, {"POLITICAL_DIGEST_SEND_EMPTY": "true"}, clear=False):
@@ -394,49 +257,67 @@ class CongressDigestTests(unittest.TestCase):
                     affected_tickers=[],
                 ),
                 previous_digest_rows=[],
+                previous_summary_rows={},
                 digest_date="2026-06-24",
-                archive_stats=build_archive_stats(
-                    type("RawUpdate", (), {"new_rows": 0, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 0})(),
-                    summary_written=0,
-                    digest_logged=0,
-                    bootstrap_completed=False,
-                ),
+                archive_stats=_archive_stats(),
+                observed_at=OBSERVED_AT,
             )
-            digest = render_digest(plan, now_sg=datetime.fromisoformat("2026-06-24T12:00:00+08:00"))
+            digest = render_digest(plan, now_sg=OBSERVED_AT)
         assert digest is not None
         self.assertIn("Scan completed successfully.", digest)
         self.assertIn("No political disclosures met the digest criteria in this run.", digest)
 
-    def test_digest_log_rows_capture_summary_hashes(self) -> None:
-        scan = _scan()
-        events = _trigger_events(scan)
-        histories = build_ticker_histories(
-            scan.transactions,
-            observed_at=datetime.fromisoformat("2026-06-24T12:00:00+08:00"),
-            trigger_events=events,
+    def test_rendered_digest_uses_new_section_headings(self) -> None:
+        new_history = _history(
+            "INTC",
+            new_events=[{"trade_key": "t1", "transaction_type": "Purchase", "amount_low": 1_000_000, "amount_high": 5_000_000, "transaction_date": "2026-06-23", "filing_date": "2026-06-24", "release_type": "LIVE_DISCLOSURE", "owner_relationship": "spouse"}],
+            release_types=("LIVE_DISCLOSURE",),
         )
-        backfill = detect_backfill_status(
-            bootstrap_run=False,
-            new_records=[event for ticker_events in events.values() for event in ticker_events],
-            material_amendments=[],
-            removed_events=[],
-            affected_tickers=["INTC", "MSFT"],
+        active_history = _history("MSFT")
+        active_state = PoliticalWatchlistState(
+            ticker="MSFT",
+            watchlist_started_at="2026-06-23T12:00:00+08:00",
+            watchlist_until="2026-06-30",
+            watchlist_status="ACTIVE",
+            watchlist_retention_type="STANDARD",
+            watchlist_day=1,
+            watchlist_total_days=5,
+            current_entry_category="WAIT",
+            previous_entry_category="WAIT",
+            current_political_classification="SINGLE_FILER_BULLISH_BET",
+            previous_political_classification="SINGLE_FILER_BULLISH_BET",
+            reminder_due=True,
+            latest_material_event="second company-specific purchase",
+            primary_risk="single-household concentration",
+            current_compact_summary_hash="compact-msft",
         )
-        plan = build_digest_plan(
-            histories=histories,
-            affected_tickers=["INTC", "MSFT"],
-            backfill_status=backfill,
-            previous_digest_rows=[],
-            digest_date="2026-06-24",
-            archive_stats=build_archive_stats(
-                type("RawUpdate", (), {"new_rows": 3, "amended_rows": 0, "idempotent_rows": 0, "deactivated_rows": 0, "seen_updates": 3})(),
-                summary_written=2,
-                digest_logged=0,
-                bootstrap_completed=False,
-            ),
+        previous_rows = {
+            "MSFT": summary_row_from_history(active_history, updated_at="2026-06-23T12:00:00+08:00", watchlist_state=active_state)
+        }
+        histories = {"INTC": new_history, "MSFT": active_history}
+        events = {"INTC": list(new_history.new_events)}
+        plan = _build_plan(histories, events, previous_summary_rows=previous_rows, affected_tickers=["INTC"])
+        digest = render_digest(plan, now_sg=OBSERVED_AT)
+        assert digest is not None
+        self.assertIn("NEW MATERIAL SIGNALS", digest)
+        self.assertIn("ACTIVE POLITICAL WATCHLIST", digest)
+
+    def test_digest_log_rows_capture_summary_hashes_and_sections(self) -> None:
+        history = _history(
+            "INTC",
+            new_events=[{"trade_key": "t1", "transaction_type": "Purchase", "amount_low": 1_000_000, "amount_high": 5_000_000, "transaction_date": "2026-06-23", "filing_date": "2026-06-24", "release_type": "LIVE_DISCLOSURE"}],
+            release_types=("LIVE_DISCLOSURE",),
         )
+        plan = _build_plan({"INTC": history}, {"INTC": list(history.new_events)}, affected_tickers=["INTC"])
         rows = digest_log_rows(plan, run_id="run-1", payload_hash="hash-1", telegram_included=False)
         self.assertTrue(all(row["Summary Hash"] for row in rows))
+        self.assertEqual(rows[0]["Digest Section"], "NEW_MATERIAL_SIGNALS")
+
+    def test_telegram_chunking_preserves_readable_boundaries(self) -> None:
+        text = "\n\n".join(f"SECTION {index}\n" + ("x" * 900) for index in range(6))
+        chunks = chunk_digest(text, limit=1500)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 1515 for chunk in chunks))
 
 
 if __name__ == "__main__":

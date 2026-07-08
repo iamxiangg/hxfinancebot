@@ -307,6 +307,13 @@ def _summary_hash(
     return _json_hash(payload)
 
 
+def _entry_category(value: Any) -> str:
+    category = str(value or "").strip().upper()
+    if category in {"ACTIONABLE", "WAIT", "RISK", "CONTEXT"}:
+        return category
+    return "OTHER"
+
+
 def build_ticker_histories(
     records: list[TransactionRecord],
     *,
@@ -401,6 +408,7 @@ def build_ticker_histories(
             previous_classification=previous_classification,
             classification_changed=previous_classification != primary_classification,
             summary_hash=summary_hash,
+            entry_category=_entry_category(getattr(current_result, "category", "other")),
             latest_transaction_date=max((record.transaction_date for record in records_in_order if record.transaction_date), default=""),
             latest_filing_date=max((record.filing_date for record in records_in_order if record.filing_date), default=""),
             latest_trigger_type=trigger_items[0].get("release_type", "") if trigger_items else "",
