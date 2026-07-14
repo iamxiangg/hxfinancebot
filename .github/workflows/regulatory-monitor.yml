@@ -1,0 +1,51 @@
+name: regulatory-monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * 1-5"
+
+concurrency:
+  group: regulatory-monitor
+  cancel-in-progress: false
+
+jobs:
+  regulatory-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify no-LLM safeguards
+        run: python -m unittest tests.test_no_llm_guardrails -v
+
+      - name: Run regulatory monitor
+        env:
+          REGULATORY_MONITOR_ENABLED: "true"
+          REGULATORY_SEND_TELEGRAM: "false"
+          REGULATORY_STATE_BACKEND: auto
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+          GCP_SERVICE_ACCOUNT_FILE: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+        run: python -m tactical.regulatory_runner --write-preview
+
+      - name: Upload regulatory preview and state
+        uses: actions/upload-artifact@v4
+        with:
+          name: regulatory-monitor-artifacts
+          path: |
+            funnel_output/regulatory_state
+            funnel_output/regulatory_audit
+          if-no-files-found: warn
+

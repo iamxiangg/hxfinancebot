@@ -146,6 +146,27 @@ def append_records(
     ).execute()
 
 
+def replace_records(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    headers: list[str],
+    records: list[dict[str, Any]],
+) -> None:
+    end_col = column_letter(len(headers))
+    values = [headers] + [[record.get(header, "") for header in headers] for record in records]
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!A1:{end_col}",
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": values},
+    ).execute()
+
+
 def upsert_records(
     service,
     spreadsheet_id: str,

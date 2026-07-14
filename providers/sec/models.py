@@ -36,6 +36,7 @@ class FilingMetadata:
     primary_document: str
     is_amendment: bool
     source_url: str
+    company_name: str = ""
 
     @property
     def accession_no_dashes(self) -> str:

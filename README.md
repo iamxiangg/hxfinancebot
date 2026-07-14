@@ -133,6 +133,18 @@ Source-level failures (e.g. VPMA crash) do not block other sources — the funne
 
 ---
 
+### Regulatory lifecycle monitor
+
+The repo now also includes a separate deterministic regulatory research system under `research/regulatory/`.
+
+- It monitors clinical, regulatory, issuer, market, and valuation context without using an LLM
+- It writes to dedicated regulatory Sheets and local JSON state
+- It does **not** automatically feed `BTD_Candidates`, `Signal_Log`, Feroldi gates, or portfolio-decision workflows
+- It uses Google Sheets as primary production persistence and local JSON as fallback
+- It does **not** introduce PostgreSQL, SQLite, SQLAlchemy, or migrations
+
+---
+
 ## Setup
 
 ### Requirements
@@ -211,6 +223,19 @@ Copy these to your GitHub Actions repository variables or a local `.env` file:
 | `FEROLDI_GATE_REVIEW_THRESHOLD` | 23.0 | Score threshold for manual review |
 | `FEROLDI_GATE_MIN_COVERAGE` | 0.75 | Minimum coverage ratio to evaluate gate |
 | `FEROLDI_GATE_ALLOW_REVIEW` | `true` | Allow review recommendations |
+| `REGULATORY_MONITOR_ENABLED` | `true` | Enable the regulatory lifecycle monitor |
+| `REGULATORY_SOURCES` | `clinicaltrials,sec,drugs_at_fda,openfda,configured_ir` | Regulatory sources to run |
+| `REGULATORY_STATE_BACKEND` | `auto` | `auto`, `sheets`, or `local` |
+| `REGULATORY_STATE_DIR` | `funnel_output/regulatory_state` | Local fallback state directory |
+| `REGULATORY_AUDIT_DIR` | `funnel_output/regulatory_audit` | Preview and raw payload archive directory |
+| `REGULATORY_BOOTSTRAP_LOOKBACK_DAYS` | `30` | Bootstrap lookback window |
+| `REGULATORY_BOOTSTRAP_SUPPRESS_NOTIFICATIONS` | `true` | Suppress ordinary bootstrap alerts |
+| `REGULATORY_INCREMENTAL_OVERLAP_DAYS` | `3` | Incremental overlap window |
+| `REGULATORY_SEND_TELEGRAM` | `true` | Enable or disable regulatory Telegram sends |
+| `REGULATORY_CT_GOV_PAGE_SIZE` | `50` | ClinicalTrials.gov page size |
+| `REGULATORY_SEC_SIC_ALLOWLIST` | `2833,2834,2835,2836,3841,3842,3845,8731` | Healthcare SIC allow-list hint |
+| `REGULATORY_MARKET_SNAPSHOTS_ENABLED` | `true` | Capture market snapshots |
+| `REGULATORY_VALUATION_ENABLED` | `true` | Enable manual-input-driven valuation |
 
 ---
 
@@ -241,6 +266,9 @@ VP_AVWAP_TEST_TICKERS="INTC,NVDA,AMD,DDOG" \
 VP_AVWAP_DRY_RUN=true \
 VP_AVWAP_WRITE_SHEETS=false \
 python -m tactical.vp_avwap_runner
+
+# Regulatory lifecycle monitor
+python -m tactical.regulatory_runner --dry-run --local
 ```
 
 ### VP/AVWAP technical tiers
@@ -276,6 +304,9 @@ python -m unittest tests.test_vpma_engine -v
 
 # Specific test
 python -m unittest tests.test_vpma_engine.ReactionCalculationTests.test_abnormal_return_with_duplicate_index -v
+
+# Focused regulatory monitor tests
+python -m unittest tests.test_regulatory_ids tests.test_regulatory_normalizer tests.test_regulatory_state_and_valuation tests.test_regulatory_archive tests.test_regulatory_engine_and_digest -v
 ```
 
 ### Run trajectory batch report
@@ -345,3 +376,9 @@ Committed by GitHub Actions:
 3. Add tests for any new behavior. Existing test patterns use `unittest` with `unittest.mock`.
 4. Do not change existing scoring thresholds without a documented reason.
 5. **Never** allow LLM-generated values to influence any investment decision (score, gate, admission, displacement, position sizing, Telegram eligibility).
+
+## Regulatory monitor docs
+
+- `docs/regulatory_lifecycle_architecture.md`
+- `python -m tactical.regulatory_runner --dry-run --local`
+- Regulatory output is isolated from `BTD_Candidates`, `Signal_Log`, Feroldi gating, and portfolio-decision workflows.

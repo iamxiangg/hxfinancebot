@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+from funnel.regulatory_schema import (
+    REGULATORY_CURRENT_HEADERS,
+    REGULATORY_CURRENT_SHEET,
+    REGULATORY_DIGEST_LOG_HEADERS,
+    REGULATORY_DIGEST_LOG_SHEET,
+    REGULATORY_EVENTS_RAW_HEADERS,
+    REGULATORY_EVENTS_RAW_SHEET,
+    REGULATORY_PROGRAM_REGISTRY_HEADERS,
+    REGULATORY_PROGRAM_REGISTRY_SHEET,
+    REGULATORY_SOURCE_STATE_HEADERS,
+    REGULATORY_SOURCE_STATE_SHEET,
+)
+from funnel.sheet_table import ensure_sheet
+
+
+def ensure_regulatory_sheets(service, spreadsheet_id: str) -> None:
+    sheets = [
+        (REGULATORY_SOURCE_STATE_SHEET, REGULATORY_SOURCE_STATE_HEADERS),
+        (REGULATORY_EVENTS_RAW_SHEET, REGULATORY_EVENTS_RAW_HEADERS),
+        (REGULATORY_PROGRAM_REGISTRY_SHEET, REGULATORY_PROGRAM_REGISTRY_HEADERS),
+        (REGULATORY_CURRENT_SHEET, REGULATORY_CURRENT_HEADERS),
+        (REGULATORY_DIGEST_LOG_SHEET, REGULATORY_DIGEST_LOG_HEADERS),
+    ]
+    for sheet_name, headers in sheets:
+        ensure_sheet(service, spreadsheet_id, sheet_name, headers)

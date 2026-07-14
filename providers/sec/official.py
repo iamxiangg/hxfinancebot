@@ -232,6 +232,7 @@ class OfficialSECProvider(SECProvider):
                 FilingMetadata(
                     ticker=profile.ticker,
                     cik=profile.cik,
+                    company_name=profile.name,
                     accession=accession,
                     form=form,
                     filed_at=filed_at,
@@ -272,6 +273,7 @@ class OfficialSECProvider(SECProvider):
                 FilingMetadata(
                     ticker="",
                     cik=_normalize_cik(entry.cik),
+                    company_name=entry.company_name,
                     accession=accession,
                     form=form,
                     filed_at=filed_at,
