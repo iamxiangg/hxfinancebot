@@ -110,14 +110,15 @@ class PoliticalWatchlistConfig:
         self.breadth_threshold = breadth_threshold
         self.concentration_threshold = concentration_threshold
         self.conviction_threshold = conviction_threshold
+        self.watchlist_calendar_days = standard_retention_trading_days
 
     @classmethod
     def from_env(cls) -> PoliticalWatchlistConfig:
         config = cls(
             enabled=_bool_env("POLITICAL_DIGEST_WATCHLIST_ENABLED", True),
-            standard_retention_trading_days=_int_env("POLITICAL_DIGEST_STANDARD_RETENTION_TRADING_DAYS", 5),
-            exceptional_retention_trading_days=_int_env("POLITICAL_DIGEST_EXCEPTIONAL_RETENTION_TRADING_DAYS", 10),
-            risk_retention_trading_days=_int_env("POLITICAL_DIGEST_RISK_RETENTION_TRADING_DAYS", 5),
+            standard_retention_trading_days=_int_env("POLITICAL_DIGEST_WATCHLIST_CALENDAR_DAYS", 7),
+            exceptional_retention_trading_days=_int_env("POLITICAL_DIGEST_WATCHLIST_CALENDAR_DAYS", 7),
+            risk_retention_trading_days=_int_env("POLITICAL_DIGEST_WATCHLIST_CALENDAR_DAYS", 7),
             max_watchlist_items=_int_env("POLITICAL_DIGEST_MAX_WATCHLIST_ITEMS", 8),
             compact_reminder_interval_days=_int_env("POLITICAL_DIGEST_COMPACT_REMINDER_INTERVAL_DAYS", 1),
             repeat_full_on_entry_change=_bool_env("POLITICAL_DIGEST_REPEAT_FULL_ON_ENTRY_CHANGE", True),
@@ -143,6 +144,18 @@ class PoliticalWatchlistConfig:
             if value < 0:
                 raise ValueError(f"{name} cannot be negative.")
         return config
+
+
+def count_watchlist_days(start: date, end: date) -> int:
+    if end < start:
+        raise ValueError("end date cannot be earlier than start date.")
+    return (end - start).days
+
+
+def add_watchlist_days(start: date, days: int) -> date:
+    if days < 0:
+        raise ValueError("days cannot be negative.")
+    return start + timedelta(days=days)
 
 
 def count_trading_sessions(start: date, end: date) -> int:
@@ -222,24 +235,8 @@ def classify_watchlist_retention(
     history: TickerPoliticalHistory,
     config: PoliticalWatchlistConfig,
 ) -> tuple[str, int]:
-    primary_window = history.windows.get(90) or history.windows.get(45)
-    if primary_window is None:
-        return "STANDARD", config.standard_retention_trading_days
-    if (
-        history.primary_classification in {"DISTRIBUTION", "MIXED_HIGH_ACTIVITY"}
-        or primary_window.put_purchase_low >= 1_000_000
-        or primary_window.sale_low >= 1_000_000
-    ):
+    if history.primary_classification == "DISTRIBUTION":
         return "RISK", config.risk_retention_trading_days
-    exceptional = (
-        primary_window.stock_purchase_low >= 1_000_000
-        or primary_window.call_purchase_low >= 1_000_000
-        or history.primary_classification == "BROAD_ACCUMULATION"
-        or primary_window.unique_buyer_count >= 2
-        or history.political_conviction >= 70.0
-    )
-    if exceptional:
-        return "EXCEPTIONAL", config.exceptional_retention_trading_days
     return "STANDARD", config.standard_retention_trading_days
 
 
@@ -323,17 +320,17 @@ def is_compact_reminder_due(
     start_date = _parse_date(state.watchlist_started_at)
     if start_date is None:
         return False
-    current_sessions = count_trading_sessions(start_date, observed_at.date())
-    if current_sessions < 1:
+    current_days = count_watchlist_days(start_date, observed_at.date()) + 1
+    if current_days < 2:
         return False
-    if current_sessions > state.watchlist_total_days:
+    if current_days > state.watchlist_total_days:
         return False
     if not state.last_compact_reminder_at:
         return True
     last_sent = _parse_date(state.last_compact_reminder_at)
     if last_sent is None:
         return True
-    return count_trading_sessions(last_sent, observed_at.date()) >= config.compact_reminder_interval_days
+    return count_watchlist_days(last_sent, observed_at.date()) >= config.compact_reminder_interval_days
 
 
 def update_watchlist_state(
@@ -365,13 +362,13 @@ def update_watchlist_state(
         status = "ACTIVE" if config.enabled else "SUPPRESSED"
     until_value = previous.watchlist_until
     if started_at:
-        until_date = add_trading_sessions(_parse_date(started_at) or observed_date, retention_days)
+        until_date = add_watchlist_days(_parse_date(started_at) or observed_date, max(0, retention_days - 1))
         until_value = until_date.isoformat()
         if status == "ACTIVE" and observed_date > until_date:
             status = "EXPIRED"
     if not started_at and previous.watchlist_status == "ACTIVE":
         status = "EXPIRED"
-    watchlist_day = count_trading_sessions(_parse_date(started_at) or observed_date, observed_date) if started_at else 0
+    watchlist_day = count_watchlist_days(_parse_date(started_at) or observed_date, observed_date) + 1 if started_at else 0
     compact_hash = build_compact_summary_hash(
         history,
         watchlist_day=max(1, watchlist_day),

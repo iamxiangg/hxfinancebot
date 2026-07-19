@@ -13,6 +13,8 @@ from funnel.review_schema import (
     BOT_STATE_SHEET,
     POLITICAL_DIGEST_LOG_HEADERS,
     POLITICAL_DIGEST_LOG_SHEET,
+    POLITICAL_DIGEST_SNAPSHOT_HEADERS,
+    POLITICAL_DIGEST_SNAPSHOT_SHEET,
     POLITICAL_TICKER_SUMMARY_HEADERS,
     POLITICAL_TICKER_SUMMARY_SHEET,
     POLITICAL_TRADES_RAW_HEADERS,
@@ -20,10 +22,12 @@ from funnel.review_schema import (
 )
 from funnel.review_setup import ensure_review_sheets
 from funnel.sheet_table import append_records, read_table, upsert_records
-from scanners.congress.models import PoliticalArchiveStats, PoliticalWatchlistState, TickerPoliticalHistory
+from scanners.congress.models import DigestDeliverySnapshot, PoliticalArchiveStats, PoliticalWatchlistState, TickerPoliticalHistory
 
 
 BOOTSTRAP_STATE_KEY = "political_archive_bootstrapped_payload_sha"
+LAST_PAYLOAD_HASH_KEY = "political_archive_last_payload_sha"
+LAST_RECORD_COUNT_KEY = "political_archive_last_record_count"
 
 
 @dataclass
@@ -32,6 +36,7 @@ class PoliticalArchiveState:
     raw_rows: dict[str, dict[str, Any]]
     summary_rows: dict[str, dict[str, Any]]
     digest_rows: list[dict[str, Any]]
+    snapshot_rows: dict[str, dict[str, Any]]
     bot_state: dict[str, str]
 
 
@@ -69,6 +74,10 @@ def _summary_path() -> Path:
 
 def _digest_log_path() -> Path:
     return _state_directory() / "political_digest_log.json"
+
+
+def _digest_snapshot_path() -> Path:
+    return _state_directory() / "political_digest_snapshot.json"
 
 
 def _bot_state_path() -> Path:
@@ -119,6 +128,11 @@ def load_political_archive_state() -> PoliticalArchiveState:
                     if str(row.get("Ticker") or "").strip()
                 },
                 digest_rows=read_table(service, spreadsheet_id, POLITICAL_DIGEST_LOG_SHEET, POLITICAL_DIGEST_LOG_HEADERS),
+                snapshot_rows={
+                    str(row.get("Digest ID") or "").strip(): row
+                    for row in read_table(service, spreadsheet_id, POLITICAL_DIGEST_SNAPSHOT_SHEET, POLITICAL_DIGEST_SNAPSHOT_HEADERS)
+                    if str(row.get("Digest ID") or "").strip()
+                },
                 bot_state=_bot_state_map(read_table(service, spreadsheet_id, BOT_STATE_SHEET, BOT_STATE_HEADERS)),
             )
         except Exception:
@@ -136,6 +150,11 @@ def load_political_archive_state() -> PoliticalArchiveState:
             if isinstance(row, dict) and str(row.get("Ticker") or "").strip()
         },
         digest_rows=[row for row in _load_json(_digest_log_path(), default=[]) if isinstance(row, dict)],
+        snapshot_rows={
+            str(row.get("Digest ID") or "").strip(): row
+            for row in _load_json(_digest_snapshot_path(), default=[])
+            if isinstance(row, dict) and str(row.get("Digest ID") or "").strip()
+        },
         bot_state={str(key): str(value) for key, value in _load_json(_bot_state_path(), default={}).items()},
     )
 
@@ -167,14 +186,18 @@ def _raw_row_from_record(record, *, now_iso: str, payload_hash: str, first_seen_
     version = 1 if existing_row is None else _row_version(existing_row) + (1 if materially_amended else 0)
     first_seen = first_seen_at or (existing_row or {}).get("First Seen At") or now_iso
     last_changed = now_iso if existing_row is None or materially_amended else str((existing_row or {}).get("Last Changed At") or now_iso)
+    previous_notified_at = str((existing_row or {}).get("First Successfully Notified At") or "").strip()
+    last_notified_at = str((existing_row or {}).get("Last Successfully Notified At") or "").strip()
     return {
         "Trade Key": record.trade_key,
         "Source Trade ID": record.source_trade_id,
         "Fingerprint": record.fingerprint,
+        "Source Payload Hash": payload_hash,
         "Source ID": record.source_id,
         "Filing ID": record.filing_id,
         "Filer ID": record.filer_id,
         "Filer Name": record.filer_name,
+        "Canonical Household ID": record.filer_id or record.filer_name,
         "Branch": record.branch,
         "Chamber": record.chamber,
         "Party": record.party,
@@ -187,6 +210,7 @@ def _raw_row_from_record(record, *, now_iso: str, payload_hash: str, first_seen_
         "Ticker": record.ticker,
         "Yahoo Ticker": record.yf_ticker,
         "Asset Name": record.asset_name,
+        "Security Description": record.description or record.asset_name,
         "Asset Type": record.asset_type,
         "Asset Class": record.asset_class,
         "Asset Intent Class": record.asset_intent_class,
@@ -224,6 +248,12 @@ def _raw_row_from_record(record, *, now_iso: str, payload_hash: str, first_seen_
         "Trigger Type": record.trigger_type,
         "First Seen At": first_seen,
         "Last Seen At": now_iso,
+        "Notification Status": "AMENDED" if materially_amended else str((existing_row or {}).get("Notification Status") or "VALIDATED"),
+        "First Successfully Notified At": previous_notified_at,
+        "Last Successfully Notified At": last_notified_at,
+        "Digest Delivery Status": str((existing_row or {}).get("Digest Delivery Status") or ""),
+        "Amends Trade Key": str((existing_row or {}).get("Amends Trade Key") or ""),
+        "Parser Version": "political-digest-v3",
         "Last Changed At": last_changed,
         "Record Version": version,
         "Is Materially Amended": _text_bool(materially_amended),
@@ -281,6 +311,7 @@ def prepare_raw_archive_upserts(
             continue
         updated = dict(existing_row)
         updated["Active In Latest Payload"] = "NO"
+        updated["Notification Status"] = "REMOVED"
         rows_to_upsert.append(updated)
         deactivated_rows += 1
         removed_events.append(
@@ -320,9 +351,20 @@ def summary_row_from_history(
     return {
         "Ticker": history.ticker,
         "Primary Classification": history.primary_classification,
+        "Aggregate Direction": history.aggregate_direction,
         "Structure Classification": history.structure_classification,
+        "Latest Disclosure Direction": history.latest_disclosure_direction,
+        "Directional Agreement": history.directional_agreement,
         "Previous Classification": history.previous_classification,
         "Classification Changed": _text_bool(history.classification_changed),
+        "Event Severity": history.event_severity,
+        "Ticker State Severity": history.ticker_state_severity,
+        "Material Effect Category": history.material_effect_category,
+        "Material Effect Percent": round(history.material_effect_percent, 4),
+        "Pre-Event 90D Purchase Low": history.pre_event_purchase_low_90d,
+        "Pre-Event 90D Sale Low": history.pre_event_sale_low_90d,
+        "Post-Event 90D Purchase Low": history.post_event_purchase_low_90d,
+        "Post-Event 90D Sale Low": history.post_event_sale_low_90d,
         "Bullish Evidence Score": round(history.bullish_evidence_score, 2),
         "Distribution Evidence Score": round(history.distribution_evidence_score, 2),
         "Breadth Score": round(history.breadth_score, 2),
@@ -464,15 +506,110 @@ def persist_digest_rows(state: PoliticalArchiveState, rows: list[dict[str, Any]]
         POLITICAL_DIGEST_LOG_HEADERS,
         rows,
     )
+    state.digest_rows = list(state.digest_rows) + rows
+
+
+def snapshot_row_from_model(snapshot: DigestDeliverySnapshot) -> dict[str, Any]:
+    return {
+        "Digest ID": snapshot.digest_id,
+        "Digest Date": snapshot.digest_date,
+        "Run ID": snapshot.run_id,
+        "Digest Status": snapshot.digest_status,
+        "Source Health": snapshot.source_health,
+        "Payload Hash": snapshot.payload_hash,
+        "Payload Refreshed": _text_bool(snapshot.payload_refreshed),
+        "Fetched Records": snapshot.fetched_records,
+        "New Records": snapshot.new_records,
+        "Amendments": snapshot.amendments,
+        "Review Required Count": snapshot.review_required_count,
+        "Included Trade Keys": _history_json(list(snapshot.included_trade_keys)),
+        "Excluded Trade Keys": _history_json(list(snapshot.excluded_trade_keys)),
+        "Ticker Summaries JSON": snapshot.ticker_summaries_json,
+        "Threshold Settings JSON": snapshot.threshold_settings_json,
+        "Rule Version": snapshot.rule_version,
+        "Template Version": snapshot.template_version,
+        "Code Commit": snapshot.code_commit,
+        "Message Hash": snapshot.message_hash,
+        "Telegram Message IDs": _history_json(list(snapshot.telegram_message_ids)),
+        "Chunk Count": snapshot.chunk_count,
+        "Successful Chunks": snapshot.successful_chunks,
+        "Failed Chunks": snapshot.failed_chunks,
+        "Attempt Count": snapshot.attempt_count,
+        "Last Delivery Error": snapshot.last_delivery_error,
+        "Rendered Digest": snapshot.rendered_digest,
+        "Delivered At": snapshot.delivered_at,
+        "Created At": snapshot.created_at,
+        "Updated At": snapshot.updated_at,
+    }
+
+
+def persist_digest_snapshot(state: PoliticalArchiveState, snapshot: DigestDeliverySnapshot) -> None:
+    row = snapshot_row_from_model(snapshot)
+    if state.context is None:
+        merged = dict(state.snapshot_rows)
+        merged[snapshot.digest_id] = row
+        _save_json(_digest_snapshot_path(), list(merged.values()))
+        state.snapshot_rows = merged
+        return
+    upsert_records(
+        state.context["service"],
+        state.context["spreadsheet_id"],
+        POLITICAL_DIGEST_SNAPSHOT_SHEET,
+        POLITICAL_DIGEST_SNAPSHOT_HEADERS,
+        "Digest ID",
+        [row],
+    )
+    state.snapshot_rows[snapshot.digest_id] = row
+
+
+def update_raw_notification_status(
+    state: PoliticalArchiveState,
+    *,
+    trade_keys: list[str],
+    notification_status: str,
+    notified_at: str,
+    digest_delivery_status: str,
+) -> None:
+    rows: list[dict[str, Any]] = []
+    for trade_key in sorted({key for key in trade_keys if key}):
+        current = state.raw_rows.get(trade_key)
+        if current is None:
+            continue
+        updated = dict(current)
+        updated["Notification Status"] = notification_status
+        updated["Digest Delivery Status"] = digest_delivery_status
+        if notified_at:
+            updated["Last Successfully Notified At"] = notified_at
+        if notified_at and not str(updated.get("First Successfully Notified At") or "").strip() and notification_status == "NOTIFIED":
+            updated["First Successfully Notified At"] = notified_at
+        rows.append(updated)
+        state.raw_rows[trade_key] = updated
+    if not rows:
+        return
+    if state.context is None:
+        _save_json(_raw_path(), list(state.raw_rows.values()))
+        return
+    upsert_records(
+        state.context["service"],
+        state.context["spreadsheet_id"],
+        POLITICAL_TRADES_RAW_SHEET,
+        POLITICAL_TRADES_RAW_HEADERS,
+        "Trade Key",
+        rows,
+    )
 
 
 def get_bootstrap_marker(state: PoliticalArchiveState) -> str:
     return str(state.bot_state.get(BOOTSTRAP_STATE_KEY, "")).strip()
 
 
-def set_bootstrap_marker(state: PoliticalArchiveState, payload_hash: str) -> None:
+def get_bot_state_value(state: PoliticalArchiveState, key: str) -> str:
+    return str(state.bot_state.get(key, "")).strip()
+
+
+def set_bot_state_value(state: PoliticalArchiveState, key: str, value: str) -> None:
     updated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-    state.bot_state[BOOTSTRAP_STATE_KEY] = payload_hash
+    state.bot_state[key] = value
     if state.context is None:
         _save_json(_bot_state_path(), state.bot_state)
         return
@@ -482,8 +619,12 @@ def set_bootstrap_marker(state: PoliticalArchiveState, payload_hash: str) -> Non
         BOT_STATE_SHEET,
         BOT_STATE_HEADERS,
         "Key",
-        [{"Key": BOOTSTRAP_STATE_KEY, "Value": payload_hash, "Updated At": updated_at}],
+        [{"Key": key, "Value": value, "Updated At": updated_at}],
     )
+
+
+def set_bootstrap_marker(state: PoliticalArchiveState, payload_hash: str) -> None:
+    set_bot_state_value(state, BOOTSTRAP_STATE_KEY, payload_hash)
 
 
 def build_archive_stats(update: RawArchiveUpdateResult, *, summary_written: int, digest_logged: int, bootstrap_completed: bool) -> PoliticalArchiveStats:

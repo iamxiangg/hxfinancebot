@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from scanners.congress.models import (
+    DigestDeliverySnapshot,
     MaterialStateChange,
     PoliticalArchiveStats,
     PoliticalBackfillStatus,
@@ -40,10 +41,15 @@ class PoliticalDigestFlag:
 class PoliticalDigestPlan:
     digest_date: str
     data_status: dict[str, int]
+    source_health: str = "HEALTHY"
+    payload_refreshed: bool = True
+    changes_since_previous: dict[str, int] = field(default_factory=dict)
     new_material_flags: tuple[PoliticalDigestFlag, ...] = ()
     material_updates: tuple[PoliticalDigestFlag, ...] = ()
     active_watchlist_items: tuple[PoliticalDigestFlag, ...] = ()
     other_new_activity: tuple[PoliticalDigestFlag, ...] = ()
+    review_required_items: tuple[dict[str, Any], ...] = ()
+    excluded_items: tuple[dict[str, Any], ...] = ()
     expired_watchlist_items: tuple[PoliticalDigestFlag, ...] = ()
     watchlist_state_changes: tuple[PoliticalDigestFlag, ...] = ()
     recorded_only_count: int = 0
@@ -54,6 +60,8 @@ class PoliticalDigestPlan:
     current_watchlist_states: dict[str, PoliticalWatchlistState] = field(default_factory=dict)
     delivered_watchlist_updates: dict[str, dict[str, Any]] = field(default_factory=dict)
     hidden_watchlist_count: int = 0
+    delivery_reconciliation: dict[str, int] = field(default_factory=dict)
+    pending_snapshot: DigestDeliverySnapshot | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -67,6 +75,10 @@ class PoliticalDigestPlan:
             ticker: state.to_dict()
             for ticker, state in sorted(self.current_watchlist_states.items())
         }
+        payload["review_required_items"] = [dict(item) for item in self.review_required_items]
+        payload["excluded_items"] = [dict(item) for item in self.excluded_items]
+        if self.pending_snapshot is not None:
+            payload["pending_snapshot"] = self.pending_snapshot.to_dict()
         if self.backfill_status is not None:
             payload["backfill_status"] = self.backfill_status.to_dict()
         if self.archive_stats is not None:

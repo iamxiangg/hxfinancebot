@@ -17,11 +17,15 @@ from googleapiclient.errors import HttpError
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.political_archive import (
     build_archive_stats,
+    get_bot_state_value,
     get_bootstrap_marker,
     load_political_archive_state,
     persist_raw_archive_updates,
     persist_summary_rows,
     prepare_raw_archive_upserts,
+    LAST_PAYLOAD_HASH_KEY,
+    LAST_RECORD_COUNT_KEY,
+    set_bot_state_value,
     set_bootstrap_marker,
     summary_row_from_history,
 )
@@ -281,6 +285,21 @@ def _audit_directory() -> Path | None:
     return path
 
 
+def _list_or_empty(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _ledger_path() -> Path:
     return _state_directory() / "transaction_ledger.json"
 
@@ -411,6 +430,7 @@ def _event_row_from_record(record: Any, *, bootstrap_run: bool = False) -> dict[
         "transaction_type": record.transaction_type,
         "asset_name": record.asset_name,
         "asset_class": record.asset_class,
+        "action": record.action,
         "option_side": record.option_side,
         "strike": record.strike,
         "expiry": record.expiry,
@@ -538,7 +558,10 @@ def run_congress_adapter_detailed(
 
     bootstrap_marker = get_bootstrap_marker(archive_state)
     bootstrap_run = not bootstrap_marker
+    previous_payload_hash = get_bot_state_value(archive_state, LAST_PAYLOAD_HASH_KEY)
+    previous_record_count = _int_or_zero(get_bot_state_value(archive_state, LAST_RECORD_COUNT_KEY))
     unique_records = _unique_transactions(scan)
+    source_record_count = _int_or_zero(scan.counts.get("total_raw_records")) or _int_or_zero(getattr(scan.metadata, "record_count", 0))
     raw_update = prepare_raw_archive_upserts(
         unique_records,
         existing_rows=archive_state.raw_rows,
@@ -588,6 +611,19 @@ def run_congress_adapter_detailed(
         removed_events=removed_records,
         affected_tickers=affected_tickers,
     )
+    payload_refreshed = scan.metadata.payload_sha256 != previous_payload_hash
+    source_health = "HEALTHY"
+    if not payload_refreshed:
+        source_health = "SOURCE_PAYLOAD_UNCHANGED"
+    elif previous_record_count and source_record_count < previous_record_count:
+        source_health = "SOURCE_PAYLOAD_INCOMPLETE"
+    unnotified_trade_keys = {
+        trade_key
+        for trade_key, row in archive_state.raw_rows.items()
+        if str(row.get("Notification Status") or "").strip().upper() != "NOTIFIED"
+    }
+    review_required_items = _list_or_empty(getattr(scan, "review_audit", []))
+    excluded_items = _list_or_empty(getattr(getattr(scan, "audit_bundle", None), "excluded_record_reasons", []))
     digest_plan = build_digest_plan(
         histories=histories,
         affected_tickers=affected_tickers,
@@ -602,6 +638,12 @@ def run_congress_adapter_detailed(
             bootstrap_completed=bootstrap_run,
         ),
         observed_at=observed_datetime,
+        review_required_items=review_required_items,
+        excluded_items=excluded_items,
+        source_health=source_health,
+        payload_refreshed=payload_refreshed,
+        source_record_count=source_record_count,
+        unnotified_trade_keys=unnotified_trade_keys,
     )
 
     summary_rows = [
@@ -623,6 +665,8 @@ def run_congress_adapter_detailed(
 
     if bootstrap_run:
         set_bootstrap_marker(archive_state, scan.metadata.payload_sha256)
+    set_bot_state_value(archive_state, LAST_PAYLOAD_HASH_KEY, scan.metadata.payload_sha256)
+    set_bot_state_value(archive_state, LAST_RECORD_COUNT_KEY, str(source_record_count))
 
     breakdown = _signal_breakdown(
         scan.ticker_results,

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,10 +13,18 @@ from zoneinfo import ZoneInfo
 import requests
 
 from funnel.congress_adapter import run_congress_adapter_detailed
-from funnel.political_archive import load_political_archive_state, persist_digest_rows, persist_summary_rows, summary_row_from_history
+from funnel.political_archive import (
+    load_political_archive_state,
+    persist_digest_rows,
+    persist_digest_snapshot,
+    persist_summary_rows,
+    summary_row_from_history,
+    update_raw_notification_status,
+)
+from scanners.congress.models import DigestDeliverySnapshot
 from scanners.congress.watchlist import apply_delivery
 from scanners.congress.engine import MODEL_VERSION
-from tactical.congress_digest import digest_log_rows, render_digest, render_digest_parts, write_digest_preview
+from tactical.congress_digest import DIGEST_TEMPLATE_VERSION, digest_log_rows, render_digest, render_digest_parts, write_digest_preview
 
 
 TOKEN = str(os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
@@ -26,6 +37,16 @@ MAX_ACTIONABLE = 8
 MAX_WAIT = 6
 MAX_RISK = 6
 MAX_NEAREST = 5
+THRESHOLD_ENV_KEYS = (
+    "POLITICAL_DIGEST_SEND_EMPTY",
+    "POLITICAL_DIGEST_WATCHLIST_CALENDAR_DAYS",
+    "POLITICAL_DIGEST_MAX_WATCHLIST_ITEMS",
+    "POLITICAL_DIGEST_COMPACT_REMINDER_INTERVAL_DAYS",
+    "POLITICAL_DIGEST_COMPACT_ACTIVITY_LOW",
+    "POLITICAL_FLAG_PURCHASE_LOW",
+    "POLITICAL_FLAG_CALL_LOW",
+    "POLITICAL_FLAG_SALE_LOW",
+)
 
 logger = logging.getLogger("congress_bot")
 logger.setLevel(logging.INFO)
@@ -189,7 +210,8 @@ def messages(results: list) -> list[str]:
     return chunks(lines)
 
 
-def send(items: list[str]) -> None:
+def send(items: list[str]) -> list[str]:
+    message_ids: list[str] = []
     for index, item in enumerate(items):
         response = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -197,8 +219,13 @@ def send(items: list[str]) -> None:
             timeout=20,
         )
         response.raise_for_status()
+        payload = response.json()
+        message_id = str((payload.get("result") or {}).get("message_id") or "").strip()
+        if message_id:
+            message_ids.append(message_id)
         if index < len(items) - 1:
             time.sleep(1)
+    return message_ids
 
 
 def _all_digest_flags(plan):
@@ -207,6 +234,89 @@ def _all_digest_flags(plan):
         *plan.material_updates,
         *plan.active_watchlist_items,
         *plan.other_new_activity,
+    )
+
+
+def _now_sg_iso() -> str:
+    return datetime.now(TZ).replace(microsecond=0).isoformat()
+
+
+def _run_id() -> str:
+    return str(os.getenv("GITHUB_RUN_ID", "")).strip() or _now_sg_iso()
+
+
+def _code_commit() -> str:
+    return str(os.getenv("GITHUB_SHA", "")).strip()
+
+
+def _threshold_settings_json() -> str:
+    payload = {
+        "model_version": MODEL_VERSION,
+        "template_version": DIGEST_TEMPLATE_VERSION,
+    }
+    for key in THRESHOLD_ENV_KEYS:
+        raw = os.getenv(key)
+        if raw is not None and str(raw).strip():
+            payload[key] = str(raw).strip()
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _included_trade_keys(plan) -> tuple[str, ...]:
+    trade_keys: list[str] = []
+    for flag in _all_digest_flags(plan):
+        trade_keys.extend(key for key in flag.trigger_trade_keys if key)
+    return tuple(dict.fromkeys(sorted(trade_keys)))
+
+
+def _excluded_trade_keys(plan) -> tuple[str, ...]:
+    trade_keys: list[str] = []
+    for item in [*plan.review_required_items, *plan.excluded_items]:
+        key = str(item.get("trade_key") or "").strip()
+        if key:
+            trade_keys.append(key)
+    return tuple(dict.fromkeys(sorted(trade_keys)))
+
+
+def _source_record_count(run) -> int:
+    try:
+        return int(run.scan.counts.get("total_raw_records") or run.scan.metadata.record_count or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _ticker_summaries_json(plan, histories: dict[str, object]) -> str:
+    tickers = sorted({flag.ticker for flag in _all_digest_flags(plan)})
+    payload = {
+        ticker: histories[ticker].to_dict()
+        for ticker in tickers
+        if ticker in histories
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _build_pending_snapshot(run, *, run_id: str, created_at: str) -> DigestDeliverySnapshot:
+    plan = run.digest_plan
+    return DigestDeliverySnapshot(
+        digest_id=f"{plan.digest_date}:{run_id}:{run.payload_hash[:12]}",
+        digest_date=plan.digest_date,
+        run_id=run_id,
+        digest_status="PENDING",
+        source_health=plan.source_health,
+        payload_hash=run.payload_hash,
+        payload_refreshed=plan.payload_refreshed,
+        fetched_records=_source_record_count(run),
+        new_records=plan.data_status.get("new_records", 0),
+        amendments=plan.data_status.get("material_amendments", 0),
+        review_required_count=len(plan.review_required_items),
+        included_trade_keys=_included_trade_keys(plan),
+        excluded_trade_keys=_excluded_trade_keys(plan),
+        ticker_summaries_json=_ticker_summaries_json(plan, run.current_ticker_histories),
+        threshold_settings_json=_threshold_settings_json(),
+        rule_version=MODEL_VERSION,
+        template_version=DIGEST_TEMPLATE_VERSION,
+        code_commit=_code_commit(),
+        created_at=created_at,
+        updated_at=created_at,
     )
 
 
@@ -249,21 +359,44 @@ def main() -> int:
         preview_path = _digest_preview_path()
         telegram_sent = False
         sent_at = ""
+        run_id = _run_id()
+        archive_state = load_political_archive_state()
 
         if digest_enabled and not legacy_output:
+            pending_snapshot = _build_pending_snapshot(run, run_id=run_id, created_at=_now_sg_iso())
+            run.digest_plan = replace(run.digest_plan, pending_snapshot=pending_snapshot)
             digest_text = render_digest(run.digest_plan, now_sg=datetime.now(TZ))
             write_digest_preview(preview_path, digest_text)
             if digest_text is not None:
                 logger.info("Rendered political digest preview to %s", preview_path)
+                parts = render_digest_parts(run.digest_plan, now_sg=datetime.now(TZ))
+                snapshot_rendered_at = _now_sg_iso()
+                pending_snapshot = replace(
+                    pending_snapshot,
+                    rendered_digest=digest_text,
+                    message_hash=hashlib.sha256(digest_text.encode("utf-8")).hexdigest(),
+                    chunk_count=len(parts),
+                    updated_at=snapshot_rendered_at,
+                )
+                persist_digest_snapshot(archive_state, pending_snapshot)
+                run.digest_plan = replace(run.digest_plan, pending_snapshot=pending_snapshot)
+                if pending_snapshot.included_trade_keys:
+                    update_raw_notification_status(
+                        archive_state,
+                        trade_keys=list(pending_snapshot.included_trade_keys),
+                        notification_status="DIGEST_PENDING",
+                        notified_at="",
+                        digest_delivery_status="PENDING",
+                    )
             else:
                 logger.info("No political digest rendered for this run.")
             if digest_text and send_telegram:
-                parts = render_digest_parts(run.digest_plan, now_sg=datetime.now(TZ))
                 delivered_tickers: set[str] = set()
+                telegram_message_ids: list[str] = []
                 flag_by_ticker = {flag.ticker: flag for flag in _all_digest_flags(run.digest_plan)}
                 try:
                     for part in parts:
-                        send([part.text])
+                        telegram_message_ids.extend(send([part.text]))
                         part_sent_at = datetime.now(TZ).isoformat()
                         delivered_tickers.update(part.tickers)
                         delivery_rows = []
@@ -293,28 +426,77 @@ def main() -> int:
                                 )
                             )
                         if delivery_rows:
-                            persist_summary_rows(load_political_archive_state(), delivery_rows)
+                            persist_summary_rows(archive_state, delivery_rows)
                     telegram_sent = True
-                    sent_at = datetime.now(TZ).isoformat()
+                    sent_at = _now_sg_iso()
+                    if pending_snapshot.included_trade_keys:
+                        update_raw_notification_status(
+                            archive_state,
+                            trade_keys=list(pending_snapshot.included_trade_keys),
+                            notification_status="NOTIFIED",
+                            notified_at=sent_at,
+                            digest_delivery_status="DELIVERED",
+                        )
+                    pending_snapshot = replace(
+                        pending_snapshot,
+                        digest_status="DELIVERED",
+                        telegram_message_ids=tuple(telegram_message_ids),
+                        successful_chunks=len(parts),
+                        failed_chunks=0,
+                        attempt_count=max(1, pending_snapshot.attempt_count + 1),
+                        last_delivery_error="",
+                        delivered_at=sent_at,
+                        updated_at=sent_at,
+                    )
+                    persist_digest_snapshot(archive_state, pending_snapshot)
+                    run.digest_plan = replace(
+                        run.digest_plan,
+                        pending_snapshot=pending_snapshot,
+                        delivery_reconciliation={
+                            **run.digest_plan.delivery_reconciliation,
+                            "successfully_delivered": len(pending_snapshot.included_trade_keys),
+                            "pending_retry": 0,
+                        },
+                    )
                     logger.info(
                         "Sent %d Telegram digest part(s) | signals=%d | payload=%s",
                         len(parts),
                         len(run.signals),
                         run.scan.metadata.payload_sha256,
                     )
-                except Exception:
+                except Exception as exc:
+                    failed_at = _now_sg_iso()
+                    pending_snapshot = replace(
+                        pending_snapshot,
+                        telegram_message_ids=tuple(telegram_message_ids),
+                        successful_chunks=len(telegram_message_ids),
+                        failed_chunks=max(0, len(parts) - len(telegram_message_ids)),
+                        attempt_count=max(1, pending_snapshot.attempt_count + 1),
+                        last_delivery_error=str(exc)[:500],
+                        updated_at=failed_at,
+                    )
+                    persist_digest_snapshot(archive_state, pending_snapshot)
+                    run.digest_plan = replace(
+                        run.digest_plan,
+                        pending_snapshot=pending_snapshot,
+                        delivery_reconciliation={
+                            **run.digest_plan.delivery_reconciliation,
+                            "successfully_delivered": 0,
+                            "pending_retry": len(pending_snapshot.included_trade_keys),
+                        },
+                    )
                     logger.exception("Telegram digest delivery failed after %d delivered ticker(s).", len(delivered_tickers))
                     raise
             elif digest_text:
                 logger.info("Digest delivery skipped because POLITICAL_DIGEST_SEND_TELEGRAM=false")
             digest_rows = digest_log_rows(
                 run.digest_plan,
-                run_id=str(os.getenv("GITHUB_RUN_ID", datetime.now(TZ).isoformat())),
+                run_id=run_id,
                 payload_hash=run.payload_hash,
                 telegram_included=telegram_sent,
                 telegram_sent_at=sent_at,
             )
-            persist_digest_rows(load_political_archive_state(), digest_rows)
+            persist_digest_rows(archive_state, digest_rows)
             return 0
 
         output = messages(scored)

@@ -164,15 +164,18 @@ class PoliticalWindowSummary:
 @dataclass(frozen=True)
 class TickerPoliticalHistory:
     ticker: str
-    primary_classification: str
-    structure_classification: str
-    bullish_evidence_score: float
-    distribution_evidence_score: float
-    breadth_score: float
-    concentration_score: float
-    inference_confidence: str
-    data_confidence: str
-    windows: dict[int, PoliticalWindowSummary]
+    primary_classification: str = "INSUFFICIENT_EVIDENCE"
+    aggregate_direction: str = "INSUFFICIENT_EVIDENCE"
+    structure_classification: str = "UNKNOWN_STRUCTURE"
+    latest_disclosure_direction: str = "AMBIGUOUS"
+    directional_agreement: str = "UNCLEAR"
+    bullish_evidence_score: float = 0.0
+    distribution_evidence_score: float = 0.0
+    breadth_score: float = 0.0
+    concentration_score: float = 0.0
+    inference_confidence: str = "LOW"
+    data_confidence: str = "LOW"
+    windows: dict[int, PoliticalWindowSummary] = field(default_factory=dict)
     new_events: list[dict[str, Any]] = field(default_factory=list)
     notable_history: list[dict[str, Any]] = field(default_factory=list)
     flag_reasons: list[str] = field(default_factory=list)
@@ -181,6 +184,14 @@ class TickerPoliticalHistory:
     classification_changed: bool = False
     summary_hash: str = ""
     entry_category: str = "OTHER"
+    event_severity: str = "LOW"
+    ticker_state_severity: str = "LOW"
+    material_effect_category: str = "NO MATERIAL EFFECT"
+    material_effect_percent: float = 0.0
+    pre_event_purchase_low_90d: float = 0.0
+    pre_event_sale_low_90d: float = 0.0
+    post_event_purchase_low_90d: float = 0.0
+    post_event_sale_low_90d: float = 0.0
     latest_transaction_date: str = ""
     latest_filing_date: str = ""
     latest_trigger_type: str = ""
@@ -285,6 +296,42 @@ class PoliticalArchiveStats:
     summary_written: int = 0
     digest_logged: int = 0
     bootstrap_completed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DigestDeliverySnapshot:
+    digest_id: str
+    digest_date: str
+    run_id: str
+    digest_status: str
+    source_health: str
+    payload_hash: str
+    payload_refreshed: bool = True
+    fetched_records: int = 0
+    new_records: int = 0
+    amendments: int = 0
+    review_required_count: int = 0
+    included_trade_keys: tuple[str, ...] = ()
+    excluded_trade_keys: tuple[str, ...] = ()
+    ticker_summaries_json: str = ""
+    threshold_settings_json: str = ""
+    rule_version: str = ""
+    template_version: str = ""
+    code_commit: str = ""
+    message_hash: str = ""
+    telegram_message_ids: tuple[str, ...] = ()
+    chunk_count: int = 0
+    successful_chunks: int = 0
+    failed_chunks: int = 0
+    attempt_count: int = 0
+    last_delivery_error: str = ""
+    rendered_digest: str = ""
+    delivered_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -104,9 +104,9 @@ def _history(
 def _base_config() -> PoliticalWatchlistConfig:
     return PoliticalWatchlistConfig(
         enabled=True,
-        standard_retention_trading_days=5,
-        exceptional_retention_trading_days=10,
-        risk_retention_trading_days=5,
+        standard_retention_trading_days=7,
+        exceptional_retention_trading_days=7,
+        risk_retention_trading_days=7,
         max_watchlist_items=8,
         compact_reminder_interval_days=1,
         repeat_full_on_entry_change=True,
@@ -140,7 +140,7 @@ class CongressWatchlistTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "earlier than start"):
             count_trading_sessions(date(2026, 7, 9), date(2026, 7, 8))
 
-    def test_detailed_standard_flag_starts_five_session_watchlist(self) -> None:
+    def test_detailed_standard_flag_starts_seven_day_watchlist(self) -> None:
         history = _history(
             "INTC",
             political_conviction=60.0,
@@ -150,9 +150,9 @@ class CongressWatchlistTests(unittest.TestCase):
         state = update_watchlist_state(None, history, observed_at=OBSERVED_AT, config=_base_config(), detailed_material_flag=True, bootstrap_run=False)
         self.assertEqual(state.watchlist_status, "ACTIVE")
         self.assertEqual(state.watchlist_retention_type, "STANDARD")
-        self.assertEqual(state.watchlist_total_days, 5)
+        self.assertEqual(state.watchlist_total_days, 7)
 
-    def test_exceptional_flag_starts_ten_session_watchlist(self) -> None:
+    def test_broad_accumulation_uses_same_seven_day_watchlist(self) -> None:
         history = _history(
             "MSFT",
             purchase_low=1_500_000.0,
@@ -162,8 +162,8 @@ class CongressWatchlistTests(unittest.TestCase):
             release_types=("LIVE_DISCLOSURE",),
         )
         state = update_watchlist_state(None, history, observed_at=OBSERVED_AT, config=_base_config(), detailed_material_flag=True, bootstrap_run=False)
-        self.assertEqual(state.watchlist_retention_type, "EXCEPTIONAL")
-        self.assertEqual(state.watchlist_total_days, 10)
+        self.assertEqual(state.watchlist_retention_type, "STANDARD")
+        self.assertEqual(state.watchlist_total_days, 7)
 
     def test_distribution_flag_uses_risk_retention(self) -> None:
         history = _history(
@@ -175,7 +175,7 @@ class CongressWatchlistTests(unittest.TestCase):
         )
         state = update_watchlist_state(None, history, observed_at=OBSERVED_AT, config=_base_config(), detailed_material_flag=True, bootstrap_run=False)
         self.assertEqual(state.watchlist_retention_type, "RISK")
-        self.assertEqual(state.watchlist_total_days, 5)
+        self.assertEqual(state.watchlist_total_days, 7)
 
     def test_old_ticker_summary_row_loads_with_safe_inactive_defaults(self) -> None:
         row = {"Ticker": "INTC", "Primary Classification": "SINGLE_FILER_BULLISH_BET", "Summary Hash": "hash-1"}

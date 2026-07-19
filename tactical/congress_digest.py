@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from scanners.congress.digest_models import PoliticalDigestFlag, PoliticalDigestPlan
-from scanners.congress.trend_classifier import deterministic_interpretation, score_label
+from scanners.congress.trend_classifier import deterministic_interpretation
 
 
 TELEGRAM_LIMIT = 3800
+DIGEST_TEMPLATE_VERSION = "2026-07-19-consolidated"
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = str(os.getenv(name, str(default))).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 @dataclass(frozen=True)
@@ -22,97 +33,54 @@ class RenderedDigestPart:
 def _money(value: float) -> str:
     number = float(value or 0.0)
     if number >= 1_000_000:
-        return f"${number / 1_000_000:.1f}m"
+        return f"US${number / 1_000_000:.1f}m"
     if number >= 1_000:
-        return f"${number / 1_000:.0f}k"
-    return f"${number:.0f}"
+        return f"US${number / 1_000:.0f}k"
+    return f"US${number:.0f}"
 
 
-def _pct(value: float) -> str:
-    return f"{max(0.0, min(1.0, value)) * 100:.1f}%"
+def _event_value_range(event: dict[str, Any]) -> str:
+    return f"{_money(float(event.get('amount_low') or 0.0))}-{_money(float(event.get('amount_high') or 0.0))}"
 
 
-def _format_event(event: dict[str, Any]) -> list[str]:
-    description = str(event.get("transaction_type") or "Unknown transaction")
-    option_bits = []
-    if event.get("option_side"):
-        option_bits.append(str(event.get("option_side")).upper())
-    if event.get("strike") not in ("", None):
-        option_bits.append(f"strike {event['strike']}")
-    if event.get("expiry"):
-        option_bits.append(f"expiry {event['expiry']}")
-    option_text = f" ({', '.join(option_bits)})" if option_bits else ""
-    lines = [
-        f"- {event.get('filer_name', 'Unknown filer')} [{event.get('owner_relationship', 'unknown')}]",
-        f"  {description}{option_text} | {_money(float(event.get('amount_low') or 0.0))}-{_money(float(event.get('amount_high') or 0.0))}",
-        f"  Trade {event.get('transaction_date', '')} | Filing {event.get('filing_date', '')} | Release {event.get('release_type', '')}",
-    ]
-    if event.get("document_url"):
-        lines.append(f"  Source {event['document_url']}")
-    return lines
+def _detected_date(flag: PoliticalDigestFlag) -> str:
+    state = flag.watchlist_state
+    if state and state.first_flagged_at:
+        return state.first_flagged_at[:10]
+    return flag.history.latest_filing_date
 
 
-def _format_window(label: str, window) -> list[str]:
-    return [
-        label,
-        f"Purchases {window.purchase_count} | Partial sales {window.partial_sale_count} | Full sales {window.full_sale_count}",
-        f"Unique buyers {window.unique_buyer_count} | Unique sellers {window.unique_seller_count}",
-        (
-            f"Stock {_money(window.stock_purchase_low)}-{_money(window.stock_purchase_high)} | "
-            f"Call {_money(window.call_purchase_low)}-{_money(window.call_purchase_high)} | "
-            f"Put {_money(window.put_purchase_low)}-{_money(window.put_purchase_high)} | "
-            f"Sale {_money(window.sale_low)}-{_money(window.sale_high)}"
-        ),
-        (
-            f"Conservative largest buyer share {_pct(window.largest_buyer_share_lower_bound)} | "
-            f"Midpoint estimate {_pct(window.largest_buyer_share_midpoint_estimate)}"
-        ),
-    ]
-
-
-def _new_dossier(flag: PoliticalDigestFlag) -> str:
+def _full_new_disclosure(flag: PoliticalDigestFlag) -> str:
     history = flag.history
-    windows = history.windows
-    lines = [
-        f"{history.ticker} - NEW POLITICAL DISCLOSURE",
-        "",
-        "WHY FLAGGED",
-    ]
-    lines.extend(f"- {reason}" for reason in history.flag_reasons[:5])
-    lines.extend(["", "NEW EVENT(S)"])
-    for event in history.new_events:
-        lines.extend(_format_event(event))
-    lines.extend(
+    latest = history.new_events[-1] if history.new_events else {}
+    filer = str(latest.get("filer_name") or "Unknown filer").strip()
+    transaction_label = str(latest.get("transaction_type") or history.latest_disclosure_direction).strip().upper()
+    lag = latest.get("days_to_file")
+    lag_line = f"Information lag: {lag} days" if lag not in ("", None) else "Information lag: unknown"
+    return "\n".join(
         [
+            f"{history.ticker} - NEW | Event {history.event_severity} | Ticker {history.ticker_state_severity}",
             "",
-            "POLITICAL EVIDENCE",
-            f"Primary classification {history.primary_classification}",
-            f"Previous classification {history.previous_classification or 'INSUFFICIENT_EVIDENCE'}",
-            f"Structure {history.structure_classification}",
-            f"Bullish evidence {score_label(history.bullish_evidence_score)} ({history.bullish_evidence_score:.0f})",
-            f"Distribution evidence {score_label(history.distribution_evidence_score)} ({history.distribution_evidence_score:.0f})",
-            f"Breadth {score_label(history.breadth_score)} ({history.breadth_score:.0f})",
-            f"Concentration {score_label(history.concentration_score)} ({history.concentration_score:.0f})",
-            f"Inference confidence {history.inference_confidence}",
-            f"Data confidence {history.data_confidence}",
+            f"{filer} - {transaction_label}",
+            f"Amount: {_event_value_range(latest) if latest else 'Unknown'}",
+            f"Transaction date: {latest.get('transaction_date', history.latest_transaction_date)}",
+            f"Filed: {latest.get('filing_date', history.latest_filing_date)}",
+            f"Detected: {_detected_date(flag)}",
+            lag_line,
             "",
-        ]
-    )
-    lines.extend(_format_window("LAST 45 DAYS", windows[45]))
-    lines.extend([""])
-    lines.extend(_format_window("LAST 90 DAYS", windows[90]))
-    lines.extend([""])
-    lines.extend(_format_window("LAST 365 DAYS", windows[365]))
-    lines.extend(["", "NOTABLE HISTORY"])
-    if history.notable_history:
-        lines.extend(f"- {item.get('text', '')}" for item in history.notable_history[:5])
-    else:
-        lines.append("- None")
-    lines.extend(
-        [
+            "Before disclosure:",
+            f"90-day purchases: {_money(history.pre_event_purchase_low_90d)} lower bound",
+            f"90-day sales: {_money(history.pre_event_sale_low_90d)} lower bound",
             "",
-            "INTERPRETATION",
-            deterministic_interpretation(
+            "After disclosure:",
+            f"90-day purchases: {_money(history.post_event_purchase_low_90d)} lower bound",
+            f"90-day sales: {_money(history.post_event_sale_low_90d)} lower bound",
+            "",
+            f"Latest direction: {history.latest_disclosure_direction}",
+            f"Aggregate classification: {history.aggregate_direction}",
+            f"Material effect: {history.material_effect_category}",
+            "Interpretation: "
+            + deterministic_interpretation(
                 primary_classification=history.primary_classification,
                 structure_classification=history.structure_classification,
                 bullish_evidence=history.bullish_evidence_score,
@@ -120,61 +88,33 @@ def _new_dossier(flag: PoliticalDigestFlag) -> str:
                 breadth_score=history.breadth_score,
                 inference_confidence=history.inference_confidence,
             ),
-            "",
-            "CURRENT STATUS",
-            f"Political conviction C{history.political_conviction:.0f}",
-            f"Entry quality E{history.entry_quality:.0f}",
-            f"Entry category {history.entry_category}",
-            f"Risk flags {', '.join(history.risk_flags) if history.risk_flags else 'None'}",
         ]
     )
-    return "\n".join(lines)
 
 
-def _update_dossier(flag: PoliticalDigestFlag) -> str:
+def _material_update(flag: PoliticalDigestFlag) -> str:
     history = flag.history
     state = flag.watchlist_state
-    lines = [
-        f"{history.ticker} - POLITICAL SIGNAL UPDATE",
-        "",
-        "WHY UPDATED",
-    ]
-    lines.extend(f"- {change.reason}" for change in flag.material_changes)
-    lines.extend(
+    change_lines = [f"- {change.reason}" for change in flag.material_changes] or ["- Material state changed."]
+    return "\n".join(
         [
+            f"{history.ticker} - POLITICAL SIGNAL UPDATE | Event {history.event_severity} | Ticker {history.ticker_state_severity}",
+            "",
+            "WHY UPDATED",
+            *change_lines,
             "",
             "CHANGE",
-            f"Previous classification / entry {history.previous_classification} / {(state.previous_entry_category if state else 'OTHER')}",
-            f"Current classification / entry {history.primary_classification} / {history.entry_category}",
+            f"Previous classification / entry: {history.previous_classification} / {(state.previous_entry_category if state else 'OTHER')}",
+            f"Current classification / entry: {history.aggregate_direction} / {history.entry_category}",
             "",
             "NEW POLITICAL DISCLOSURE",
-            "None" if not history.new_events else "See updated event details below.",
-        ]
-    )
-    if history.new_events:
-        lines.append("")
-        for event in history.new_events:
-            lines.extend(_format_event(event))
-    lines.extend(
-        [
+            "None" if not history.new_events else "See latest record below.",
             "",
-            "POLITICAL EVIDENCE",
-            f"Current classification {history.primary_classification}",
-            f"Structure {history.structure_classification}",
-            f"Bullish evidence {score_label(history.bullish_evidence_score)} ({history.bullish_evidence_score:.0f})",
-            f"Distribution evidence {score_label(history.distribution_evidence_score)} ({history.distribution_evidence_score:.0f})",
-            f"Breadth {score_label(history.breadth_score)} ({history.breadth_score:.0f})",
-            f"Concentration {score_label(history.concentration_score)} ({history.concentration_score:.0f})",
-            f"Inference confidence {history.inference_confidence}",
-            "",
-            "CURRENT STATUS",
-            f"Political conviction C{history.political_conviction:.0f}",
-            f"Entry quality E{history.entry_quality:.0f}",
-            f"Entry category {history.entry_category}",
-            f"Primary risk {(state.primary_risk if state else 'None')}",
-            "",
-            "INTERPRETATION",
-            deterministic_interpretation(
+            f"Latest direction: {history.latest_disclosure_direction}",
+            f"Aggregate classification: {history.aggregate_direction}",
+            f"Material effect: {history.material_effect_category}",
+            "Interpretation: "
+            + deterministic_interpretation(
                 primary_classification=history.primary_classification,
                 structure_classification=history.structure_classification,
                 bullish_evidence=history.bullish_evidence_score,
@@ -184,91 +124,162 @@ def _update_dossier(flag: PoliticalDigestFlag) -> str:
             ),
         ]
     )
-    return "\n".join(lines)
 
 
-def _watchlist_compact(flag: PoliticalDigestFlag) -> str:
+def _watchlist_item(flag: PoliticalDigestFlag) -> str:
     history = flag.history
     state = flag.watchlist_state
     assert state is not None
+    event = history.new_events[-1] if history.new_events else {}
+    item_text = state.latest_material_event or (
+        f"{str(event.get('filer_name') or 'Unknown filer').strip()} {str(event.get('transaction_type') or 'activity').strip().lower()}"
+    )
     return "\n".join(
         [
-            f"{history.ticker} | Watch Day {max(1, state.watchlist_day)} of {max(1, state.watchlist_total_days)}",
-            history.primary_classification.replace("_", " ").title(),
-            f"Political C{history.political_conviction:.0f} | Entry E{history.entry_quality:.0f} | Status: {history.entry_category}",
-            f"Latest material event: {state.latest_material_event or 'No new political disclosure'}",
-            f"Primary risk: {state.primary_risk}",
-            "No new political disclosure",
+            f"{history.ticker} - {history.aggregate_direction} | Day {max(1, state.watchlist_day)} of {max(1, state.watchlist_total_days)}",
+            item_text,
+            f"Transaction: {history.latest_transaction_date} | Filed: {history.latest_filing_date} | Detected: {_detected_date(flag)}",
+            f"90-day purchases: {_money(history.post_event_purchase_low_90d)} lower bound",
+            f"90-day sales: {_money(history.post_event_sale_low_90d)} lower bound",
+            f"Breadth: {history.windows[90].unique_buyer_count} buyer versus {history.windows[90].unique_seller_count} sellers",
+            f"Latest direction: {history.latest_disclosure_direction}",
+            f"Aggregate direction: {history.aggregate_direction}",
+            f"Material effect: {history.material_effect_category}",
+            "No change since previous digest." if not flag.material_changes else "State changed since previous digest.",
         ]
     )
 
 
-def _other_new_activity(flag: PoliticalDigestFlag) -> str:
+def _below_threshold(flag: PoliticalDigestFlag) -> str:
     history = flag.history
     event = history.new_events[-1] if history.new_events else {}
-    latest = str(event.get("transaction_type") or "activity").strip()
-    amount_low = float(event.get("amount_low") or 0.0)
-    amount_high = float(event.get("amount_high") or 0.0)
-    amount = ""
-    if amount_low > 0 or amount_high > 0:
-        amount = f" | {_money(amount_low)}-{_money(amount_high)}"
-    return (
-        f"{history.ticker} | {history.primary_classification} | {latest}{amount} | "
-        f"Political C{history.political_conviction:.0f} | Entry {history.entry_category}"
+    filer = str(event.get("filer_name") or "Unknown filer").strip()
+    transaction_type = str(event.get("transaction_type") or "activity").strip().lower()
+    return "\n".join(
+        [
+            f"{history.ticker} - {filer} {transaction_type}, {_event_value_range(event) if event else 'Unknown'}",
+            f"Classification: {history.aggregate_direction}",
+            f"Reason not qualified: material effect {history.material_effect_category.lower()}",
+        ]
+    )
+
+
+def _review_required_or_excluded(item: dict[str, Any]) -> str:
+    label = str(item.get("ticker") or item.get("asset_name") or item.get("trade_key") or "record").strip()
+    reason = str(item.get("reason") or item.get("proposed_resolution") or item.get("classification") or "review").strip()
+    return f"{label} - {reason}"
+
+
+def _review_summary_blocks(items: tuple[dict[str, Any], ...], *, label: str) -> list[RenderedDigestPart]:
+    if not items:
+        return []
+    max_examples = max(0, _int_env("POLITICAL_DIGEST_MAX_REVIEW_EXAMPLES", 8))
+    reasons = Counter(
+        str(item.get("reason") or item.get("proposed_resolution") or item.get("classification") or "review").strip()
+        for item in items
+    )
+    reason_lines = [
+        f"{reason}: {count}"
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:6]
+    ]
+    blocks = [
+        RenderedDigestPart(
+            "\n".join(
+                [
+                    f"{label}: {len(items)} record(s)",
+                    *reason_lines,
+                ]
+            )
+        )
+    ]
+    if max_examples and items:
+        examples = [_review_required_or_excluded(dict(item)) for item in items[:max_examples]]
+        remaining = max(0, len(items) - len(examples))
+        if remaining:
+            examples.append(f"... {remaining} more recorded in the audit archive.")
+        blocks.append(RenderedDigestPart("\n".join([f"{label} EXAMPLES", *examples])))
+    return blocks
+
+
+def _expired(flag: PoliticalDigestFlag) -> str:
+    return "\n".join(
+        [
+            f"{flag.ticker} - expired after seven days without a new qualifying disclosure",
+            f"Final classification: {flag.history.aggregate_direction}",
+        ]
     )
 
 
 def _all_flags(plan: PoliticalDigestPlan) -> tuple[PoliticalDigestFlag, ...]:
-    return (
-        *plan.new_material_flags,
-        *plan.material_updates,
-        *plan.active_watchlist_items,
-        *plan.other_new_activity,
+    return (*plan.new_material_flags, *plan.material_updates, *plan.active_watchlist_items, *plan.other_new_activity)
+
+
+def _render_header(plan: PoliticalDigestPlan, today: date) -> str:
+    payload_hash = plan.pending_snapshot.payload_hash if plan.pending_snapshot is not None else ""
+    lines = [
+        "DAILY POLITICAL-TRADING DIGEST",
+        today.strftime("%d %B %Y"),
+        "",
+        "RUN AND SOURCE STATUS",
+        f"Source health: {plan.source_health}",
+        f"Payload refreshed: {'Yes' if plan.payload_refreshed else 'No'}",
+        f"Payload hash: {payload_hash}",
+        f"Fetched records: {plan.data_status.get('fetched_records', 0)}",
+        f"New records: {plan.data_status.get('new_records', 0)}",
+        f"Amendments: {plan.data_status.get('material_amendments', 0)}",
+        f"Rejected or review-required records: {plan.data_status.get('review_required', 0) + plan.data_status.get('excluded_records', 0)}",
+        "",
+        "CHANGES SINCE THE PREVIOUS DIGEST",
+        f"New qualifying tickers: {plan.changes_since_previous.get('new_qualifying_tickers', 0)}",
+        f"New disclosures on active tickers: {plan.changes_since_previous.get('new_disclosures_on_active_tickers', 0)}",
+        f"Classification changes: {plan.changes_since_previous.get('classification_changes', 0)}",
+        f"Material amendments: {plan.changes_since_previous.get('material_amendments', 0)}",
+        f"Expired tickers: {plan.changes_since_previous.get('expired_tickers', 0)}",
+    ]
+    if plan.summary_lines:
+        lines.extend(["", *plan.summary_lines])
+    return "\n".join(lines)
+
+
+def _render_zero_activity(plan: PoliticalDigestPlan, today: date) -> str:
+    if plan.source_health != "HEALTHY":
+        status_lines = [
+            "Scan completed, but source freshness or completeness needs review.",
+            "No zero-activity conclusion is being asserted for this run.",
+        ]
+    else:
+        status_lines = [
+            "Scan completed successfully.",
+            "No qualifying political disclosures met the digest criteria in this run.",
+        ]
+    return "\n".join(
+        [
+            _render_header(plan, today),
+            "",
+            *status_lines,
+            "",
+            "DELIVERY RECONCILIATION",
+            f"Valid new or amended records: {plan.delivery_reconciliation.get('valid_new_or_amended_records', 0)}",
+            f"Included in digest: {plan.delivery_reconciliation.get('included_in_digest', 0)}",
+            f"Review required: {plan.delivery_reconciliation.get('review_required', 0)}",
+            f"Pending retry: {plan.delivery_reconciliation.get('pending_retry', 0)}",
+        ]
     )
 
 
 def _render_blocks(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> list[RenderedDigestPart]:
     today = now_sg.date() if isinstance(now_sg, datetime) else now_sg
-    if not _all_flags(plan):
+    if not _all_flags(plan) and not plan.review_required_items and not plan.excluded_items and not plan.expired_watchlist_items:
         if not plan.send_digest:
             return []
-        lines = [
-            "DAILY POLITICAL-TRADING DIGEST",
-            today.strftime("%d %B %Y"),
-            "",
-            "Scan completed successfully.",
-            "No political disclosures met the digest criteria in this run.",
-            "",
-            "DATA STATUS",
-            f"New records {plan.data_status.get('new_records', 0)}",
-            f"Material amendments {plan.data_status.get('material_amendments', 0)}",
-            f"Historical backfills {plan.data_status.get('historical_backfills', 0)}",
-            f"Affected tickers {plan.data_status.get('affected_tickers', 0)}",
-        ]
-        return [RenderedDigestPart("\n".join(lines))]
+        return [RenderedDigestPart(_render_zero_activity(plan, today))]
 
-    blocks = [
-        RenderedDigestPart(
-            "\n".join(
-                [
-                    "DAILY POLITICAL-TRADING DIGEST",
-                    today.strftime("%d %B %Y"),
-                    "",
-                    "DATA STATUS",
-                    f"New material signals: {plan.data_status.get('new_material_signals', 0)}",
-                    f"Material updates: {plan.data_status.get('material_updates', 0)}",
-                    f"Active watchlist reminders: {plan.data_status.get('active_watchlist_reminders', 0)}",
-                    f"Other new activity: {plan.data_status.get('other_new_activity', 0)}",
-                ]
-                + list(plan.summary_lines)
-            )
-        )
-    ]
+    blocks = [RenderedDigestPart(_render_header(plan, today))]
     sections = [
-        ("NEW MATERIAL SIGNALS", plan.new_material_flags, _new_dossier),
-        ("MATERIAL SIGNAL UPDATES", plan.material_updates, _update_dossier),
-        ("ACTIVE POLITICAL WATCHLIST", plan.active_watchlist_items, _watchlist_compact),
-        ("OTHER NEW ACTIVITY", plan.other_new_activity, _other_new_activity),
+        ("NEW DISCLOSURES", plan.new_material_flags, _full_new_disclosure),
+        ("MATERIAL SIGNAL UPDATES", plan.material_updates, _material_update),
+        ("ROLLING SEVEN-DAY WATCHLIST", plan.active_watchlist_items, _watchlist_item),
+        ("BELOW-THRESHOLD ACTIVITY", plan.other_new_activity, _below_threshold),
     ]
     for heading, flags, formatter in sections:
         if not flags:
@@ -276,6 +287,28 @@ def _render_blocks(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> lis
         blocks.append(RenderedDigestPart(heading))
         for flag in flags:
             blocks.append(RenderedDigestPart(formatter(flag), (flag.ticker,)))
+    if plan.review_required_items or plan.excluded_items:
+        blocks.append(RenderedDigestPart("REVIEW-REQUIRED AND EXCLUDED RECORDS"))
+        blocks.extend(_review_summary_blocks(plan.review_required_items, label="Review required"))
+        blocks.extend(_review_summary_blocks(plan.excluded_items, label="Excluded"))
+    if plan.expired_watchlist_items:
+        blocks.append(RenderedDigestPart("EXPIRED TODAY"))
+        for flag in plan.expired_watchlist_items:
+            blocks.append(RenderedDigestPart(_expired(flag), (flag.ticker,)))
+    blocks.append(
+        RenderedDigestPart(
+            "\n".join(
+                [
+                    "DELIVERY RECONCILIATION",
+                    f"Valid new or amended records: {plan.delivery_reconciliation.get('valid_new_or_amended_records', 0)}",
+                    f"Included in digest: {plan.delivery_reconciliation.get('included_in_digest', 0)}",
+                    f"Review required: {plan.delivery_reconciliation.get('review_required', 0)}",
+                    f"Successfully delivered: {plan.delivery_reconciliation.get('successfully_delivered', 0)}",
+                    f"Pending retry: {plan.delivery_reconciliation.get('pending_retry', 0)}",
+                ]
+            )
+        )
+    )
     return blocks
 
 
@@ -358,11 +391,14 @@ def digest_log_rows(
     created_at: str | None = None,
 ) -> list[dict[str, Any]]:
     timestamp = created_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    digest_id = plan.pending_snapshot.digest_id if plan.pending_snapshot is not None else ""
+    delivery_status = plan.pending_snapshot.digest_status if plan.pending_snapshot is not None else ""
     rows: list[dict[str, Any]] = []
     rank = 1
     for flag in _all_flags(plan):
         rows.append(
             {
+                "Digest ID": digest_id,
                 "Digest Date": plan.digest_date,
                 "Run ID": run_id,
                 "Ticker": flag.ticker,
@@ -375,6 +411,7 @@ def digest_log_rows(
                 "Summary Hash": flag.history.summary_hash,
                 "Trigger Trade Keys": json.dumps(list(flag.trigger_trade_keys), sort_keys=True),
                 "Release Types": json.dumps(list(flag.release_types), sort_keys=True),
+                "Delivery Status": delivery_status,
                 "Telegram Included": "YES" if telegram_included else "NO",
                 "Telegram Sent At": telegram_sent_at,
                 "Payload Hash": payload_hash,

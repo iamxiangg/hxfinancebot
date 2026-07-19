@@ -13,6 +13,7 @@ from funnel.political_archive import (
     load_political_archive_state,
     persist_raw_archive_updates,
     prepare_raw_archive_upserts,
+    update_raw_notification_status,
 )
 from scanners.congress.engine import run_scan_from_payload
 from scanners.congress.flag_ranker import build_digest_plan, classify_release_type, detect_backfill_status
@@ -239,6 +240,56 @@ class PoliticalArchiveTests(unittest.TestCase):
             self.assertTrue(raw_file.exists())
             payload = json.loads(raw_file.read_text(encoding="utf-8"))
             self.assertEqual(payload[0]["Trade Key"], "id:persist-1")
+
+    def test_pending_status_update_does_not_clear_prior_notification_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                "CONGRESS_STATE_DIR": temp_dir,
+                "POLITICAL_ARCHIVE_BACKEND": "local",
+            },
+            clear=False,
+        ):
+            state = load_political_archive_state()
+            scan = _scan(
+                [
+                    {
+                        "id": "notify-1",
+                        "ticker": "MSFT",
+                        "asset_name": "Microsoft Common Stock",
+                        "asset_type": "Common Stock",
+                        "transaction_type": "Purchase",
+                        "transaction_date": "2026-06-20",
+                        "filing_date": "2026-06-22",
+                        "amount_range_low": 100000,
+                        "amount_range_high": 150000,
+                        "filer_name": "Alex Doe",
+                        "filer_id": "A1",
+                        "owner": "Self",
+                        "branch": "Legislative",
+                        "chamber": "House",
+                    }
+                ]
+            )
+            update = prepare_raw_archive_upserts(scan.transactions[:1], existing_rows=state.raw_rows, observed_at="2026-06-24T12:00:00+08:00", payload_hash="payload")
+            persist_raw_archive_updates(state, update)
+            update_raw_notification_status(
+                state,
+                trade_keys=["id:notify-1"],
+                notification_status="NOTIFIED",
+                notified_at="2026-06-24T12:30:00+08:00",
+                digest_delivery_status="DELIVERED",
+            )
+            update_raw_notification_status(
+                state,
+                trade_keys=["id:notify-1"],
+                notification_status="DIGEST_PENDING",
+                notified_at="",
+                digest_delivery_status="PENDING",
+            )
+            row = load_political_archive_state().raw_rows["id:notify-1"]
+        self.assertEqual(row["First Successfully Notified At"], "2026-06-24T12:30:00+08:00")
+        self.assertEqual(row["Last Successfully Notified At"], "2026-06-24T12:30:00+08:00")
 
     def test_bootstrap_suppresses_historical_alerts(self) -> None:
         payload = [

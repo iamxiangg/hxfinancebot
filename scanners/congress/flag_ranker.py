@@ -246,10 +246,19 @@ def build_digest_plan(
     digest_date: str,
     archive_stats: PoliticalArchiveStats,
     observed_at: datetime,
+    review_required_items: list[dict[str, Any]] | None = None,
+    excluded_items: list[dict[str, Any]] | None = None,
+    source_health: str = "HEALTHY",
+    payload_refreshed: bool = True,
+    source_record_count: int = 0,
+    unnotified_trade_keys: set[str] | None = None,
 ) -> PoliticalDigestPlan:
     config = PoliticalWatchlistConfig.from_env()
     observed_iso = observed_at.replace(microsecond=0).isoformat()
     affected_set = {ticker.upper() for ticker in affected_tickers}
+    review_required_items = review_required_items or []
+    excluded_items = excluded_items or []
+    unnotified_trade_keys = unnotified_trade_keys or set()
     max_detailed = int(_float_env("POLITICAL_DIGEST_MAX_DETAILED_FLAGS", 3.0))
     hard_max = int(_float_env("POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS", 5.0))
     detail_limit = max(0, min(max_detailed, hard_max))
@@ -259,7 +268,9 @@ def build_digest_plan(
     for ticker, history in sorted(histories.items()):
         if ticker.upper() not in affected_set or not history.new_events:
             continue
-        if history.summary_hash == _previous_detailed_hash(ticker, previous_summary_rows, previous_digest_rows):
+        if history.summary_hash == _previous_detailed_hash(ticker, previous_summary_rows, previous_digest_rows) and not (
+            set(history.latest_trigger_trade_keys) & unnotified_trade_keys
+        ):
             continue
         if _qualifies_for_digest(history):
             if not backfill_status.bootstrap_run or {"LIVE_DISCLOSURE", "MATERIAL_AMENDMENT", "DATA_CORRECTION"} & set(history.release_types):
@@ -427,11 +438,14 @@ def build_digest_plan(
     ]
 
     data_status = {
+        "fetched_records": source_record_count,
         "new_records": backfill_status.new_trade_count,
         "material_amendments": backfill_status.amended_trade_count,
         "historical_backfills": sum("HISTORICAL_BACKFILL" in history.release_types for history in material_candidates + other_new_candidates),
         "data_corrections": sum("DATA_CORRECTION" in history.release_types for history in material_candidates + other_new_candidates),
         "affected_tickers": len(affected_set),
+        "review_required": len(review_required_items),
+        "excluded_records": len(excluded_items),
         "new_material_signals": len(new_material_flags),
         "material_updates": len(material_updates),
         "active_watchlist_reminders": len(active_watchlist_items),
@@ -439,6 +453,13 @@ def build_digest_plan(
         "detailed_flags": len(new_material_flags),
         "compact_activity_count": len(other_new_activity),
         "recorded_only_count": max(0, len(affected_set) - len(new_material_tickers | material_update_tickers | {flag.ticker for flag in other_new_activity})),
+    }
+    changes_since_previous = {
+        "new_qualifying_tickers": len(new_material_flags),
+        "new_disclosures_on_active_tickers": sum(1 for flag in new_material_flags if str(previous_summary_rows.get(flag.ticker, {}).get("Watchlist Status") or "").strip().upper() == "ACTIVE"),
+        "classification_changes": sum(1 for flag in [*new_material_flags, *material_updates] if flag.history.classification_changed),
+        "material_amendments": sum("MATERIAL_AMENDMENT" in flag.release_types for flag in [*new_material_flags, *material_updates]),
+        "expired_tickers": len(expired_watchlist_items),
     }
     release_counter = Counter(release for history in material_candidates + other_new_candidates for release in history.release_types)
     summary_lines = tuple(
@@ -452,10 +473,15 @@ def build_digest_plan(
     return PoliticalDigestPlan(
         digest_date=digest_date,
         data_status=data_status,
+        source_health=source_health,
+        payload_refreshed=payload_refreshed,
+        changes_since_previous=changes_since_previous,
         new_material_flags=tuple(new_material_flags),
         material_updates=tuple(material_updates),
         active_watchlist_items=tuple(active_watchlist_items),
         other_new_activity=tuple(other_new_activity),
+        review_required_items=tuple(dict(item) for item in review_required_items),
+        excluded_items=tuple(dict(item) for item in excluded_items),
         expired_watchlist_items=tuple(expired_watchlist_items),
         watchlist_state_changes=tuple(material_updates + expired_watchlist_items),
         recorded_only_count=data_status["recorded_only_count"],
@@ -466,4 +492,11 @@ def build_digest_plan(
         current_watchlist_states=current_states,
         delivered_watchlist_updates=dict(previous_summary_rows),
         hidden_watchlist_count=hidden_watchlist_count,
+        delivery_reconciliation={
+            "valid_new_or_amended_records": backfill_status.new_trade_count + backfill_status.amended_trade_count,
+            "included_in_digest": len(new_material_flags) + len(material_updates) + len(active_watchlist_items) + len(other_new_activity),
+            "review_required": len(review_required_items),
+            "successfully_delivered": 0,
+            "pending_retry": backfill_status.new_trade_count + backfill_status.amended_trade_count,
+        },
     )

@@ -265,7 +265,7 @@ class CongressDigestTests(unittest.TestCase):
             digest = render_digest(plan, now_sg=OBSERVED_AT)
         assert digest is not None
         self.assertIn("Scan completed successfully.", digest)
-        self.assertIn("No political disclosures met the digest criteria in this run.", digest)
+        self.assertIn("No qualifying political disclosures met the digest criteria in this run.", digest)
 
     def test_rendered_digest_uses_new_section_headings(self) -> None:
         new_history = _history(
@@ -281,7 +281,7 @@ class CongressDigestTests(unittest.TestCase):
             watchlist_status="ACTIVE",
             watchlist_retention_type="STANDARD",
             watchlist_day=1,
-            watchlist_total_days=5,
+            watchlist_total_days=7,
             current_entry_category="WAIT",
             previous_entry_category="WAIT",
             current_political_classification="SINGLE_FILER_BULLISH_BET",
@@ -299,8 +299,8 @@ class CongressDigestTests(unittest.TestCase):
         plan = _build_plan(histories, events, previous_summary_rows=previous_rows, affected_tickers=["INTC"])
         digest = render_digest(plan, now_sg=OBSERVED_AT)
         assert digest is not None
-        self.assertIn("NEW MATERIAL SIGNALS", digest)
-        self.assertIn("ACTIVE POLITICAL WATCHLIST", digest)
+        self.assertIn("NEW DISCLOSURES", digest)
+        self.assertIn("ROLLING SEVEN-DAY WATCHLIST", digest)
 
     def test_digest_log_rows_capture_summary_hashes_and_sections(self) -> None:
         history = _history(
