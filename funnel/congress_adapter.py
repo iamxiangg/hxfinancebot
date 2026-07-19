@@ -24,6 +24,7 @@ from funnel.political_archive import (
     persist_raw_archive_updates,
     persist_summary_rows,
     prepare_raw_archive_upserts,
+    seed_review_override_rows,
     LAST_PAYLOAD_HASH_KEY,
     LAST_RECORD_COUNT_KEY,
     set_bot_state_value,
@@ -630,6 +631,7 @@ def run_congress_adapter_detailed(
         if str(item.get("classification") or "").strip().upper() == "REQUIRES_REVIEW"
         and str(item.get("manual_review_required") or "").strip().lower() in {"true", "yes", "1"}
     ]
+    seed_review_override_rows(archive_state, review_required_items, seeded_at=observed_datetime.isoformat())
     excluded_items = [
         {
             "reason": str(record.reason or "EXCLUDED").strip(),

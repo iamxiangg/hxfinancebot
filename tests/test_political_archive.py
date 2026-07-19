@@ -13,6 +13,7 @@ from funnel.political_archive import (
     load_political_archive_state,
     persist_raw_archive_updates,
     prepare_raw_archive_upserts,
+    seed_review_override_rows,
     update_raw_notification_status,
 )
 from scanners.congress.engine import run_scan_from_payload
@@ -290,6 +291,59 @@ class PoliticalArchiveTests(unittest.TestCase):
             row = load_political_archive_state().raw_rows["id:notify-1"]
         self.assertEqual(row["First Successfully Notified At"], "2026-06-24T12:30:00+08:00")
         self.assertEqual(row["Last Successfully Notified At"], "2026-06-24T12:30:00+08:00")
+
+    def test_review_override_seed_preserves_manual_decision_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                "CONGRESS_STATE_DIR": temp_dir,
+                "POLITICAL_ARCHIVE_BACKEND": "local",
+            },
+            clear=False,
+        ):
+            state = load_political_archive_state()
+            seed_review_override_rows(
+                state,
+                [
+                    {
+                        "trade_key": "id:review-1",
+                        "asset_name": "Boston Scientific Corp Common Stock",
+                        "filer_name": "Evan Smith",
+                        "transaction_type": "Purchase",
+                        "action": "purchase",
+                        "document_url": "https://example.test/doc",
+                        "classification": "REQUIRES_REVIEW",
+                        "reason": "UNRESOLVED_PUBLIC_SECURITY",
+                        "proposed_resolution": "manual_ticker_resolution",
+                    }
+                ],
+                seeded_at="2026-06-24T12:00:00+08:00",
+            )
+            state.review_override_rows["id:review-1"]["Resolved Ticker"] = "BSX"
+            state.review_override_rows["id:review-1"]["Reviewer Note"] = "Exact match"
+            seed_review_override_rows(
+                state,
+                [
+                    {
+                        "trade_key": "id:review-1",
+                        "asset_name": "Boston Scientific Corp Common Stock",
+                        "filer_name": "Evan Smith",
+                        "transaction_type": "Purchase",
+                        "action": "purchase",
+                        "document_url": "https://example.test/doc2",
+                        "classification": "REQUIRES_REVIEW",
+                        "reason": "UNRESOLVED_PUBLIC_SECURITY",
+                        "proposed_resolution": "manual_ticker_resolution",
+                    }
+                ],
+                seeded_at="2026-06-24T13:00:00+08:00",
+            )
+            row = state.review_override_rows["id:review-1"]
+
+        self.assertEqual(row["Resolved Ticker"], "BSX")
+        self.assertEqual(row["Reviewer Note"], "Exact match")
+        self.assertEqual(row["Document URL"], "https://example.test/doc2")
+        self.assertEqual(row["Active"], "YES")
 
     def test_bootstrap_suppresses_historical_alerts(self) -> None:
         payload = [

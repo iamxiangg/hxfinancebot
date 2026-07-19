@@ -333,6 +333,10 @@ def ticker_code(value: Any) -> str | None:
     return ticker if re.fullmatch(r"[A-Z0-9.^=\-]+", ticker) else None
 
 
+def normalize_asset_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper())).strip()
+
+
 def yf_ticker(ticker: str) -> str:
     return YF_OVERRIDES.get(ticker, ticker)
 
@@ -381,6 +385,30 @@ def _review_action(value: Any) -> str:
         "sale_unknown": "sale_unknown",
     }
     return aliases.get(text, "")
+
+
+def _active_review_decision(row: dict[str, Any]) -> str:
+    decision = str(row.get("Review Decision") or "").strip().upper()
+    if decision in {"RESOLVE", "EXCLUDE", "DEFER"}:
+        return decision
+    if str(row.get("Resolved Ticker") or "").strip():
+        return "RESOLVE"
+    return ""
+
+
+def _review_override_maps(review_overrides: dict[str, dict[str, Any]] | None) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    by_asset_name: dict[str, dict[str, Any]] = {}
+    for trade_key, row in (review_overrides or {}).items():
+        decision = _active_review_decision(row)
+        if not decision:
+            continue
+        if str(trade_key or "").strip():
+            by_key[str(trade_key).strip()] = row
+        asset_name_key = normalize_asset_name(row.get("Asset Name"))
+        if asset_name_key and decision == "RESOLVE":
+            by_asset_name.setdefault(asset_name_key, row)
+    return by_key, by_asset_name
 
 
 def option_record(item: dict[str, Any]) -> bool:
@@ -900,7 +928,10 @@ def _review_rows(records: list[TransactionRecord]) -> list[dict[str, Any]]:
                 "asset_name": record.asset_name,
                 "asset_type": record.asset_type,
                 "asset_class": record.asset_class,
+                "filer_name": record.filer_name,
+                "transaction_type": record.transaction_type,
                 "action": record.action,
+                "document_url": record.doc_url,
                 "transaction_date": record.transaction_date,
                 "filing_date": record.filing_date,
                 "active_in_latest_payload": True,
@@ -1117,7 +1148,7 @@ def classify_payload_records(
 ) -> tuple[list[TransactionRecord], dict[str, dict[str, Any]], Counter]:
     scope = _resolve_scope(branch_scope)
     prior = prior_ledger or {}
-    overrides = review_overrides or {}
+    overrides, asset_name_overrides = _review_override_maps(review_overrides)
     seen_keys: set[str] = set()
     ledger_updates: dict[str, dict[str, Any]] = dict(prior)
     counts: Counter = Counter()
@@ -1254,9 +1285,9 @@ def classify_payload_records(
             broad_market=intent.broad_market,
             intentionality_score=intent.intentionality_score,
         )
-        override = overrides.get(trade_key)
+        override = overrides.get(trade_key) or asset_name_overrides.get(normalize_asset_name(asset_name))
         if override:
-            decision = str(override.get("Review Decision") or "").strip().upper()
+            decision = _active_review_decision(override)
             note = str(override.get("Reviewer Note") or "").strip()
             if decision == "RESOLVE":
                 resolved_ticker = ticker_code(override.get("Resolved Ticker")) or ticker

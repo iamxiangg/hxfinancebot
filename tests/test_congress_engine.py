@@ -234,6 +234,44 @@ class CongressEngineTests(unittest.TestCase):
         self.assertEqual(scan.transactions[0].reason, "ACTIVE_FRESH")
         self.assertEqual(scan.transactions[0].broad_outcome, "RETAINED_ACTIVE")
 
+    def test_review_override_reuses_exact_asset_name_resolution(self) -> None:
+        payload = [
+            {
+                "id": "review-2",
+                "ticker": "",
+                "asset_name": "Boston Scientific Corp Common Stock",
+                "asset_type": "Common Stock",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-06-20",
+                "filing_date": "2026-06-22",
+                "amount_range_low": 100000,
+                "amount_range_high": 100000,
+                "filer_name": "Evan Smith",
+                "filer_id": "E1",
+                "owner": "Self",
+                "branch": "Legislative",
+                "chamber": "House",
+            }
+        ]
+
+        scan = run_scan_from_payload(
+            payload,
+            observed_at="2026-06-24T12:00:00+08:00",
+            price_fetcher=price_fetcher_factory({}),
+            review_overrides={
+                "id:review-1": {
+                    "Asset Name": "BOSTON SCIENTIFIC CORP COMMON STOCK",
+                    "Resolved Ticker": "BSX",
+                    "Active": "YES",
+                }
+            },
+        )
+
+        self.assertFalse(scan.review_audit)
+        self.assertEqual(scan.transactions[0].ticker, "BSX")
+        self.assertEqual(scan.transactions[0].yf_ticker, "BSX")
+        self.assertEqual(scan.transactions[0].reason, "ACTIVE_FRESH")
+
     @patch("scanners.congress.engine.CompanyClassificationProvider.classify", side_effect=fake_classification)
     @patch("scanners.congress.engine.CongressionalRoleProvider.current_roles", side_effect=fake_current_roles)
     def test_spouse_ownership_is_included_and_not_counted_twice(self, _mock_roles, _mock_classify) -> None:

@@ -182,10 +182,70 @@ def active_review_overrides(state: PoliticalArchiveState) -> dict[str, dict[str,
         if str(row.get("Active") or "").strip().upper() not in {"YES", "Y", "TRUE", "1"}:
             continue
         decision = str(row.get("Review Decision") or "").strip().upper()
-        if decision not in {"RESOLVE", "EXCLUDE", "DEFER"}:
+        if decision not in {"RESOLVE", "EXCLUDE", "DEFER"} and not str(row.get("Resolved Ticker") or "").strip():
             continue
         overrides[trade_key] = dict(row)
     return overrides
+
+
+def _review_seed_row_from_item(item: dict[str, Any], *, now_iso: str, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    existing = existing or {}
+    return {
+        "Trade Key": str(item.get("trade_key") or item.get("Trade Key") or "").strip(),
+        "Asset Name": str(item.get("asset_name") or item.get("Asset Name") or "").strip(),
+        "Review Decision": str(existing.get("Review Decision") or "").strip(),
+        "Resolved Ticker": str(existing.get("Resolved Ticker") or "").strip(),
+        "Resolved Yahoo Ticker": str(existing.get("Resolved Yahoo Ticker") or "").strip(),
+        "Resolved Asset Class": str(existing.get("Resolved Asset Class") or "").strip(),
+        "Resolved Action": str(existing.get("Resolved Action") or item.get("action") or "").strip(),
+        "Reviewer Note": str(existing.get("Reviewer Note") or "").strip(),
+        "Reviewed At": str(existing.get("Reviewed At") or "").strip(),
+        "Active": str(existing.get("Active") or "YES").strip() or "YES",
+        "Filer Name": str(item.get("filer_name") or item.get("Filer Name") or "").strip(),
+        "Transaction Type": str(item.get("transaction_type") or item.get("Transaction Type") or "").strip(),
+        "Resolved Action Candidate": str(item.get("action") or "").strip(),
+        "Document URL": str(item.get("document_url") or item.get("Document URL") or "").strip(),
+        "Broad Outcome": str(item.get("classification") or item.get("broad_outcome") or "").strip(),
+        "Reason": str(item.get("reason") or "").strip(),
+        "Proposed Resolution": str(item.get("proposed_resolution") or "").strip(),
+        "Last Seeded At": now_iso,
+    }
+
+
+def seed_review_override_rows(state: PoliticalArchiveState, review_items: list[dict[str, Any]], *, seeded_at: str | None = None) -> list[dict[str, Any]]:
+    now_iso = seeded_at or datetime.now(UTC).replace(microsecond=0).isoformat()
+    rows: list[dict[str, Any]] = []
+    for item in review_items:
+        trade_key = str(item.get("trade_key") or item.get("Trade Key") or "").strip()
+        if not trade_key:
+            continue
+        rows.append(
+            _review_seed_row_from_item(
+                item,
+                now_iso=now_iso,
+                existing=state.review_override_rows.get(trade_key, {}),
+            )
+        )
+    if not rows:
+        return []
+    if state.context is None:
+        merged = dict(state.review_override_rows)
+        for row in rows:
+            merged[str(row.get("Trade Key") or "").strip()] = row
+        _save_json(_review_overrides_path(), list(merged.values()))
+        state.review_override_rows = merged
+        return rows
+    upsert_records(
+        state.context["service"],
+        state.context["spreadsheet_id"],
+        POLITICAL_REVIEW_OVERRIDES_SHEET,
+        POLITICAL_REVIEW_OVERRIDES_HEADERS,
+        "Trade Key",
+        rows,
+    )
+    for row in rows:
+        state.review_override_rows[str(row.get("Trade Key") or "").strip()] = row
+    return rows
 
 
 def _text_bool(value: bool) -> str:

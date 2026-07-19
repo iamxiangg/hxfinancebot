@@ -495,6 +495,14 @@ POLITICAL_REVIEW_OVERRIDES_HEADERS = [
     "Reviewer Note",
     "Reviewed At",
     "Active",
+    "Filer Name",
+    "Transaction Type",
+    "Resolved Action Candidate",
+    "Document URL",
+    "Broad Outcome",
+    "Reason",
+    "Proposed Resolution",
+    "Last Seeded At",
 ]
 
 
