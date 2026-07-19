@@ -367,7 +367,7 @@ def _history_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def _sheet_cell_text(value: str, *, limit: int = 49_000) -> str:
+def _sheet_cell_text(value: str, *, limit: int = 45_000) -> str:
     text = str(value or "")
     if len(text) <= limit:
         return text
@@ -546,7 +546,7 @@ def persist_digest_rows(state: PoliticalArchiveState, rows: list[dict[str, Any]]
 
 
 def snapshot_row_from_model(snapshot: DigestDeliverySnapshot) -> dict[str, Any]:
-    return {
+    row = {
         "Digest ID": snapshot.digest_id,
         "Digest Date": snapshot.digest_date,
         "Run ID": snapshot.run_id,
@@ -576,6 +576,10 @@ def snapshot_row_from_model(snapshot: DigestDeliverySnapshot) -> dict[str, Any]:
         "Delivered At": snapshot.delivered_at,
         "Created At": snapshot.created_at,
         "Updated At": snapshot.updated_at,
+    }
+    return {
+        key: _sheet_cell_text(value) if isinstance(value, str) else value
+        for key, value in row.items()
     }
 
 
