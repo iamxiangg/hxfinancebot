@@ -67,6 +67,11 @@ def _sheet_backend_enabled() -> bool:
     return bool(os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip() and os.getenv("GOOGLE_SHEET_ID", "").strip())
 
 
+def _must_use_sheet_backend() -> bool:
+    backend = str(os.getenv("POLITICAL_ARCHIVE_BACKEND", "auto")).strip().lower()
+    return backend != "local" and bool(os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip() and os.getenv("GOOGLE_SHEET_ID", "").strip())
+
+
 def _raw_path() -> Path:
     return _state_directory() / "political_trades_raw.json"
 
@@ -148,7 +153,8 @@ def load_political_archive_state() -> PoliticalArchiveState:
                 bot_state=_bot_state_map(read_table(service, spreadsheet_id, BOT_STATE_SHEET, BOT_STATE_HEADERS)),
             )
         except Exception:
-            pass
+            if _must_use_sheet_backend():
+                raise
     return PoliticalArchiveState(
         context=None,
         raw_rows={

@@ -355,6 +355,11 @@ def _sheet_ledger_context() -> _SheetLedgerContext | None:
     return _SheetLedgerContext(service=service, spreadsheet_id=spreadsheet_id)
 
 
+def _must_use_sheet_ledger() -> bool:
+    backend = str(os.getenv("CONGRESS_LEDGER_BACKEND", "auto")).strip().lower()
+    return backend != "local" and bool(os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip() and os.getenv("GOOGLE_SHEET_ID", "").strip())
+
+
 def _load_local_ledger() -> dict[str, dict[str, Any]]:
     path = _ledger_path()
     if not path.exists():
@@ -378,6 +383,8 @@ def _load_ledger() -> tuple[dict[str, dict[str, Any]], _SheetLedgerContext | Non
     try:
         context = _sheet_ledger_context()
     except Exception as exc:
+        if _must_use_sheet_ledger():
+            raise
         logger.warning("Congress sheet ledger unavailable, falling back to local JSON: %r", exc)
         context = None
 
