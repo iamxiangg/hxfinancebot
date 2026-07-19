@@ -267,6 +267,48 @@ class CongressDigestTests(unittest.TestCase):
         self.assertIn("Scan completed successfully.", digest)
         self.assertIn("No qualifying political disclosures met the digest criteria in this run.", digest)
 
+    def test_review_section_separates_auto_exclusions_from_manual_review(self) -> None:
+        plan = build_digest_plan(
+            histories={},
+            affected_tickers=[],
+            backfill_status=detect_backfill_status(
+                bootstrap_run=False,
+                new_records=[],
+                material_amendments=[],
+                removed_events=[],
+                affected_tickers=[],
+            ),
+            previous_digest_rows=[],
+            previous_summary_rows={},
+            digest_date="2026-06-24",
+            archive_stats=_archive_stats(),
+            observed_at=OBSERVED_AT,
+            review_required_items=[
+                {
+                    "trade_key": "id:review-1",
+                    "ticker": "",
+                    "asset_name": "Boston Scientific Corp Common Stock",
+                    "classification": "REQUIRES_REVIEW",
+                    "reason": "UNRESOLVED_PUBLIC_SECURITY",
+                    "proposed_resolution": "manual_ticker_resolution",
+                    "manual_review_required": True,
+                }
+            ],
+            excluded_items=[
+                {"trade_key": "id:excluded-1", "asset_name": "Treasury Bill", "reason": "OUT_OF_SCOPE_ASSET"},
+                {"trade_key": "id:excluded-2", "ticker": "FAS", "reason": "INVALID_TICKER"},
+            ],
+        )
+
+        digest = render_digest(plan, now_sg=OBSERVED_AT)
+
+        assert digest is not None
+        self.assertIn("AUTOMATICALLY EXCLUDED", digest)
+        self.assertIn("2 records", digest)
+        self.assertIn("MANUAL REVIEW REQUIRED", digest)
+        self.assertIn("1 active records", digest)
+        self.assertIn("Boston Scientific Corp Common Stock - manual ticker resolution", digest)
+
     def test_rendered_digest_uses_new_section_headings(self) -> None:
         new_history = _history(
             "INTC",

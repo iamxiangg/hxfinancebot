@@ -14,6 +14,7 @@ CONGRESS_LEDGER_SHEET = "Congress_Ledger"
 POLITICAL_TRADES_RAW_SHEET = "Political_Trades_Raw"
 POLITICAL_TICKER_SUMMARY_SHEET = "Political_Ticker_Summary"
 POLITICAL_DIGEST_LOG_SHEET = "Political_Digest_Log"
+POLITICAL_REVIEW_OVERRIDES_SHEET = "Political_Review_Overrides"
 INSIDER_LEDGER_SHEET = "Insider_Ledger"
 FEROLDI_FIRST_CUT_DETAIL_SHEET = "Feroldi_First_Cut_Detail"
 
@@ -480,6 +481,20 @@ POLITICAL_DIGEST_SNAPSHOT_HEADERS = [
     "Delivered At",
     "Created At",
     "Updated At",
+]
+
+
+POLITICAL_REVIEW_OVERRIDES_HEADERS = [
+    "Trade Key",
+    "Asset Name",
+    "Review Decision",
+    "Resolved Ticker",
+    "Resolved Yahoo Ticker",
+    "Resolved Asset Class",
+    "Resolved Action",
+    "Reviewer Note",
+    "Reviewed At",
+    "Active",
 ]
 
 

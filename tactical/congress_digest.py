@@ -170,6 +170,14 @@ def _review_required_or_excluded(item: dict[str, Any]) -> str:
     return f"{label} - {reason}"
 
 
+def _manual_review_label(item: dict[str, Any]) -> str:
+    ticker = str(item.get("ticker") or "").strip().upper()
+    asset_name = str(item.get("asset_name") or item.get("trade_key") or "record").strip()
+    reason = str(item.get("proposed_resolution") or item.get("reason") or "ticker resolution").strip()
+    label = ticker or asset_name
+    return f"{label} - {reason.replace('_', ' ')}"
+
+
 def _review_summary_blocks(items: tuple[dict[str, Any], ...], *, label: str) -> list[RenderedDigestPart]:
     if not items:
         return []
@@ -201,6 +209,28 @@ def _review_summary_blocks(items: tuple[dict[str, Any], ...], *, label: str) -> 
     return blocks
 
 
+def _automatic_exclusion_blocks(items: tuple[dict[str, Any], ...]) -> list[RenderedDigestPart]:
+    if not items:
+        return []
+    reasons = Counter(str(item.get("reason") or "EXCLUDED").strip() for item in items)
+    reason_lines = [
+        f"{reason}: {count}"
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:6]
+    ]
+    return [RenderedDigestPart("\n".join(["AUTOMATICALLY EXCLUDED", f"{len(items):,} records", *reason_lines]))]
+
+
+def _manual_review_blocks(items: tuple[dict[str, Any], ...]) -> list[RenderedDigestPart]:
+    if not items:
+        return []
+    max_examples = max(0, _int_env("POLITICAL_DIGEST_MAX_REVIEW_EXAMPLES", 8))
+    examples = [_manual_review_label(dict(item)) for item in items[:max_examples]]
+    remaining = max(0, len(items) - len(examples))
+    if remaining:
+        examples.append(f"... {remaining} more active review record(s).")
+    return [RenderedDigestPart("\n".join(["MANUAL REVIEW REQUIRED", f"{len(items)} active records", *examples]))]
+
+
 def _expired(flag: PoliticalDigestFlag) -> str:
     return "\n".join(
         [
@@ -227,7 +257,8 @@ def _render_header(plan: PoliticalDigestPlan, today: date) -> str:
         f"Fetched records: {plan.data_status.get('fetched_records', 0)}",
         f"New records: {plan.data_status.get('new_records', 0)}",
         f"Amendments: {plan.data_status.get('material_amendments', 0)}",
-        f"Rejected or review-required records: {plan.data_status.get('review_required', 0) + plan.data_status.get('excluded_records', 0)}",
+        f"Automatically excluded records: {plan.data_status.get('excluded_records', 0)}",
+        f"Manual review required: {plan.data_status.get('review_required', 0)}",
         "",
         "CHANGES SINCE THE PREVIOUS DIGEST",
         f"New qualifying tickers: {plan.changes_since_previous.get('new_qualifying_tickers', 0)}",
@@ -288,9 +319,8 @@ def _render_blocks(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> lis
         for flag in flags:
             blocks.append(RenderedDigestPart(formatter(flag), (flag.ticker,)))
     if plan.review_required_items or plan.excluded_items:
-        blocks.append(RenderedDigestPart("REVIEW-REQUIRED AND EXCLUDED RECORDS"))
-        blocks.extend(_review_summary_blocks(plan.review_required_items, label="Review required"))
-        blocks.extend(_review_summary_blocks(plan.excluded_items, label="Excluded"))
+        blocks.extend(_automatic_exclusion_blocks(plan.excluded_items))
+        blocks.extend(_manual_review_blocks(plan.review_required_items))
     if plan.expired_watchlist_items:
         blocks.append(RenderedDigestPart("EXPIRED TODAY"))
         for flag in plan.expired_watchlist_items:

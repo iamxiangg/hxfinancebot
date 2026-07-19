@@ -15,6 +15,8 @@ from funnel.review_schema import (
     POLITICAL_DIGEST_LOG_SHEET,
     POLITICAL_DIGEST_SNAPSHOT_HEADERS,
     POLITICAL_DIGEST_SNAPSHOT_SHEET,
+    POLITICAL_REVIEW_OVERRIDES_HEADERS,
+    POLITICAL_REVIEW_OVERRIDES_SHEET,
     POLITICAL_TICKER_SUMMARY_HEADERS,
     POLITICAL_TICKER_SUMMARY_SHEET,
     POLITICAL_TRADES_RAW_HEADERS,
@@ -37,6 +39,7 @@ class PoliticalArchiveState:
     summary_rows: dict[str, dict[str, Any]]
     digest_rows: list[dict[str, Any]]
     snapshot_rows: dict[str, dict[str, Any]]
+    review_override_rows: dict[str, dict[str, Any]]
     bot_state: dict[str, str]
 
 
@@ -78,6 +81,10 @@ def _digest_log_path() -> Path:
 
 def _digest_snapshot_path() -> Path:
     return _state_directory() / "political_digest_snapshot.json"
+
+
+def _review_overrides_path() -> Path:
+    return _state_directory() / "political_review_overrides.json"
 
 
 def _bot_state_path() -> Path:
@@ -133,6 +140,11 @@ def load_political_archive_state() -> PoliticalArchiveState:
                     for row in read_table(service, spreadsheet_id, POLITICAL_DIGEST_SNAPSHOT_SHEET, POLITICAL_DIGEST_SNAPSHOT_HEADERS)
                     if str(row.get("Digest ID") or "").strip()
                 },
+                review_override_rows={
+                    str(row.get("Trade Key") or "").strip(): row
+                    for row in read_table(service, spreadsheet_id, POLITICAL_REVIEW_OVERRIDES_SHEET, POLITICAL_REVIEW_OVERRIDES_HEADERS)
+                    if str(row.get("Trade Key") or "").strip()
+                },
                 bot_state=_bot_state_map(read_table(service, spreadsheet_id, BOT_STATE_SHEET, BOT_STATE_HEADERS)),
             )
         except Exception:
@@ -155,8 +167,25 @@ def load_political_archive_state() -> PoliticalArchiveState:
             for row in _load_json(_digest_snapshot_path(), default=[])
             if isinstance(row, dict) and str(row.get("Digest ID") or "").strip()
         },
+        review_override_rows={
+            str(row.get("Trade Key") or "").strip(): row
+            for row in _load_json(_review_overrides_path(), default=[])
+            if isinstance(row, dict) and str(row.get("Trade Key") or "").strip()
+        },
         bot_state={str(key): str(value) for key, value in _load_json(_bot_state_path(), default={}).items()},
     )
+
+
+def active_review_overrides(state: PoliticalArchiveState) -> dict[str, dict[str, Any]]:
+    overrides: dict[str, dict[str, Any]] = {}
+    for trade_key, row in state.review_override_rows.items():
+        if str(row.get("Active") or "").strip().upper() not in {"YES", "Y", "TRUE", "1"}:
+            continue
+        decision = str(row.get("Review Decision") or "").strip().upper()
+        if decision not in {"RESOLVE", "EXCLUDE", "DEFER"}:
+            continue
+        overrides[trade_key] = dict(row)
+    return overrides
 
 
 def _text_bool(value: bool) -> str:

@@ -17,6 +17,7 @@ from googleapiclient.errors import HttpError
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.political_archive import (
     build_archive_stats,
+    active_review_overrides,
     get_bot_state_value,
     get_bootstrap_marker,
     load_political_archive_state,
@@ -529,6 +530,7 @@ def run_congress_adapter_detailed(
     scan = run_live_scan(
         prior_ledger=ledger,
         branch_scope=os.getenv("POLITICAL_DISCLOSURE_SCOPE", "all"),
+        review_overrides=active_review_overrides(archive_state),
     )
     if persist_ledger:
         # Saving the ledger is best-effort. If Google Sheets rate-limits the
@@ -622,8 +624,23 @@ def run_congress_adapter_detailed(
         for trade_key, row in archive_state.raw_rows.items()
         if str(row.get("Notification Status") or "").strip().upper() != "NOTIFIED"
     }
-    review_required_items = _list_or_empty(getattr(scan, "review_audit", []))
-    excluded_items = _list_or_empty(getattr(getattr(scan, "audit_bundle", None), "excluded_record_reasons", []))
+    review_required_items = [
+        dict(item)
+        for item in _list_or_empty(getattr(scan, "review_audit", []))
+        if str(item.get("classification") or "").strip().upper() == "REQUIRES_REVIEW"
+        and str(item.get("manual_review_required") or "").strip().lower() in {"true", "yes", "1"}
+    ]
+    excluded_items = [
+        {
+            "reason": str(record.reason or "EXCLUDED").strip(),
+            "classification": record.broad_outcome,
+            "asset_name": record.asset_name,
+            "ticker": record.ticker,
+            "trade_key": record.trade_key,
+        }
+        for record in _list_or_empty(getattr(scan, "transactions", []))
+        if record.broad_outcome == "EXCLUDED" and not record.manual_review_required
+    ]
     digest_plan = build_digest_plan(
         histories=histories,
         affected_tickers=affected_tickers,
