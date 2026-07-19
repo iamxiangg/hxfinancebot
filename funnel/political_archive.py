@@ -367,6 +367,13 @@ def _history_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
 
 
+def _sheet_cell_text(value: str, *, limit: int = 49_000) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
 def summary_row_from_history(
     history: TickerPoliticalHistory,
     *,
@@ -553,8 +560,8 @@ def snapshot_row_from_model(snapshot: DigestDeliverySnapshot) -> dict[str, Any]:
         "Review Required Count": snapshot.review_required_count,
         "Included Trade Keys": _history_json(list(snapshot.included_trade_keys)),
         "Excluded Trade Keys": _history_json(list(snapshot.excluded_trade_keys)),
-        "Ticker Summaries JSON": snapshot.ticker_summaries_json,
-        "Threshold Settings JSON": snapshot.threshold_settings_json,
+        "Ticker Summaries JSON": _sheet_cell_text(snapshot.ticker_summaries_json),
+        "Threshold Settings JSON": _sheet_cell_text(snapshot.threshold_settings_json),
         "Rule Version": snapshot.rule_version,
         "Template Version": snapshot.template_version,
         "Code Commit": snapshot.code_commit,
@@ -565,7 +572,7 @@ def snapshot_row_from_model(snapshot: DigestDeliverySnapshot) -> dict[str, Any]:
         "Failed Chunks": snapshot.failed_chunks,
         "Attempt Count": snapshot.attempt_count,
         "Last Delivery Error": snapshot.last_delivery_error,
-        "Rendered Digest": snapshot.rendered_digest,
+        "Rendered Digest": _sheet_cell_text(snapshot.rendered_digest),
         "Delivered At": snapshot.delivered_at,
         "Created At": snapshot.created_at,
         "Updated At": snapshot.updated_at,
