@@ -260,6 +260,16 @@ def _watchlist_priority(flag: PoliticalDigestFlag) -> tuple[float, float, float,
     )
 
 
+def _rolling_activity_priority(history: TickerPoliticalHistory) -> tuple[float, float, float, float, str]:
+    return (
+        history.political_conviction,
+        history.entry_quality,
+        history.breadth_score,
+        _rank_score(history),
+        history.ticker,
+    )
+
+
 def _previous_detailed_hash(
     ticker: str,
     previous_summary_rows: dict[str, dict[str, Any]],
@@ -487,7 +497,7 @@ def build_digest_plan(
         )
         for history in sorted(
             [*other_new_candidates, *(history for history in ranked_material if history.ticker not in new_material_tickers)],
-            key=lambda item: (_rank_score(item), item.ticker),
+            key=_rolling_activity_priority,
             reverse=True,
         )
         if history.ticker not in shown_tickers

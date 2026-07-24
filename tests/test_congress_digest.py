@@ -354,6 +354,41 @@ class CongressDigestTests(unittest.TestCase):
         self.assertFalse(plan.other_new_activity)
         self.assertFalse(plan.send_digest)
 
+    def test_rolling_activity_sorts_by_visible_scores(self) -> None:
+        high = _history(
+            "HIGH",
+            political_conviction=90.0,
+            entry_quality=40.0,
+            latest_transaction_date="2026-05-29",
+            latest_filing_date="2026-06-23",
+        )
+        low = _history(
+            "LOW",
+            political_conviction=60.0,
+            entry_quality=95.0,
+            latest_transaction_date="2026-05-29",
+            latest_filing_date="2026-06-23",
+        )
+
+        plan = build_digest_plan(
+            histories={"LOW": low, "HIGH": high},
+            affected_tickers=[],
+            backfill_status=detect_backfill_status(
+                bootstrap_run=False,
+                new_records=[],
+                material_amendments=[],
+                removed_events=[],
+                affected_tickers=[],
+            ),
+            previous_digest_rows=[],
+            previous_summary_rows={},
+            digest_date="2026-06-24",
+            archive_stats=_archive_stats(),
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["HIGH", "LOW"])
+
     def test_no_new_event_run_can_send_success_notification_when_enabled(self) -> None:
         with patch.dict(os.environ, {"POLITICAL_DIGEST_SEND_EMPTY": "true"}, clear=False):
             plan = build_digest_plan(
