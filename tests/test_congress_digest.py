@@ -105,6 +105,7 @@ def _history(
     summary_hash: str | None = None,
     latest_transaction_date: str = "2026-06-23",
     latest_filing_date: str = "2026-06-24",
+    signal_context=None,
 ) -> TickerPoliticalHistory:
     windows = {
         45: _window(),
@@ -147,6 +148,7 @@ def _history(
         entry_quality=entry_quality,
         signal_category=entry_category.lower(),
         existing_status=entry_category.lower(),
+        signal_context=dict(signal_context or {}),
     )
 
 
@@ -253,6 +255,19 @@ class CongressDigestTests(unittest.TestCase):
             release_types=(),
             latest_transaction_date="2026-05-29",
             latest_filing_date="2026-06-23",
+            signal_context={
+                "active_amount_low": 1000.0,
+                "active_amount_mid": 8000.0,
+                "active_amount_high": 15000.0,
+                "buyers": 1,
+                "branches": ["congress"],
+                "asset_intent_classes": ["INDIVIDUAL_STOCK"],
+                "cluster_type": "SINGLE_FILER",
+                "weighted_age": 29.0,
+                "weighted_return": 7.0,
+                "flow": "Distribution signal",
+                "names": ["Taylor"],
+            },
         )
 
         plan = build_digest_plan(
@@ -276,8 +291,9 @@ class CongressDigestTests(unittest.TestCase):
         self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["MSFT"])
         assert digest is not None
         self.assertIn("ROLLING LATE-FILING ACTIVITY", digest)
-        self.assertIn("90-day stock buys: US$200k low / US$300k high", digest)
-        self.assertIn("Congress breadth: 1 buyers, 0 sellers, 0 records", digest)
+        self.assertIn("$MSFT | Active US$8k [US$1k-US$15k] | 1 filers | Congress | Individual Stock | Single Filer", digest)
+        self.assertIn("Wtd age 29d | Since trade +7.0% | Distribution signal | Taylor", digest)
+        self.assertIn("90d buys US$200k low / US$300k high; sales US$0 low / US$0 high", digest)
         self.assertIn("Scores: political 78, entry 55, breadth 40", digest)
 
     def test_old_filing_is_not_included_by_rolling_window(self) -> None:

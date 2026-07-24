@@ -201,6 +201,7 @@ class TickerPoliticalHistory:
     entry_quality: float = 0.0
     signal_category: str = "other"
     existing_status: str = "other"
+    signal_context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

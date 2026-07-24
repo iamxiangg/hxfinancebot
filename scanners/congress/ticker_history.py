@@ -326,6 +326,27 @@ def _aggregate_direction(primary_classification: str) -> str:
     return "INSUFFICIENT_EVIDENCE"
 
 
+def _signal_context(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {}
+    return {
+        "active_amount_low": float(getattr(result, "active_amount_low", 0.0) or 0.0),
+        "active_amount_mid": float(getattr(result, "active_amount_mid", 0.0) or 0.0),
+        "active_amount_high": float(getattr(result, "active_amount_high", 0.0) or 0.0),
+        "buyers": int(getattr(result, "buyers", 0) or 0),
+        "cluster_buyers": int(getattr(result, "cluster_buyers", 0) or 0),
+        "branches": list(getattr(result, "branches", []) or []),
+        "asset_intent_classes": list(getattr(result, "asset_intent_classes", []) or []),
+        "cluster_type": str(getattr(result, "cluster_type", "") or ""),
+        "weighted_age": float(getattr(result, "weighted_age", 0.0) or 0.0),
+        "weighted_return": float(getattr(result, "weighted_return", 0.0) or 0.0),
+        "flow": str(getattr(result, "flow", "") or ""),
+        "names": list(getattr(result, "names", []) or []),
+        "active_trade_count": int(getattr(result, "active_trade_count", 0) or 0),
+        "active_late_disclosed_trade_count": int(getattr(result, "active_late_disclosed_trade_count", 0) or 0),
+    }
+
+
 def _latest_disclosure_direction(trigger_items: list[dict[str, Any]]) -> str:
     if not trigger_items:
         return "AMBIGUOUS"
@@ -558,5 +579,6 @@ def build_ticker_histories(
             entry_quality=entry_quality,
             signal_category=str(getattr(current_result, "category", "other") or "other"),
             existing_status=str(getattr(current_result, "category", "other") or "other"),
+            signal_context=_signal_context(current_result),
         )
     return histories

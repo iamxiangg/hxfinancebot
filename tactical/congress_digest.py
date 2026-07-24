@@ -43,6 +43,10 @@ def _event_value_range(event: dict[str, Any]) -> str:
     return f"{_money(float(event.get('amount_low') or 0.0))}-{_money(float(event.get('amount_high') or 0.0))}"
 
 
+def _title_text(value: str) -> str:
+    return str(value or "").replace("_", " ").title()
+
+
 def _detected_date(flag: PoliticalDigestFlag) -> str:
     state = flag.watchlist_state
     if state and state.first_flagged_at:
@@ -154,6 +158,40 @@ def _below_threshold(flag: PoliticalDigestFlag) -> str:
     history = flag.history
     event = history.new_events[-1] if history.new_events else {}
     window = history.windows.get(90) or history.windows.get(45) or history.windows.get(365)
+    context = history.signal_context or {}
+    if context:
+        fallback_active_low = (window.stock_purchase_low + window.call_purchase_low) if window else 0.0
+        active_low = float(context.get("active_amount_low") or fallback_active_low)
+        active_mid = float(context.get("active_amount_mid") or active_low)
+        active_high = float(context.get("active_amount_high") or active_low)
+        buyers = int(context.get("buyers") or (window.unique_buyer_count if window else 0))
+        branches = context.get("branches") if isinstance(context.get("branches"), list) else []
+        intents = context.get("asset_intent_classes") if isinstance(context.get("asset_intent_classes"), list) else []
+        names = context.get("names") if isinstance(context.get("names"), list) else []
+        branch_mix = " + ".join(_title_text(item) for item in branches[:2]) if branches else "Unknown"
+        instrument = ", ".join(_title_text(item) for item in intents[:2]) if intents else history.structure_classification.replace("_", " ").title()
+        cluster = _title_text(str(context.get("cluster_type") or "Single Filer"))
+        flow = str(context.get("flow") or f"{history.aggregate_direction.title()} signal").strip()
+        name_text = ", ".join(str(name).strip() for name in names[:4] if str(name).strip()) or "Unknown"
+        return "\n".join(
+            [
+                (
+                    f"${history.ticker} | Active {_money(active_mid)} [{_money(active_low)}-{_money(active_high)}] | "
+                    f"{buyers} filers | {branch_mix} | {instrument} | {cluster} | "
+                    f"Wtd age {float(context.get('weighted_age') or 0.0):.0f}d | "
+                    f"Since trade {float(context.get('weighted_return') or 0.0):+.1f}% | {flow} | {name_text}"
+                ),
+                f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
+                (
+                    f"90d buys {_money(window.stock_purchase_low + window.call_purchase_low)} low / "
+                    f"{_money(window.stock_purchase_high + window.call_purchase_high)} high; "
+                    f"sales {_money(window.sale_low)} low / {_money(window.sale_high)} high"
+                    if window
+                    else "90d magnitude unavailable"
+                ),
+                f"Scores: political {history.political_conviction:.0f}, entry {history.entry_quality:.0f}, breadth {history.breadth_score:.0f}",
+            ]
+        )
     if window is None:
         filer = str(event.get("filer_name") or "Rolling aggregate").strip()
         transaction_type = str(event.get("transaction_type") or history.aggregate_direction or "activity").strip().lower()
