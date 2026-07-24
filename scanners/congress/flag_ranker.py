@@ -292,7 +292,7 @@ def build_digest_plan(
     max_detailed = int(_float_env("POLITICAL_DIGEST_MAX_DETAILED_FLAGS", 3.0))
     hard_max = int(_float_env("POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS", 5.0))
     detail_limit = max(0, min(max_detailed, hard_max))
-    rolling_lookback_days = int(_float_env("POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS", 14.0))
+    rolling_lookback_days = int(_float_env("POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS", 30.0))
 
     material_candidates: list[TickerPoliticalHistory] = []
     other_new_candidates: list[TickerPoliticalHistory] = []

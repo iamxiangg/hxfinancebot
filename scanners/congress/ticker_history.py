@@ -15,7 +15,7 @@ from scanners.congress.models import PoliticalWindowSummary, TickerPoliticalHist
 PRIMARY_WINDOW_DAYS = 90
 HISTORY_WINDOW_DAYS = 365
 SHORT_WINDOW_DAYS = 7
-ROLLING_DIGEST_WINDOW_DAYS = 14
+ROLLING_DIGEST_WINDOW_DAYS = 30
 
 
 def _float_env(name: str, default: float) -> float:

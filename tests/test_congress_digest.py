@@ -107,7 +107,7 @@ def _history(
     latest_filing_date: str = "2026-06-24",
 ) -> TickerPoliticalHistory:
     windows = {
-        14: _window(),
+        30: _window(),
         45: _window(),
         90: _window(),
         365: PoliticalWindowSummary(
@@ -252,8 +252,8 @@ class CongressDigestTests(unittest.TestCase):
             "MSFT",
             new_events=[],
             release_types=(),
-            latest_transaction_date="2026-06-18",
-            latest_filing_date="2026-06-20",
+            latest_transaction_date="2026-05-31",
+            latest_filing_date="2026-06-02",
         )
 
         plan = build_digest_plan(
@@ -276,15 +276,15 @@ class CongressDigestTests(unittest.TestCase):
 
         self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["MSFT"])
         assert digest is not None
-        self.assertIn("ROLLING 14-DAY ACTIVITY", digest)
+        self.assertIn("ROLLING 30-DAY ACTIVITY", digest)
 
     def test_old_activity_is_not_included_by_rolling_window(self) -> None:
         history = _history(
             "MSFT",
             new_events=[],
             release_types=(),
-            latest_transaction_date="2026-06-01",
-            latest_filing_date="2026-06-02",
+            latest_transaction_date="2026-05-24",
+            latest_filing_date="2026-05-25",
         )
 
         plan = build_digest_plan(
