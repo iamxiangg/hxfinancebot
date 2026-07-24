@@ -276,6 +276,9 @@ class CongressDigestTests(unittest.TestCase):
         self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["MSFT"])
         assert digest is not None
         self.assertIn("ROLLING LATE-FILING ACTIVITY", digest)
+        self.assertIn("90-day stock buys: US$200k low / US$300k high", digest)
+        self.assertIn("Congress breadth: 1 buyers, 0 sellers, 0 records", digest)
+        self.assertIn("Scores: political 78, entry 55, breadth 40", digest)
 
     def test_old_filing_is_not_included_by_rolling_window(self) -> None:
         history = _history(

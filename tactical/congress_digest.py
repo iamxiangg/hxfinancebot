@@ -153,14 +153,30 @@ def _watchlist_item(flag: PoliticalDigestFlag) -> str:
 def _below_threshold(flag: PoliticalDigestFlag) -> str:
     history = flag.history
     event = history.new_events[-1] if history.new_events else {}
-    filer = str(event.get("filer_name") or "Rolling aggregate").strip()
-    transaction_type = str(event.get("transaction_type") or history.aggregate_direction or "activity").strip().lower()
+    window = history.windows.get(90) or history.windows.get(45) or history.windows.get(365)
+    if window is None:
+        filer = str(event.get("filer_name") or "Rolling aggregate").strip()
+        transaction_type = str(event.get("transaction_type") or history.aggregate_direction or "activity").strip().lower()
+        return "\n".join(
+            [
+                f"{history.ticker} - {filer} {transaction_type}, {_event_value_range(event) if event else 'Unknown'}",
+                f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
+                f"Classification: {history.aggregate_direction}",
+                f"Reason not qualified: material effect {history.material_effect_category.lower()}",
+            ]
+        )
+    reasons = "; ".join(history.flag_reasons[:2]) if history.flag_reasons else "met rolling activity thresholds"
     return "\n".join(
         [
-            f"{history.ticker} - {filer} {transaction_type}, {_event_value_range(event) if event else 'Unknown'}",
+            f"{history.ticker} - {history.aggregate_direction} | {history.primary_classification.replace('_', ' ')}",
             f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
-            f"Classification: {history.aggregate_direction}",
-            f"Reason not qualified: material effect {history.material_effect_category.lower()}",
+            f"90-day stock buys: {_money(window.stock_purchase_low)} low / {_money(window.stock_purchase_high)} high",
+            f"90-day call buys: {_money(window.call_purchase_low)} low / {_money(window.call_purchase_high)} high",
+            f"90-day sales: {_money(window.sale_low)} low / {_money(window.sale_high)} high",
+            f"Congress breadth: {window.unique_buyer_count} buyers, {window.unique_seller_count} sellers, {window.unique_record_count} records",
+            f"Scores: political {history.political_conviction:.0f}, entry {history.entry_quality:.0f}, breadth {history.breadth_score:.0f}",
+            f"Why shown: {reasons}",
+            f"Why compact: material effect {history.material_effect_category.lower()}",
         ]
     )
 
