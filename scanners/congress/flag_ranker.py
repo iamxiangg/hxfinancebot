@@ -188,21 +188,30 @@ def _qualifies_for_other_activity(history: TickerPoliticalHistory) -> bool:
     )
 
 
-def _transaction_age_days(history: TickerPoliticalHistory, observed_at: datetime) -> int | None:
-    if not history.latest_transaction_date:
+def _age_days(value: str, observed_at: datetime) -> int | None:
+    if not value:
         return None
     try:
-        transaction_date = datetime.fromisoformat(str(history.latest_transaction_date)).date()
+        item_date = datetime.fromisoformat(str(value)).date()
     except ValueError:
         return None
-    return (observed_at.date() - transaction_date).days
+    return (observed_at.date() - item_date).days
 
 
-def _has_rolling_activity(history: TickerPoliticalHistory, *, observed_at: datetime, window_days: int) -> bool:
-    age = _transaction_age_days(history, observed_at)
-    if age is None or age < 0 or age > window_days:
+def _has_rolling_activity(
+    history: TickerPoliticalHistory,
+    *,
+    observed_at: datetime,
+    filing_lookback_days: int,
+    transaction_max_age_days: int,
+) -> bool:
+    filing_age = _age_days(history.latest_filing_date, observed_at)
+    transaction_age = _age_days(history.latest_transaction_date, observed_at)
+    if filing_age is None or filing_age < 0 or filing_age > filing_lookback_days:
         return False
-    window = history.windows.get(window_days) or history.windows.get(45) or history.windows.get(90)
+    if transaction_age is None or transaction_age < 0 or transaction_age > transaction_max_age_days:
+        return False
+    window = history.windows.get(transaction_max_age_days) or history.windows.get(90) or history.windows.get(45)
     if window is None:
         return False
     compact_threshold = _float_env("POLITICAL_DIGEST_COMPACT_ACTIVITY_LOW", 25000.0)
@@ -292,16 +301,24 @@ def build_digest_plan(
     max_detailed = int(_float_env("POLITICAL_DIGEST_MAX_DETAILED_FLAGS", 3.0))
     hard_max = int(_float_env("POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS", 5.0))
     detail_limit = max(0, min(max_detailed, hard_max))
-    rolling_lookback_days = int(_float_env("POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS", 30.0))
+    rolling_filing_lookback_days = int(_float_env("POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS", 45.0))
+    rolling_transaction_max_age_days = int(_float_env("POLITICAL_DIGEST_ROLLING_TRANSACTION_MAX_AGE_DAYS", 90.0))
+    rolling_activity_limit = int(_float_env("POLITICAL_DIGEST_MAX_ROLLING_ACTIVITY_ITEMS", 12.0))
 
     material_candidates: list[TickerPoliticalHistory] = []
     other_new_candidates: list[TickerPoliticalHistory] = []
     for ticker, history in sorted(histories.items()):
         fresh_trigger = ticker.upper() in affected_set and bool(history.new_events)
         rolling_trigger = (
-            rolling_lookback_days > 0
+            rolling_filing_lookback_days > 0
+            and rolling_transaction_max_age_days > 0
             and not fresh_trigger
-            and _has_rolling_activity(history, observed_at=observed_at, window_days=rolling_lookback_days)
+            and _has_rolling_activity(
+                history,
+                observed_at=observed_at,
+                filing_lookback_days=rolling_filing_lookback_days,
+                transaction_max_age_days=rolling_transaction_max_age_days,
+            )
         )
         if not fresh_trigger and not rolling_trigger:
             continue
@@ -454,7 +471,7 @@ def build_digest_plan(
     hidden_watchlist_count = max(0, len(ranked_watchlist) - len(active_watchlist_items))
 
     shown_tickers = new_material_tickers | material_update_tickers | {flag.ticker for flag in active_watchlist_items}
-    other_new_activity = [
+    ranked_other_activity = [
         PoliticalDigestFlag(
             ticker=history.ticker,
             rank_score=_rank_score(history),
@@ -475,6 +492,8 @@ def build_digest_plan(
         )
         if history.ticker not in shown_tickers
     ]
+    other_new_activity = ranked_other_activity[: max(0, rolling_activity_limit)]
+    hidden_rolling_count = max(0, len(ranked_other_activity) - len(other_new_activity))
 
     data_status = {
         "fetched_records": source_record_count,
@@ -492,6 +511,7 @@ def build_digest_plan(
         "detailed_flags": len(new_material_flags),
         "compact_activity_count": len(other_new_activity),
         "recorded_only_count": max(0, len(affected_set) - len(new_material_tickers | material_update_tickers | {flag.ticker for flag in other_new_activity})),
+        "hidden_rolling_activity": hidden_rolling_count,
     }
     changes_since_previous = {
         "new_qualifying_tickers": len(new_material_flags),
@@ -504,6 +524,7 @@ def build_digest_plan(
     summary_lines = tuple(
         [*(f"Release mix {name}: {release_counter.get(name, 0)}" for name in sorted(release_counter))]
         + ([f"{hidden_watchlist_count} additional active signals remain recorded in Political_Ticker_Summary."] if hidden_watchlist_count else [])
+        + ([f"{hidden_rolling_count} additional rolling activity ticker(s) hidden by the digest cap."] if hidden_rolling_count else [])
     )
     send_digest = bool(new_material_flags or material_updates or active_watchlist_items or other_new_activity)
     if _bool_env("POLITICAL_DIGEST_SEND_EMPTY", False) and not send_digest:

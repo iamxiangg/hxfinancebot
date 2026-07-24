@@ -107,7 +107,6 @@ def _history(
     latest_filing_date: str = "2026-06-24",
 ) -> TickerPoliticalHistory:
     windows = {
-        30: _window(),
         45: _window(),
         90: _window(),
         365: PoliticalWindowSummary(
@@ -252,8 +251,8 @@ class CongressDigestTests(unittest.TestCase):
             "MSFT",
             new_events=[],
             release_types=(),
-            latest_transaction_date="2026-05-31",
-            latest_filing_date="2026-06-02",
+            latest_transaction_date="2026-05-29",
+            latest_filing_date="2026-06-23",
         )
 
         plan = build_digest_plan(
@@ -276,15 +275,44 @@ class CongressDigestTests(unittest.TestCase):
 
         self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["MSFT"])
         assert digest is not None
-        self.assertIn("ROLLING 30-DAY ACTIVITY", digest)
+        self.assertIn("ROLLING LATE-FILING ACTIVITY", digest)
 
-    def test_old_activity_is_not_included_by_rolling_window(self) -> None:
+    def test_old_filing_is_not_included_by_rolling_window(self) -> None:
         history = _history(
             "MSFT",
             new_events=[],
             release_types=(),
             latest_transaction_date="2026-05-24",
-            latest_filing_date="2026-05-25",
+            latest_filing_date="2026-05-01",
+        )
+
+        plan = build_digest_plan(
+            histories={"MSFT": history},
+            affected_tickers=[],
+            backfill_status=detect_backfill_status(
+                bootstrap_run=False,
+                new_records=[],
+                material_amendments=[],
+                removed_events=[],
+                affected_tickers=[],
+            ),
+            previous_digest_rows=[],
+            previous_summary_rows={},
+            digest_date="2026-06-24",
+            archive_stats=_archive_stats(),
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertFalse(plan.other_new_activity)
+        self.assertFalse(plan.send_digest)
+
+    def test_ancient_transaction_is_not_included_by_recent_filing(self) -> None:
+        history = _history(
+            "MSFT",
+            new_events=[],
+            release_types=(),
+            latest_transaction_date="2026-02-01",
+            latest_filing_date="2026-06-23",
         )
 
         plan = build_digest_plan(

@@ -179,7 +179,9 @@ Copy these to your GitHub Actions repository variables or a local `.env` file:
 | `POLITICAL_DIGEST_LEGACY_OUTPUT` | `false` | Use the legacy Congress formatter instead of the digest |
 | `POLITICAL_DIGEST_SEND_TELEGRAM` | `true` | Render the digest but skip Telegram when false |
 | `POLITICAL_DIGEST_SEND_EMPTY` | `true` | Send a success notification when the political scan has no digest hits |
-| `POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS` | `30` | Include qualifying rolling activity whose latest transaction is within this many calendar days, even when it is not a fresh disclosure trigger |
+| `POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS` | `45` | Include qualifying rolling activity whose latest filing is within this many calendar days, even when it is not a fresh disclosure trigger |
+| `POLITICAL_DIGEST_ROLLING_TRANSACTION_MAX_AGE_DAYS` | `90` | Exclude rolling activity when the underlying transaction is older than this many calendar days |
+| `POLITICAL_DIGEST_MAX_ROLLING_ACTIVITY_ITEMS` | `12` | Max compact rolling late-filing tickers rendered per digest |
 | `POLITICAL_DIGEST_MAX_DETAILED_FLAGS` | `3` | Default detailed dossier cap |
 | `POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS` | `5` | Absolute detailed dossier cap |
 | `POLITICAL_DIGEST_WATCHLIST_ENABLED` | `true` | Keep detailed political signals on a short-lived reminder watchlist |

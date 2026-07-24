@@ -153,11 +153,12 @@ def _watchlist_item(flag: PoliticalDigestFlag) -> str:
 def _below_threshold(flag: PoliticalDigestFlag) -> str:
     history = flag.history
     event = history.new_events[-1] if history.new_events else {}
-    filer = str(event.get("filer_name") or "Unknown filer").strip()
-    transaction_type = str(event.get("transaction_type") or "activity").strip().lower()
+    filer = str(event.get("filer_name") or "Rolling aggregate").strip()
+    transaction_type = str(event.get("transaction_type") or history.aggregate_direction or "activity").strip().lower()
     return "\n".join(
         [
             f"{history.ticker} - {filer} {transaction_type}, {_event_value_range(event) if event else 'Unknown'}",
+            f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
             f"Classification: {history.aggregate_direction}",
             f"Reason not qualified: material effect {history.material_effect_category.lower()}",
         ]
@@ -310,7 +311,7 @@ def _render_blocks(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> lis
         ("NEW DISCLOSURES", plan.new_material_flags, _full_new_disclosure),
         ("MATERIAL SIGNAL UPDATES", plan.material_updates, _material_update),
         ("ROLLING SEVEN-DAY WATCHLIST", plan.active_watchlist_items, _watchlist_item),
-        ("ROLLING 30-DAY ACTIVITY", plan.other_new_activity, _below_threshold),
+        ("ROLLING LATE-FILING ACTIVITY", plan.other_new_activity, _below_threshold),
     ]
     for heading, flags, formatter in sections:
         if not flags:
