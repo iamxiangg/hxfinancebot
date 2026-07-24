@@ -103,8 +103,11 @@ def _history(
     new_events=None,
     release_types=(),
     summary_hash: str | None = None,
+    latest_transaction_date: str = "2026-06-23",
+    latest_filing_date: str = "2026-06-24",
 ) -> TickerPoliticalHistory:
     windows = {
+        14: _window(),
         45: _window(),
         90: _window(),
         365: PoliticalWindowSummary(
@@ -136,8 +139,8 @@ def _history(
         classification_changed=False,
         summary_hash=summary_hash or f"{ticker.lower()}-{entry_category.lower()}",
         entry_category=entry_category,
-        latest_transaction_date="2026-06-23",
-        latest_filing_date="2026-06-24",
+        latest_transaction_date=latest_transaction_date,
+        latest_filing_date=latest_filing_date,
         latest_trigger_type=release_types[0] if release_types else "",
         latest_trigger_trade_keys=tuple(event.get("trade_key", "") for event in (new_events or []) if event.get("trade_key")),
         release_types=tuple(release_types),
@@ -243,6 +246,66 @@ class CongressDigestTests(unittest.TestCase):
             observed_at=OBSERVED_AT,
         )
         self.assertIsNone(render_digest(plan, now_sg=OBSERVED_AT))
+
+    def test_recent_rolling_activity_is_included_without_fresh_trigger(self) -> None:
+        history = _history(
+            "MSFT",
+            new_events=[],
+            release_types=(),
+            latest_transaction_date="2026-06-18",
+            latest_filing_date="2026-06-20",
+        )
+
+        plan = build_digest_plan(
+            histories={"MSFT": history},
+            affected_tickers=[],
+            backfill_status=detect_backfill_status(
+                bootstrap_run=False,
+                new_records=[],
+                material_amendments=[],
+                removed_events=[],
+                affected_tickers=[],
+            ),
+            previous_digest_rows=[],
+            previous_summary_rows={},
+            digest_date="2026-06-24",
+            archive_stats=_archive_stats(),
+            observed_at=OBSERVED_AT,
+        )
+        digest = render_digest(plan, now_sg=OBSERVED_AT)
+
+        self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["MSFT"])
+        assert digest is not None
+        self.assertIn("ROLLING 14-DAY ACTIVITY", digest)
+
+    def test_old_activity_is_not_included_by_rolling_window(self) -> None:
+        history = _history(
+            "MSFT",
+            new_events=[],
+            release_types=(),
+            latest_transaction_date="2026-06-01",
+            latest_filing_date="2026-06-02",
+        )
+
+        plan = build_digest_plan(
+            histories={"MSFT": history},
+            affected_tickers=[],
+            backfill_status=detect_backfill_status(
+                bootstrap_run=False,
+                new_records=[],
+                material_amendments=[],
+                removed_events=[],
+                affected_tickers=[],
+            ),
+            previous_digest_rows=[],
+            previous_summary_rows={},
+            digest_date="2026-06-24",
+            archive_stats=_archive_stats(),
+            observed_at=OBSERVED_AT,
+        )
+
+        self.assertFalse(plan.other_new_activity)
+        self.assertFalse(plan.send_digest)
 
     def test_no_new_event_run_can_send_success_notification_when_enabled(self) -> None:
         with patch.dict(os.environ, {"POLITICAL_DIGEST_SEND_EMPTY": "true"}, clear=False):

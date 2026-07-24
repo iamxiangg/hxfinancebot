@@ -15,6 +15,7 @@ from scanners.congress.models import PoliticalWindowSummary, TickerPoliticalHist
 PRIMARY_WINDOW_DAYS = 90
 HISTORY_WINDOW_DAYS = 365
 SHORT_WINDOW_DAYS = 7
+ROLLING_DIGEST_WINDOW_DAYS = 14
 
 
 def _float_env(name: str, default: float) -> float:
@@ -455,7 +456,7 @@ def build_ticker_histories(
         )
         windows = {
             window: _window_summary(records_in_order, observed_on=observed_on, window_days=window)
-            for window in (SHORT_WINDOW_DAYS, 45, 90, 365)
+            for window in (SHORT_WINDOW_DAYS, ROLLING_DIGEST_WINDOW_DAYS, 45, 90, 365)
         }
         primary_window = windows[PRIMARY_WINDOW_DAYS]
         full_history = windows[HISTORY_WINDOW_DAYS]

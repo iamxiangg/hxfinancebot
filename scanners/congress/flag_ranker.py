@@ -188,6 +188,36 @@ def _qualifies_for_other_activity(history: TickerPoliticalHistory) -> bool:
     )
 
 
+def _transaction_age_days(history: TickerPoliticalHistory, observed_at: datetime) -> int | None:
+    if not history.latest_transaction_date:
+        return None
+    try:
+        transaction_date = datetime.fromisoformat(str(history.latest_transaction_date)).date()
+    except ValueError:
+        return None
+    return (observed_at.date() - transaction_date).days
+
+
+def _has_rolling_activity(history: TickerPoliticalHistory, *, observed_at: datetime, window_days: int) -> bool:
+    age = _transaction_age_days(history, observed_at)
+    if age is None or age < 0 or age > window_days:
+        return False
+    window = history.windows.get(window_days) or history.windows.get(45) or history.windows.get(90)
+    if window is None:
+        return False
+    compact_threshold = _float_env("POLITICAL_DIGEST_COMPACT_ACTIVITY_LOW", 25000.0)
+    material_purchase_threshold = _float_env("POLITICAL_FLAG_PURCHASE_LOW", 100000.0)
+    material_call_threshold = _float_env("POLITICAL_FLAG_CALL_LOW", 100000.0)
+    material_sale_threshold = _float_env("POLITICAL_FLAG_SALE_LOW", 100000.0)
+    return (
+        window.stock_purchase_low >= min(compact_threshold, material_purchase_threshold)
+        or window.call_purchase_low >= min(compact_threshold, material_call_threshold)
+        or window.sale_low >= min(compact_threshold, material_sale_threshold)
+        or window.unique_buyer_count >= 2
+        or history.primary_classification in {"BROAD_ACCUMULATION", "DISTRIBUTION", "MIXED_HIGH_ACTIVITY"}
+    )
+
+
 def _material_update_priority(flag: PoliticalDigestFlag) -> tuple[int, float, str]:
     priorities = {
         "ENTRY_BECAME_ACTIONABLE": 1,
@@ -262,18 +292,27 @@ def build_digest_plan(
     max_detailed = int(_float_env("POLITICAL_DIGEST_MAX_DETAILED_FLAGS", 3.0))
     hard_max = int(_float_env("POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS", 5.0))
     detail_limit = max(0, min(max_detailed, hard_max))
+    rolling_lookback_days = int(_float_env("POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS", 14.0))
 
     material_candidates: list[TickerPoliticalHistory] = []
     other_new_candidates: list[TickerPoliticalHistory] = []
     for ticker, history in sorted(histories.items()):
-        if ticker.upper() not in affected_set or not history.new_events:
+        fresh_trigger = ticker.upper() in affected_set and bool(history.new_events)
+        rolling_trigger = (
+            rolling_lookback_days > 0
+            and not fresh_trigger
+            and _has_rolling_activity(history, observed_at=observed_at, window_days=rolling_lookback_days)
+        )
+        if not fresh_trigger and not rolling_trigger:
             continue
-        if history.summary_hash == _previous_detailed_hash(ticker, previous_summary_rows, previous_digest_rows) and not (
+        if fresh_trigger and history.summary_hash == _previous_detailed_hash(ticker, previous_summary_rows, previous_digest_rows) and not (
             set(history.latest_trigger_trade_keys) & unnotified_trade_keys
         ):
             continue
         if _qualifies_for_digest(history):
-            if not backfill_status.bootstrap_run or {"LIVE_DISCLOSURE", "MATERIAL_AMENDMENT", "DATA_CORRECTION"} & set(history.release_types):
+            if rolling_trigger and not fresh_trigger:
+                other_new_candidates.append(history)
+            elif not backfill_status.bootstrap_run or {"LIVE_DISCLOSURE", "MATERIAL_AMENDMENT", "DATA_CORRECTION"} & set(history.release_types):
                 material_candidates.append(history)
             elif _qualifies_for_other_activity(history):
                 other_new_candidates.append(history)

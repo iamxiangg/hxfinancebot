@@ -310,7 +310,7 @@ def _render_blocks(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> lis
         ("NEW DISCLOSURES", plan.new_material_flags, _full_new_disclosure),
         ("MATERIAL SIGNAL UPDATES", plan.material_updates, _material_update),
         ("ROLLING SEVEN-DAY WATCHLIST", plan.active_watchlist_items, _watchlist_item),
-        ("BELOW-THRESHOLD ACTIVITY", plan.other_new_activity, _below_threshold),
+        ("ROLLING 14-DAY ACTIVITY", plan.other_new_activity, _below_threshold),
     ]
     for heading, flags, formatter in sections:
         if not flags:
