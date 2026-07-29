@@ -1,9 +1,7 @@
 name: Funnel - Review Candidates
 
 "on":
-  schedule:
-    # GitHub cron uses UTC. 12:00 UTC = 20:00 Singapore time.
-    - cron: "0 12 * * 1-5"
+  # Automatic trigger removed on 2026-07-29; run manually only.
   workflow_dispatch:
     inputs:
       min_conviction:
