@@ -1,8 +1,7 @@
 name: Earnings Short Volatility Scanner
 
 "on":
-  repository_dispatch:
-    types: [earnings_check]
+  # Automatic triggers removed on 2026-07-29; run manually only.
   workflow_dispatch:
     inputs:
       mode:
@@ -14,11 +13,6 @@ name: Earnings Short Volatility Scanner
           - auto
           - screen
           - exit
-  schedule:
-    - cron: "35,45,55 18 * * 1-5"
-    - cron: "35,45,55 19 * * 1-5"
-    - cron: "35,40,45,50 13 * * 1-5"
-    - cron: "35,40,45,50 14 * * 1-5"
 
 permissions:
   contents: write
