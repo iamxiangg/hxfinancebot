@@ -333,6 +333,10 @@ def ticker_code(value: Any) -> str | None:
     return ticker if re.fullmatch(r"[A-Z0-9.^=\-]+", ticker) else None
 
 
+def normalize_asset_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper())).strip()
+
+
 def yf_ticker(ticker: str) -> str:
     return YF_OVERRIDES.get(ticker, ticker)
 
@@ -365,6 +369,46 @@ def action(value: Any) -> str:
     if "sale" in text or re.search(r"\bsell\b", text):
         return "sale_unknown"
     return "other"
+
+
+def _review_action(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "buy": "purchase",
+        "purchase": "purchase",
+        "partial_sale": "sale_partial",
+        "sale_partial": "sale_partial",
+        "full_sale": "sale_full",
+        "sale_full": "sale_full",
+        "sale": "sale_unknown",
+        "sell": "sale_unknown",
+        "sale_unknown": "sale_unknown",
+    }
+    return aliases.get(text, "")
+
+
+def _active_review_decision(row: dict[str, Any]) -> str:
+    decision = str(row.get("Review Decision") or "").strip().upper()
+    if decision in {"RESOLVE", "EXCLUDE", "DEFER"}:
+        return decision
+    if str(row.get("Resolved Ticker") or "").strip():
+        return "RESOLVE"
+    return ""
+
+
+def _review_override_maps(review_overrides: dict[str, dict[str, Any]] | None) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    by_asset_name: dict[str, dict[str, Any]] = {}
+    for trade_key, row in (review_overrides or {}).items():
+        decision = _active_review_decision(row)
+        if not decision:
+            continue
+        if str(trade_key or "").strip():
+            by_key[str(trade_key).strip()] = row
+        asset_name_key = normalize_asset_name(row.get("Asset Name"))
+        if asset_name_key and decision == "RESOLVE":
+            by_asset_name.setdefault(asset_name_key, row)
+    return by_key, by_asset_name
 
 
 def option_record(item: dict[str, Any]) -> bool:
@@ -873,15 +917,24 @@ def _flow_label(*, cluster_type: str, asset_intents: set[str], strong_distributi
 def _review_rows(records: list[TransactionRecord]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for record in records:
-        if record.broad_outcome not in {"REQUIRES_REVIEW", "EXCLUDED"}:
+        if record.broad_outcome != "REQUIRES_REVIEW" or not record.manual_review_required:
             continue
         rows.append(
             {
+                "trade_key": record.trade_key,
                 "trade_id": record.source_trade_id or record.trade_key,
                 "ticker": record.ticker,
+                "yf_ticker": record.yf_ticker,
                 "asset_name": record.asset_name,
+                "asset_type": record.asset_type,
+                "asset_class": record.asset_class,
+                "filer_name": record.filer_name,
+                "transaction_type": record.transaction_type,
+                "action": record.action,
+                "document_url": record.doc_url,
                 "transaction_date": record.transaction_date,
                 "filing_date": record.filing_date,
+                "active_in_latest_payload": True,
                 "reason": record.reason,
                 "classification": record.broad_outcome,
                 "proposed_resolution": record.proposed_resolution,
@@ -1091,9 +1144,11 @@ def classify_payload_records(
     observed_on: date,
     prior_ledger: dict[str, dict[str, Any]] | None = None,
     branch_scope: str | None = None,
+    review_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[TransactionRecord], dict[str, dict[str, Any]], Counter]:
     scope = _resolve_scope(branch_scope)
     prior = prior_ledger or {}
+    overrides, asset_name_overrides = _review_override_maps(review_overrides)
     seen_keys: set[str] = set()
     ledger_updates: dict[str, dict[str, Any]] = dict(prior)
     counts: Counter = Counter()
@@ -1230,6 +1285,42 @@ def classify_payload_records(
             broad_market=intent.broad_market,
             intentionality_score=intent.intentionality_score,
         )
+        override = overrides.get(trade_key) or asset_name_overrides.get(normalize_asset_name(asset_name))
+        if override:
+            decision = _active_review_decision(override)
+            note = str(override.get("Reviewer Note") or "").strip()
+            if decision == "RESOLVE":
+                resolved_ticker = ticker_code(override.get("Resolved Ticker")) or ticker
+                resolved_yahoo = str(override.get("Resolved Yahoo Ticker") or "").strip().upper()
+                resolved_asset_class = str(override.get("Resolved Asset Class") or "").strip().lower() or asset_class
+                resolved_action = _review_action(override.get("Resolved Action")) or tx_action
+                if resolved_ticker:
+                    ticker = resolved_ticker
+                    record.ticker = resolved_ticker
+                    record.yf_ticker = resolved_yahoo or yf_ticker(resolved_ticker)
+                if resolved_asset_class in {"stock", "option", "etf", "other"}:
+                    asset_class = resolved_asset_class
+                    record.asset_class = resolved_asset_class
+                if resolved_action:
+                    tx_action = resolved_action
+                    record.action = resolved_action
+                record.reason = "RESOLVED_BY_REVIEW"
+                record.proposed_resolution = note or "review_override"
+                record.manual_review_required = False
+                record.broad_outcome = "EXCLUDED"
+            elif decision == "EXCLUDE":
+                record.reason = "EXCLUDED_BY_REVIEW"
+                record.proposed_resolution = note or "review_override_exclude"
+                record.manual_review_required = False
+                records.append(record)
+                continue
+            elif decision == "DEFER":
+                record.broad_outcome = "REQUIRES_REVIEW"
+                record.reason = "DEFERRED_BY_REVIEW"
+                record.proposed_resolution = note or "manual_review_deferred"
+                record.manual_review_required = True
+                records.append(record)
+                continue
 
         if trade_key in seen_keys:
             record.reason = "DUPLICATE"
@@ -1609,6 +1700,7 @@ def run_scan_from_payload(
     prior_ledger: dict[str, dict[str, Any]] | None = None,
     branch_scope: str | None = None,
     price_fetcher: PriceFetcher | None = None,
+    review_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> CongressScanResult:
     observed_datetime = _normalise_datetime(observed_at or datetime.now(SINGAPORE_TZ))
     observed_on = observed_datetime.date()
@@ -1627,6 +1719,7 @@ def run_scan_from_payload(
         observed_on=observed_on,
         prior_ledger=prior_ledger,
         branch_scope=scope,
+        review_overrides=review_overrides,
     )
     for entry in ledger.values():
         entry["last_seen_payload_hash"] = payload_hash
@@ -1730,6 +1823,7 @@ def run_live_scan(
     payload_fetcher: FetchPayload | None = None,
     price_fetcher: PriceFetcher | None = None,
     branch_scope: str | None = None,
+    review_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> CongressScanResult:
     fetcher = payload_fetcher or fetch_live_payload
     raw_bytes, payload = fetcher()
@@ -1740,4 +1834,5 @@ def run_live_scan(
         prior_ledger=prior_ledger,
         branch_scope=branch_scope,
         price_fetcher=price_fetcher,
+        review_overrides=review_overrides,
     )

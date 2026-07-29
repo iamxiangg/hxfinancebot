@@ -14,6 +14,8 @@ from scanners.congress.models import PoliticalWindowSummary, TickerPoliticalHist
 
 PRIMARY_WINDOW_DAYS = 90
 HISTORY_WINDOW_DAYS = 365
+SHORT_WINDOW_DAYS = 7
+ROLLING_DIGEST_WINDOW_DAYS = 90
 
 
 def _float_env(name: str, default: float) -> float:
@@ -307,6 +309,144 @@ def _summary_hash(
     return _json_hash(payload)
 
 
+def _entry_category(value: Any) -> str:
+    category = str(value or "").strip().upper()
+    if category in {"ACTIONABLE", "WAIT", "RISK", "CONTEXT"}:
+        return category
+    return "OTHER"
+
+
+def _aggregate_direction(primary_classification: str) -> str:
+    if primary_classification in {"BROAD_ACCUMULATION", "REPEAT_FILER_ACCUMULATION", "SINGLE_FILER_BULLISH_BET"}:
+        return "ACCUMULATION"
+    if primary_classification == "DISTRIBUTION":
+        return "DISTRIBUTION"
+    if primary_classification == "MIXED_HIGH_ACTIVITY":
+        return "MIXED"
+    return "INSUFFICIENT_EVIDENCE"
+
+
+def _signal_context(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {}
+    return {
+        "active_amount_low": float(getattr(result, "active_amount_low", 0.0) or 0.0),
+        "active_amount_mid": float(getattr(result, "active_amount_mid", 0.0) or 0.0),
+        "active_amount_high": float(getattr(result, "active_amount_high", 0.0) or 0.0),
+        "buyers": int(getattr(result, "buyers", 0) or 0),
+        "cluster_buyers": int(getattr(result, "cluster_buyers", 0) or 0),
+        "branches": list(getattr(result, "branches", []) or []),
+        "asset_intent_classes": list(getattr(result, "asset_intent_classes", []) or []),
+        "cluster_type": str(getattr(result, "cluster_type", "") or ""),
+        "weighted_age": float(getattr(result, "weighted_age", 0.0) or 0.0),
+        "weighted_return": float(getattr(result, "weighted_return", 0.0) or 0.0),
+        "flow": str(getattr(result, "flow", "") or ""),
+        "names": list(getattr(result, "names", []) or []),
+        "active_trade_count": int(getattr(result, "active_trade_count", 0) or 0),
+        "active_late_disclosed_trade_count": int(getattr(result, "active_late_disclosed_trade_count", 0) or 0),
+    }
+
+
+def _latest_disclosure_direction(trigger_items: list[dict[str, Any]]) -> str:
+    if not trigger_items:
+        return "AMBIGUOUS"
+    latest = trigger_items[-1]
+    option_side = str(latest.get("option_side") or "").strip().lower()
+    action = str(latest.get("action") or "").strip().lower()
+    transaction_type = str(latest.get("transaction_type") or "").strip().lower()
+    if option_side == "call":
+        return "BUY_CALL" if action == "purchase" or "purchase" in transaction_type else "SELL_CALL"
+    if option_side == "put":
+        return "BUY_PUT" if action == "purchase" or "purchase" in transaction_type else "SELL_PUT"
+    if action == "purchase" or "purchase" in transaction_type or "buy" in transaction_type:
+        return "BUY"
+    if action == "sale_full":
+        return "FULL_SALE"
+    if action == "sale_partial":
+        return "PARTIAL_SALE"
+    if action == "sale_unknown" or "sale" in transaction_type or "sell" in transaction_type:
+        return "SELL"
+    if "exchange" in transaction_type:
+        return "EXCHANGE"
+    return "AMBIGUOUS"
+
+
+def _directional_agreement(latest_disclosure_direction: str, aggregate_direction: str) -> str:
+    if aggregate_direction == "INSUFFICIENT_EVIDENCE":
+        return "UNCLEAR"
+    if latest_disclosure_direction in {"BUY", "BUY_CALL", "SELL_PUT"}:
+        return "AGREEING" if aggregate_direction == "ACCUMULATION" else "CONTRADICTORY"
+    if latest_disclosure_direction in {"SELL", "FULL_SALE", "PARTIAL_SALE", "BUY_PUT", "SELL_CALL"}:
+        return "AGREEING" if aggregate_direction == "DISTRIBUTION" else "CONTRADICTORY"
+    return "MIXED"
+
+
+def _severity_bucket(value: float) -> str:
+    if value >= 85.0:
+        return "CRITICAL"
+    if value >= 65.0:
+        return "HIGH"
+    if value >= 35.0:
+        return "STANDARD"
+    return "LOW"
+
+
+def _event_severity(trigger_items: list[dict[str, Any]], classification_changed: bool) -> str:
+    if classification_changed:
+        return "HIGH"
+    if not trigger_items:
+        return "LOW"
+    total_low = sum(float(item.get("amount_low") or 0.0) for item in trigger_items)
+    if total_low >= 1_000_000:
+        return "CRITICAL"
+    if total_low >= 100_000:
+        return "HIGH"
+    if total_low >= 25_000:
+        return "STANDARD"
+    return "LOW"
+
+
+def _ticker_state_severity(aggregate_direction: str, political_conviction: float, breadth_score: float, distribution_evidence: float) -> str:
+    if aggregate_direction == "DISTRIBUTION":
+        return _severity_bucket(max(political_conviction, distribution_evidence))
+    return _severity_bucket(max(political_conviction, breadth_score))
+
+
+def _material_effect(
+    records_in_order: list[TransactionRecord],
+    trigger_trade_keys: tuple[str, ...],
+    *,
+    observed_on: date,
+    current_classification: str,
+    previous_classification: str,
+) -> tuple[float, float, float, float, float, str]:
+    full_window = _window_summary(records_in_order, observed_on=observed_on, window_days=PRIMARY_WINDOW_DAYS)
+    without_trigger = [record for record in records_in_order if record.trade_key not in set(trigger_trade_keys)]
+    prior_window = _window_summary(without_trigger, observed_on=observed_on, window_days=PRIMARY_WINDOW_DAYS)
+    pre_imbalance = abs(prior_window.sale_low - prior_window.stock_purchase_low - prior_window.call_purchase_low)
+    post_imbalance = abs(full_window.sale_low - full_window.stock_purchase_low - full_window.call_purchase_low)
+    delta = abs(post_imbalance - pre_imbalance)
+    effect_pct = (delta / max(1.0, pre_imbalance)) * 100.0
+    if current_classification != previous_classification and current_classification != "INSUFFICIENT_EVIDENCE":
+        category = "CLASSIFICATION-CHANGING"
+    elif effect_pct >= 50.0:
+        category = "MATERIAL EFFECT"
+    elif effect_pct >= 15.0:
+        category = "MODERATE EFFECT"
+    elif effect_pct >= 0.01:
+        category = "MINOR EFFECT"
+    else:
+        category = "NO MATERIAL EFFECT"
+    return (
+        prior_window.stock_purchase_low + prior_window.call_purchase_low,
+        prior_window.sale_low,
+        full_window.stock_purchase_low + full_window.call_purchase_low,
+        full_window.sale_low,
+        effect_pct,
+        category,
+    )
+
+
 def build_ticker_histories(
     records: list[TransactionRecord],
     *,
@@ -337,7 +477,7 @@ def build_ticker_histories(
         )
         windows = {
             window: _window_summary(records_in_order, observed_on=observed_on, window_days=window)
-            for window in (45, 90, 365)
+            for window in (SHORT_WINDOW_DAYS, ROLLING_DIGEST_WINDOW_DAYS, 45, 90, 365)
         }
         primary_window = windows[PRIMARY_WINDOW_DAYS]
         full_history = windows[HISTORY_WINDOW_DAYS]
@@ -369,6 +509,23 @@ def build_ticker_histories(
         release_types = tuple(dict.fromkeys(item.get("release_type", "") for item in trigger_items if item.get("release_type")))
         political_conviction = float(getattr(current_result, "conviction", 0.0) or 0.0)
         entry_quality = float(getattr(current_result, "entry", 0.0) or 0.0)
+        aggregate_direction = _aggregate_direction(primary_classification)
+        latest_disclosure_direction = _latest_disclosure_direction(trigger_items)
+        directional_agreement = _directional_agreement(latest_disclosure_direction, aggregate_direction)
+        (
+            pre_event_purchase_low_90d,
+            pre_event_sale_low_90d,
+            post_event_purchase_low_90d,
+            post_event_sale_low_90d,
+            material_effect_percent,
+            material_effect_category,
+        ) = _material_effect(
+            records_in_order,
+            trigger_trade_keys,
+            observed_on=observed_on,
+            current_classification=primary_classification,
+            previous_classification=previous_classification,
+        )
         summary_hash = _summary_hash(
             ticker,
             primary_classification,
@@ -386,7 +543,10 @@ def build_ticker_histories(
         histories[ticker] = TickerPoliticalHistory(
             ticker=ticker,
             primary_classification=primary_classification,
+            aggregate_direction=aggregate_direction,
             structure_classification=structure_classification,
+            latest_disclosure_direction=latest_disclosure_direction,
+            directional_agreement=directional_agreement,
             bullish_evidence_score=bullish_evidence,
             distribution_evidence_score=distribution_evidence,
             breadth_score=breadth_score,
@@ -401,6 +561,15 @@ def build_ticker_histories(
             previous_classification=previous_classification,
             classification_changed=previous_classification != primary_classification,
             summary_hash=summary_hash,
+            entry_category=_entry_category(getattr(current_result, "category", "other")),
+            event_severity=_event_severity(trigger_items, previous_classification != primary_classification),
+            ticker_state_severity=_ticker_state_severity(aggregate_direction, political_conviction, breadth_score, distribution_evidence),
+            material_effect_category=material_effect_category,
+            material_effect_percent=round(material_effect_percent, 2),
+            pre_event_purchase_low_90d=pre_event_purchase_low_90d,
+            pre_event_sale_low_90d=pre_event_sale_low_90d,
+            post_event_purchase_low_90d=post_event_purchase_low_90d,
+            post_event_sale_low_90d=post_event_sale_low_90d,
             latest_transaction_date=max((record.transaction_date for record in records_in_order if record.transaction_date), default=""),
             latest_filing_date=max((record.filing_date for record in records_in_order if record.filing_date), default=""),
             latest_trigger_type=trigger_items[0].get("release_type", "") if trigger_items else "",
@@ -410,5 +579,6 @@ def build_ticker_histories(
             entry_quality=entry_quality,
             signal_category=str(getattr(current_result, "category", "other") or "other"),
             existing_status=str(getattr(current_result, "category", "other") or "other"),
+            signal_context=_signal_context(current_result),
         )
     return histories

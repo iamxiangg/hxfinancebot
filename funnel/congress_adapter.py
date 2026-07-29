@@ -17,11 +17,17 @@ from googleapiclient.errors import HttpError
 from funnel.google_client import get_sheets_service, get_spreadsheet_id
 from funnel.political_archive import (
     build_archive_stats,
+    active_review_overrides,
+    get_bot_state_value,
     get_bootstrap_marker,
     load_political_archive_state,
     persist_raw_archive_updates,
     persist_summary_rows,
     prepare_raw_archive_upserts,
+    seed_review_override_rows,
+    LAST_PAYLOAD_HASH_KEY,
+    LAST_RECORD_COUNT_KEY,
+    set_bot_state_value,
     set_bootstrap_marker,
     summary_row_from_history,
 )
@@ -78,6 +84,12 @@ class CongressAdapterRun:
     previous_ticker_states: dict[str, dict[str, Any]]
     ranked_digest_flags: list[dict[str, Any]]
     compact_digest_items: list[dict[str, Any]]
+    new_material_flags: list[dict[str, Any]]
+    material_updates: list[dict[str, Any]]
+    active_watchlist_items: list[dict[str, Any]]
+    other_new_activity: list[dict[str, Any]]
+    expired_watchlist_items: list[dict[str, Any]]
+    watchlist_state_changes: list[dict[str, Any]]
     backfill_status: PoliticalBackfillStatus
     archive_stats: PoliticalArchiveStats
     digest_plan: PoliticalDigestPlan
@@ -275,6 +287,21 @@ def _audit_directory() -> Path | None:
     return path
 
 
+def _list_or_empty(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _ledger_path() -> Path:
     return _state_directory() / "transaction_ledger.json"
 
@@ -328,6 +355,11 @@ def _sheet_ledger_context() -> _SheetLedgerContext | None:
     return _SheetLedgerContext(service=service, spreadsheet_id=spreadsheet_id)
 
 
+def _must_use_sheet_ledger() -> bool:
+    backend = str(os.getenv("CONGRESS_LEDGER_BACKEND", "auto")).strip().lower()
+    return backend != "local" and bool(os.getenv("GCP_SERVICE_ACCOUNT_FILE", "").strip() and os.getenv("GOOGLE_SHEET_ID", "").strip())
+
+
 def _load_local_ledger() -> dict[str, dict[str, Any]]:
     path = _ledger_path()
     if not path.exists():
@@ -351,6 +383,8 @@ def _load_ledger() -> tuple[dict[str, dict[str, Any]], _SheetLedgerContext | Non
     try:
         context = _sheet_ledger_context()
     except Exception as exc:
+        if _must_use_sheet_ledger():
+            raise
         logger.warning("Congress sheet ledger unavailable, falling back to local JSON: %r", exc)
         context = None
 
@@ -405,6 +439,7 @@ def _event_row_from_record(record: Any, *, bootstrap_run: bool = False) -> dict[
         "transaction_type": record.transaction_type,
         "asset_name": record.asset_name,
         "asset_class": record.asset_class,
+        "action": record.action,
         "option_side": record.option_side,
         "strike": record.strike,
         "expiry": record.expiry,
@@ -499,9 +534,11 @@ def run_congress_adapter_detailed(
     observed_datetime = _normalise_datetime(observed_at or datetime.now(UTC).isoformat())
     ledger, ledger_context = _load_ledger()
     archive_state = load_political_archive_state()
+    previous_summary_rows = dict(archive_state.summary_rows)
     scan = run_live_scan(
         prior_ledger=ledger,
         branch_scope=os.getenv("POLITICAL_DISCLOSURE_SCOPE", "all"),
+        review_overrides=active_review_overrides(archive_state),
     )
     if persist_ledger:
         # Saving the ledger is best-effort. If Google Sheets rate-limits the
@@ -531,7 +568,10 @@ def run_congress_adapter_detailed(
 
     bootstrap_marker = get_bootstrap_marker(archive_state)
     bootstrap_run = not bootstrap_marker
+    previous_payload_hash = get_bot_state_value(archive_state, LAST_PAYLOAD_HASH_KEY)
+    previous_record_count = _int_or_zero(get_bot_state_value(archive_state, LAST_RECORD_COUNT_KEY))
     unique_records = _unique_transactions(scan)
+    source_record_count = _int_or_zero(scan.counts.get("total_raw_records")) or _int_or_zero(getattr(scan.metadata, "record_count", 0))
     raw_update = prepare_raw_archive_upserts(
         unique_records,
         existing_rows=archive_state.raw_rows,
@@ -581,10 +621,64 @@ def run_congress_adapter_detailed(
         removed_events=removed_records,
         affected_tickers=affected_tickers,
     )
+    payload_refreshed = scan.metadata.payload_sha256 != previous_payload_hash
+    source_health = "HEALTHY"
+    if not payload_refreshed:
+        source_health = "SOURCE_PAYLOAD_UNCHANGED"
+    elif previous_record_count and source_record_count < previous_record_count:
+        source_health = "SOURCE_PAYLOAD_INCOMPLETE"
+    unnotified_trade_keys = {
+        trade_key
+        for trade_key, row in archive_state.raw_rows.items()
+        if str(row.get("Notification Status") or "").strip().upper() != "NOTIFIED"
+    }
+    review_required_items = [
+        dict(item)
+        for item in _list_or_empty(getattr(scan, "review_audit", []))
+        if str(item.get("classification") or "").strip().upper() == "REQUIRES_REVIEW"
+        and str(item.get("manual_review_required") or "").strip().lower() in {"true", "yes", "1"}
+    ]
+    seed_review_override_rows(archive_state, review_required_items, seeded_at=observed_datetime.isoformat())
+    excluded_items = [
+        {
+            "reason": str(record.reason or "EXCLUDED").strip(),
+            "classification": record.broad_outcome,
+            "asset_name": record.asset_name,
+            "ticker": record.ticker,
+            "trade_key": record.trade_key,
+        }
+        for record in _list_or_empty(getattr(scan, "transactions", []))
+        if record.broad_outcome == "EXCLUDED" and not record.manual_review_required
+    ]
+    digest_plan = build_digest_plan(
+        histories=histories,
+        affected_tickers=affected_tickers,
+        backfill_status=backfill_status,
+        previous_digest_rows=archive_state.digest_rows,
+        previous_summary_rows=previous_summary_rows,
+        digest_date=observed_datetime.date().isoformat(),
+        archive_stats=build_archive_stats(
+            raw_update,
+            summary_written=len(histories),
+            digest_logged=0,
+            bootstrap_completed=bootstrap_run,
+        ),
+        observed_at=observed_datetime,
+        review_required_items=review_required_items,
+        excluded_items=excluded_items,
+        source_health=source_health,
+        payload_refreshed=payload_refreshed,
+        source_record_count=source_record_count,
+        unnotified_trade_keys=unnotified_trade_keys,
+    )
 
     summary_rows = [
-        summary_row_from_history(history, updated_at=observed_datetime.isoformat())
-        for _, history in sorted(histories.items())
+        summary_row_from_history(
+            history,
+            updated_at=observed_datetime.isoformat(),
+            watchlist_state=digest_plan.current_watchlist_states.get(ticker),
+        )
+        for ticker, history in sorted(histories.items())
     ]
     persist_summary_rows(archive_state, summary_rows)
 
@@ -594,17 +688,11 @@ def run_congress_adapter_detailed(
         digest_logged=0,
         bootstrap_completed=bootstrap_run,
     )
-    digest_plan = build_digest_plan(
-        histories=histories,
-        affected_tickers=affected_tickers,
-        backfill_status=backfill_status,
-        previous_digest_rows=archive_state.digest_rows,
-        digest_date=observed_datetime.date().isoformat(),
-        archive_stats=archive_stats,
-    )
 
     if bootstrap_run:
         set_bootstrap_marker(archive_state, scan.metadata.payload_sha256)
+    set_bot_state_value(archive_state, LAST_PAYLOAD_HASH_KEY, scan.metadata.payload_sha256)
+    set_bot_state_value(archive_state, LAST_RECORD_COUNT_KEY, str(source_record_count))
 
     breakdown = _signal_breakdown(
         scan.ticker_results,
@@ -636,9 +724,15 @@ def run_congress_adapter_detailed(
         removed_records=removed_records,
         affected_tickers=affected_tickers,
         current_ticker_histories=histories,
-        previous_ticker_states=archive_state.summary_rows,
-        ranked_digest_flags=[flag.to_dict() for flag in digest_plan.detailed_flags],
-        compact_digest_items=[flag.to_dict() for flag in digest_plan.compact_flags],
+        previous_ticker_states=previous_summary_rows,
+        ranked_digest_flags=[flag.to_dict() for flag in digest_plan.new_material_flags],
+        compact_digest_items=[flag.to_dict() for flag in digest_plan.other_new_activity],
+        new_material_flags=[flag.to_dict() for flag in digest_plan.new_material_flags],
+        material_updates=[flag.to_dict() for flag in digest_plan.material_updates],
+        active_watchlist_items=[flag.to_dict() for flag in digest_plan.active_watchlist_items],
+        other_new_activity=[flag.to_dict() for flag in digest_plan.other_new_activity],
+        expired_watchlist_items=[flag.to_dict() for flag in digest_plan.expired_watchlist_items],
+        watchlist_state_changes=[flag.to_dict() for flag in digest_plan.watchlist_state_changes],
         backfill_status=backfill_status,
         archive_stats=archive_stats,
         digest_plan=digest_plan,

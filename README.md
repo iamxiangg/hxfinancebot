@@ -190,8 +190,24 @@ Copy these to your GitHub Actions repository variables or a local `.env` file:
 | `POLITICAL_DIGEST_ENABLED` | `true` | Enable the daily political-trading digest |
 | `POLITICAL_DIGEST_LEGACY_OUTPUT` | `false` | Use the legacy Congress formatter instead of the digest |
 | `POLITICAL_DIGEST_SEND_TELEGRAM` | `true` | Render the digest but skip Telegram when false |
+| `POLITICAL_DIGEST_SEND_EMPTY` | `true` | Send a success notification when the political scan has no digest hits |
+| `POLITICAL_DIGEST_ROLLING_LOOKBACK_DAYS` | `45` | Include qualifying rolling activity whose latest filing is within this many calendar days, even when it is not a fresh disclosure trigger |
+| `POLITICAL_DIGEST_ROLLING_TRANSACTION_MAX_AGE_DAYS` | `90` | Exclude rolling activity when the underlying transaction is older than this many calendar days |
+| `POLITICAL_DIGEST_MAX_ROLLING_ACTIVITY_ITEMS` | `12` | Max compact rolling late-filing tickers rendered per digest |
 | `POLITICAL_DIGEST_MAX_DETAILED_FLAGS` | `3` | Default detailed dossier cap |
 | `POLITICAL_DIGEST_HARD_MAX_DETAILED_FLAGS` | `5` | Absolute detailed dossier cap |
+| `POLITICAL_DIGEST_WATCHLIST_ENABLED` | `true` | Keep detailed political signals on a short-lived reminder watchlist |
+| `POLITICAL_DIGEST_STANDARD_RETENTION_TRADING_DAYS` | `5` | Standard reminder retention in trading-day sessions |
+| `POLITICAL_DIGEST_EXCEPTIONAL_RETENTION_TRADING_DAYS` | `10` | Exceptional reminder retention in trading-day sessions |
+| `POLITICAL_DIGEST_RISK_RETENTION_TRADING_DAYS` | `5` | Risk reminder retention in trading-day sessions |
+| `POLITICAL_DIGEST_MAX_WATCHLIST_ITEMS` | `8` | Max compact reminders rendered per digest |
+| `POLITICAL_DIGEST_COMPACT_REMINDER_INTERVAL_DAYS` | `1` | Minimum trading sessions between compact reminders |
+| `POLITICAL_DIGEST_REPEAT_FULL_ON_ENTRY_CHANGE` | `true` | Re-alert when entry category changes materially |
+| `POLITICAL_DIGEST_REPEAT_FULL_ON_CLASSIFICATION_CHANGE` | `true` | Re-alert when political classification changes materially |
+| `POLITICAL_DIGEST_REPEAT_FULL_ON_NEW_TRADE` | `true` | Re-alert when a new material trade refreshes a flagged ticker |
+| `POLITICAL_DIGEST_REPEAT_FULL_ON_MATERIAL_AMENDMENT` | `true` | Re-alert when a flagged disclosure is materially amended |
+| `POLITICAL_DIGEST_REPEAT_FULL_ON_MAJOR_EVIDENCE_CHANGE` | `true` | Re-alert when supported evidence moves beyond the configured deltas |
+| `POLITICAL_DIGEST_SEND_EXPIRED_NOTICE` | `false` | Optionally emit explicit expiry notices when watchlist items lapse |
 | `POLITICAL_BACKFILL_TRADE_THRESHOLD` | `200` | Probable backfill threshold by new rows |
 | `POLITICAL_BACKFILL_FILING_THRESHOLD` | `25` | Probable backfill threshold by filings |
 | `POLITICAL_BACKFILL_TICKER_THRESHOLD` | `50` | Probable backfill threshold by tickers |
@@ -346,7 +362,9 @@ The insider scanner persists all processed SEC accessions and qualified purchase
 
 ### Political digest
 
-The Congress scanner now maintains a durable raw archive (`Political_Trades_Raw`), deterministic ticker history summaries (`Political_Ticker_Summary`), and a repeat-suppressed daily political digest (`Political_Digest_Log`). The existing `Congress_Ledger` remains the lightweight deduplication layer, while the new archive and digest state can also fall back to local JSON under `CONGRESS_STATE_DIR`.
+The Congress scanner now maintains a durable raw archive (`Political_Trades_Raw`), deterministic ticker history summaries (`Political_Ticker_Summary`), and a repeat-suppressed daily political digest (`Political_Digest_Log`). The existing `Congress_Ledger` remains the lightweight transaction-deduplication layer, while the digest adds separate ticker-state suppression so unchanged political dossiers are not resent every day.
+
+Detailed political signals can remain on an active watchlist for 5 or 10 trading sessions, depending on retention type. Material state changes such as `WAIT -> ACTIONABLE`, supported classification changes, or disclosure amendments can generate a fresh update dossier, while unchanged signals fall back to compact watchlist reminders. Trading-session counting currently uses a deterministic weekday fallback, so weekends are skipped but US market holidays are not modeled separately.
 
 ---
 
