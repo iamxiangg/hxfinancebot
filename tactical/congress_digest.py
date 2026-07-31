@@ -13,7 +13,7 @@ from scanners.congress.trend_classifier import deterministic_interpretation
 
 
 TELEGRAM_LIMIT = 3800
-DIGEST_TEMPLATE_VERSION = "2026-07-19-consolidated"
+DIGEST_TEMPLATE_VERSION = "2026-07-31-evidence-first"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -43,8 +43,49 @@ def _event_value_range(event: dict[str, Any]) -> str:
     return f"{_money(float(event.get('amount_low') or 0.0))}-{_money(float(event.get('amount_high') or 0.0))}"
 
 
-def _title_text(value: str) -> str:
-    return str(value or "").replace("_", " ").title()
+def _short_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return str(value or "Unknown")
+    return f"{parsed.day} {parsed.strftime('%b')}"
+
+
+def _signal_direction(flag: PoliticalDigestFlag) -> str:
+    direction = str(flag.history.aggregate_direction or "").strip().upper()
+    if direction in {"ACCUMULATION", "DISTRIBUTION", "MIXED"}:
+        return direction
+    classification = str(flag.history.primary_classification or "").upper()
+    if "DISTRIBUTION" in classification:
+        return "DISTRIBUTION"
+    if "ACCUMULATION" in classification or "BULLISH" in classification:
+        return "ACCUMULATION"
+    return "ACTIVITY"
+
+
+def _net_activity_label(*, purchase_low: float, sale_low: float) -> str:
+    if purchase_low > sale_low:
+        return "Net buying"
+    if sale_low > purchase_low:
+        return "Net selling"
+    return "Mixed"
+
+
+def _filer_label(count: int) -> str:
+    return "filer" if count == 1 else "filers"
+
+
+def _count_label(count: int, singular: str) -> str:
+    return singular if count == 1 else f"{singular}s"
+
+
+def _supporting_scores(history) -> str:
+    scores = [
+        ("Entry", history.entry_quality),
+        ("Breadth", history.breadth_score),
+    ]
+    visible = [f"{label} {value:.0f}" for label, value in scores if float(value or 0.0) > 0.0]
+    return " | ".join(visible)
 
 
 def _detected_date(flag: PoliticalDigestFlag) -> str:
@@ -156,65 +197,68 @@ def _watchlist_item(flag: PoliticalDigestFlag) -> str:
 
 def _below_threshold(flag: PoliticalDigestFlag) -> str:
     history = flag.history
-    event = history.new_events[-1] if history.new_events else {}
     window = history.windows.get(90) or history.windows.get(45) or history.windows.get(365)
     context = history.signal_context or {}
+    purchase_low = (window.stock_purchase_low + window.call_purchase_low) if window else 0.0
+    purchase_high = (window.stock_purchase_high + window.call_purchase_high) if window else 0.0
+    sale_low = window.sale_low if window else 0.0
+    sale_high = window.sale_high if window else 0.0
+    direction = _signal_direction(flag)
+    filers = int(context.get("buyers") or (window.unique_buyer_count if window else 0))
+    names = context.get("names") if isinstance(context.get("names"), list) else []
+    name_text = ", ".join(
+        str(name).strip(" ,")
+        for name in names[:4]
+        if str(name).strip(" ,")
+    )
+    score = f" | Political {history.political_conviction:.0f}" if history.political_conviction > 0 else ""
+    active_low = float(context.get("active_amount_low") or purchase_low)
+    active_high = float(context.get("active_amount_high") or purchase_high)
+    activity_line = f"Active activity: {_money(active_low)}-{_money(active_high)}" if context else ""
+    breadth_line = (
+        f"90d: {window.unique_buyer_count} {_count_label(window.unique_buyer_count, 'buyer')} / "
+        f"{window.unique_seller_count} {_count_label(window.unique_seller_count, 'seller')} | "
+        f"Buys {_money(purchase_low)}-{_money(purchase_high)} | "
+        f"Sales {_money(sale_low)}-{_money(sale_high)} | "
+        f"{_net_activity_label(purchase_low=purchase_low, sale_low=sale_low)}"
+        if window
+        else "90d activity unavailable"
+    )
+    detail_parts = []
+    if filers:
+        detail_parts.append(f"{filers} active {_filer_label(filers)}")
+    if activity_line:
+        detail_parts.append(activity_line)
+    weighted_return = context.get("weighted_return") if context else None
+    if weighted_return not in (None, ""):
+        detail_parts.append(f"Since trade {float(weighted_return):+.1f}%")
+    if name_text:
+        detail_parts.append(name_text)
+    footer_parts = [
+        f"Trade {_short_date(history.latest_transaction_date)}",
+        f"Filed {_short_date(history.latest_filing_date)}",
+    ]
+    supporting_scores = _supporting_scores(history)
+    if supporting_scores:
+        footer_parts.append(supporting_scores)
+
     if context:
-        fallback_active_low = (window.stock_purchase_low + window.call_purchase_low) if window else 0.0
-        active_low = float(context.get("active_amount_low") or fallback_active_low)
-        active_mid = float(context.get("active_amount_mid") or active_low)
-        active_high = float(context.get("active_amount_high") or active_low)
-        buyers = int(context.get("buyers") or (window.unique_buyer_count if window else 0))
-        branches = context.get("branches") if isinstance(context.get("branches"), list) else []
-        intents = context.get("asset_intent_classes") if isinstance(context.get("asset_intent_classes"), list) else []
-        names = context.get("names") if isinstance(context.get("names"), list) else []
-        branch_mix = " + ".join(_title_text(item) for item in branches[:2]) if branches else "Unknown"
-        instrument = ", ".join(_title_text(item) for item in intents[:2]) if intents else history.structure_classification.replace("_", " ").title()
-        cluster = _title_text(str(context.get("cluster_type") or "Single Filer"))
-        flow = str(context.get("flow") or f"{history.aggregate_direction.title()} signal").strip()
-        name_text = ", ".join(str(name).strip() for name in names[:4] if str(name).strip()) or "Unknown"
         return "\n".join(
             [
-                (
-                    f"${history.ticker} | Active {_money(active_mid)} [{_money(active_low)}-{_money(active_high)}] | "
-                    f"{buyers} filers | {branch_mix} | {instrument} | {cluster} | "
-                    f"Wtd age {float(context.get('weighted_age') or 0.0):.0f}d | "
-                    f"Since trade {float(context.get('weighted_return') or 0.0):+.1f}% | {flow} | {name_text}"
-                ),
-                f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
-                (
-                    f"90d buys {_money(window.stock_purchase_low + window.call_purchase_low)} low / "
-                    f"{_money(window.stock_purchase_high + window.call_purchase_high)} high; "
-                    f"sales {_money(window.sale_low)} low / {_money(window.sale_high)} high"
-                    if window
-                    else "90d magnitude unavailable"
-                ),
-                f"Scores: political {history.political_conviction:.0f}, entry {history.entry_quality:.0f}, breadth {history.breadth_score:.0f}",
+                f"${history.ticker}  {direction}{score}",
+                " | ".join(detail_parts),
+                breadth_line,
+                " | ".join(footer_parts),
             ]
         )
-    if window is None:
-        filer = str(event.get("filer_name") or "Rolling aggregate").strip()
-        transaction_type = str(event.get("transaction_type") or history.aggregate_direction or "activity").strip().lower()
-        return "\n".join(
-            [
-                f"{history.ticker} - {filer} {transaction_type}, {_event_value_range(event) if event else 'Unknown'}",
-                f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
-                f"Classification: {history.aggregate_direction}",
-                f"Reason not qualified: material effect {history.material_effect_category.lower()}",
-            ]
-        )
+
     reasons = "; ".join(history.flag_reasons[:2]) if history.flag_reasons else "met rolling activity thresholds"
     return "\n".join(
         [
-            f"{history.ticker} - {history.aggregate_direction} | {history.primary_classification.replace('_', ' ')}",
-            f"Latest transaction: {history.latest_transaction_date} | Latest filed: {history.latest_filing_date}",
-            f"90-day stock buys: {_money(window.stock_purchase_low)} low / {_money(window.stock_purchase_high)} high",
-            f"90-day call buys: {_money(window.call_purchase_low)} low / {_money(window.call_purchase_high)} high",
-            f"90-day sales: {_money(window.sale_low)} low / {_money(window.sale_high)} high",
-            f"Congress breadth: {window.unique_buyer_count} buyers, {window.unique_seller_count} sellers, {window.unique_record_count} records",
-            f"Scores: political {history.political_conviction:.0f}, entry {history.entry_quality:.0f}, breadth {history.breadth_score:.0f}",
+            f"${history.ticker}  {direction}{score}",
+            breadth_line,
+            " | ".join(footer_parts),
             f"Why shown: {reasons}",
-            f"Why compact: material effect {history.material_effect_category.lower()}",
         ]
     )
 
@@ -265,7 +309,8 @@ def _review_summary_blocks(items: tuple[dict[str, Any], ...], *, label: str) -> 
 
 
 def _automatic_exclusion_blocks(items: tuple[dict[str, Any], ...]) -> list[RenderedDigestPart]:
-    if not items:
+    include_exclusions = str(os.getenv("POLITICAL_DIGEST_INCLUDE_EXCLUSIONS", "false")).strip().lower()
+    if not items or include_exclusions not in {"1", "true", "yes"}:
         return []
     reasons = Counter(str(item.get("reason") or "EXCLUDED").strip() for item in items)
     reason_lines = [
@@ -300,28 +345,32 @@ def _all_flags(plan: PoliticalDigestPlan) -> tuple[PoliticalDigestFlag, ...]:
 
 
 def _render_header(plan: PoliticalDigestPlan, today: date) -> str:
-    payload_hash = plan.pending_snapshot.payload_hash if plan.pending_snapshot is not None else ""
+    source_summary = [
+        f"Source: {plan.source_health.title()}",
+        f"{plan.data_status.get('fetched_records', 0):,} records scanned",
+    ]
+    if plan.data_status.get("new_records", 0):
+        source_summary.append(f"{plan.data_status['new_records']} new")
+    if plan.data_status.get("material_amendments", 0):
+        source_summary.append(f"{plan.data_status['material_amendments']} amended")
+    change_summary = [
+        f"{count} {label}"
+        for label, count in [
+            ("new tickers", plan.changes_since_previous.get("new_qualifying_tickers", 0)),
+            ("active-ticker disclosures", plan.changes_since_previous.get("new_disclosures_on_active_tickers", 0)),
+            ("classification changes", plan.changes_since_previous.get("classification_changes", 0)),
+            ("expired", plan.changes_since_previous.get("expired_tickers", 0)),
+        ]
+        if count
+    ]
     lines = [
         "DAILY POLITICAL-TRADING DIGEST",
         today.strftime("%d %B %Y"),
         "",
-        "RUN AND SOURCE STATUS",
-        f"Source health: {plan.source_health}",
-        f"Payload refreshed: {'Yes' if plan.payload_refreshed else 'No'}",
-        f"Payload hash: {payload_hash}",
-        f"Fetched records: {plan.data_status.get('fetched_records', 0)}",
-        f"New records: {plan.data_status.get('new_records', 0)}",
-        f"Amendments: {plan.data_status.get('material_amendments', 0)}",
-        f"Automatically excluded records: {plan.data_status.get('excluded_records', 0)}",
-        f"Manual review required: {plan.data_status.get('review_required', 0)}",
-        "",
-        "CHANGES SINCE THE PREVIOUS DIGEST",
-        f"New qualifying tickers: {plan.changes_since_previous.get('new_qualifying_tickers', 0)}",
-        f"New disclosures on active tickers: {plan.changes_since_previous.get('new_disclosures_on_active_tickers', 0)}",
-        f"Classification changes: {plan.changes_since_previous.get('classification_changes', 0)}",
-        f"Material amendments: {plan.changes_since_previous.get('material_amendments', 0)}",
-        f"Expired tickers: {plan.changes_since_previous.get('expired_tickers', 0)}",
+        " | ".join(source_summary),
     ]
+    if change_summary:
+        lines.append("Changes: " + " | ".join(change_summary))
     if plan.summary_lines:
         lines.extend(["", *plan.summary_lines])
     return "\n".join(lines)
@@ -373,27 +422,14 @@ def _render_blocks(plan: PoliticalDigestPlan, *, now_sg: date | datetime) -> lis
         blocks.append(RenderedDigestPart(heading))
         for flag in flags:
             blocks.append(RenderedDigestPart(formatter(flag), (flag.ticker,)))
-    if plan.review_required_items or plan.excluded_items:
+    if plan.excluded_items:
         blocks.extend(_automatic_exclusion_blocks(plan.excluded_items))
+    if plan.review_required_items:
         blocks.extend(_manual_review_blocks(plan.review_required_items))
     if plan.expired_watchlist_items:
         blocks.append(RenderedDigestPart("EXPIRED TODAY"))
         for flag in plan.expired_watchlist_items:
             blocks.append(RenderedDigestPart(_expired(flag), (flag.ticker,)))
-    blocks.append(
-        RenderedDigestPart(
-            "\n".join(
-                [
-                    "DELIVERY RECONCILIATION",
-                    f"Valid new or amended records: {plan.delivery_reconciliation.get('valid_new_or_amended_records', 0)}",
-                    f"Included in digest: {plan.delivery_reconciliation.get('included_in_digest', 0)}",
-                    f"Review required: {plan.delivery_reconciliation.get('review_required', 0)}",
-                    f"Successfully delivered: {plan.delivery_reconciliation.get('successfully_delivered', 0)}",
-                    f"Pending retry: {plan.delivery_reconciliation.get('pending_retry', 0)}",
-                ]
-            )
-        )
-    )
     return blocks
 
 

@@ -291,10 +291,10 @@ class CongressDigestTests(unittest.TestCase):
         self.assertEqual([flag.ticker for flag in plan.other_new_activity], ["MSFT"])
         assert digest is not None
         self.assertIn("ROLLING LATE-FILING ACTIVITY", digest)
-        self.assertIn("$MSFT | Active US$8k [US$1k-US$15k] | 1 filers | Congress | Individual Stock | Single Filer", digest)
-        self.assertIn("Wtd age 29d | Since trade +7.0% | Distribution signal | Taylor", digest)
-        self.assertIn("90d buys US$200k low / US$300k high; sales US$0 low / US$0 high", digest)
-        self.assertIn("Scores: political 78, entry 55, breadth 40", digest)
+        self.assertIn("$MSFT  ACCUMULATION | Political 78", digest)
+        self.assertIn("1 active filer | Active activity: US$1k-US$15k | Since trade +7.0% | Taylor", digest)
+        self.assertIn("90d: 1 buyer / 0 sellers | Buys US$200k-US$300k | Sales US$0-US$0 | Net buying", digest)
+        self.assertIn("Trade 29 May | Filed 23 Jun | Entry 55 | Breadth 40", digest)
 
     def test_old_filing_is_not_included_by_rolling_window(self) -> None:
         history = _history(
@@ -448,11 +448,10 @@ class CongressDigestTests(unittest.TestCase):
         digest = render_digest(plan, now_sg=OBSERVED_AT)
 
         assert digest is not None
-        self.assertIn("AUTOMATICALLY EXCLUDED", digest)
-        self.assertIn("2 records", digest)
         self.assertIn("MANUAL REVIEW REQUIRED", digest)
         self.assertIn("1 active records", digest)
         self.assertIn("Boston Scientific Corp Common Stock - manual ticker resolution", digest)
+        self.assertNotIn("AUTOMATICALLY EXCLUDED", digest)
 
     def test_rendered_digest_uses_new_section_headings(self) -> None:
         new_history = _history(
