@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,13 @@ from funnel.review_schema import (
     POLITICAL_TRADES_RAW_SHEET,
 )
 from funnel.review_setup import ensure_review_sheets
-from funnel.sheet_table import append_records, read_table, upsert_records
+from funnel.sheet_table import (
+    append_records,
+    read_table,
+    read_table_with_row_numbers,
+    upsert_records,
+    upsert_records_from_loaded_rows,
+)
 from scanners.congress.models import DigestDeliverySnapshot, PoliticalArchiveStats, PoliticalWatchlistState, TickerPoliticalHistory
 
 
@@ -41,6 +47,7 @@ class PoliticalArchiveState:
     snapshot_rows: dict[str, dict[str, Any]]
     review_override_rows: dict[str, dict[str, Any]]
     bot_state: dict[str, str]
+    raw_row_numbers: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -127,11 +134,17 @@ def load_political_archive_state() -> PoliticalArchiveState:
             service = get_sheets_service(readonly=False)
             spreadsheet_id = get_spreadsheet_id()
             ensure_review_sheets(service, spreadsheet_id)
+            raw_table = read_table_with_row_numbers(
+                service,
+                spreadsheet_id,
+                POLITICAL_TRADES_RAW_SHEET,
+                POLITICAL_TRADES_RAW_HEADERS,
+            )
             return PoliticalArchiveState(
                 context={"service": service, "spreadsheet_id": spreadsheet_id},
                 raw_rows={
                     str(row.get("Trade Key") or "").strip(): row
-                    for row in read_table(service, spreadsheet_id, POLITICAL_TRADES_RAW_SHEET, POLITICAL_TRADES_RAW_HEADERS)
+                    for _, row in raw_table
                     if str(row.get("Trade Key") or "").strip()
                 },
                 summary_rows={
@@ -151,6 +164,11 @@ def load_political_archive_state() -> PoliticalArchiveState:
                     if str(row.get("Trade Key") or "").strip()
                 },
                 bot_state=_bot_state_map(read_table(service, spreadsheet_id, BOT_STATE_SHEET, BOT_STATE_HEADERS)),
+                raw_row_numbers={
+                    str(row.get("Trade Key") or "").strip().upper(): row_number
+                    for row_number, row in raw_table
+                    if str(row.get("Trade Key") or "").strip()
+                },
             )
         except Exception:
             if _must_use_sheet_backend():
@@ -179,6 +197,7 @@ def load_political_archive_state() -> PoliticalArchiveState:
             if isinstance(row, dict) and str(row.get("Trade Key") or "").strip()
         },
         bot_state={str(key): str(value) for key, value in _load_json(_bot_state_path(), default={}).items()},
+        raw_row_numbers={},
     )
 
 
@@ -562,14 +581,17 @@ def persist_raw_archive_updates(state: PoliticalArchiveState, update: RawArchive
         _save_json(_raw_path(), list(merged.values()))
         state.raw_rows = merged
         return
-    upsert_records(
+    upsert_records_from_loaded_rows(
         state.context["service"],
         state.context["spreadsheet_id"],
         POLITICAL_TRADES_RAW_SHEET,
         POLITICAL_TRADES_RAW_HEADERS,
         "Trade Key",
         update.rows_to_upsert,
+        state.raw_row_numbers,
     )
+    for row in update.rows_to_upsert:
+        state.raw_rows[str(row.get("Trade Key") or "").strip()] = row
 
 
 def persist_summary_rows(state: PoliticalArchiveState, rows: list[dict[str, Any]]) -> None:
@@ -695,13 +717,14 @@ def update_raw_notification_status(
     if state.context is None:
         _save_json(_raw_path(), list(state.raw_rows.values()))
         return
-    upsert_records(
+    upsert_records_from_loaded_rows(
         state.context["service"],
         state.context["spreadsheet_id"],
         POLITICAL_TRADES_RAW_SHEET,
         POLITICAL_TRADES_RAW_HEADERS,
         "Trade Key",
         rows,
+        state.raw_row_numbers,
     )
 
 

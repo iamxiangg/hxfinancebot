@@ -30,7 +30,7 @@ from funnel.review_schema import (
     SIGNAL_LOG_HEADERS,
     SIGNAL_LOG_SHEET,
 )
-from funnel.sheet_table import ensure_sheet
+from funnel.sheet_table import ensure_sheets
 
 
 def ensure_review_sheets(service, spreadsheet_id: str) -> None:
@@ -50,5 +50,4 @@ def ensure_review_sheets(service, spreadsheet_id: str) -> None:
         (POLITICAL_REVIEW_OVERRIDES_SHEET, POLITICAL_REVIEW_OVERRIDES_HEADERS),
         (INSIDER_LEDGER_SHEET, INSIDER_LEDGER_HEADERS),
     ]
-    for sheet_name, headers in sheets:
-        ensure_sheet(service, spreadsheet_id, sheet_name, headers)
+    ensure_sheets(service, spreadsheet_id, sheets)
