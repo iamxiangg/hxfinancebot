@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            args=(--limit "3" --dry-run)
+            args=(--limit "3" --test-ingest)
           else
             args=(--limit "${REQUESTED_LIMIT}")
             if [[ "${REQUESTED_DRY_RUN}" == "true" ]]; then
