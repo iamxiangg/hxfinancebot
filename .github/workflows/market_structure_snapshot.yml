@@ -1,0 +1,69 @@
+name: HX Fixed Market Structure Snapshot
+
+"on":
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Optional deterministic symbol limit; 0 = full eligible universe"
+        required: false
+        default: "0"
+      dry_run:
+        description: "Calculate without ingesting to Supabase"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "45 23 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hx-fixed-market-structure-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: Calculate and persist 20D/60D market structure
+        env:
+          HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
+          HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
+          PYTHONUNBUFFERED: "1"
+          YAHOO_MAX_CONCURRENT_REQUESTS: "1"
+          YAHOO_MIN_INTERVAL_SECONDS: "0.5"
+          YAHOO_RETRY_LIMIT: "3"
+          REQUESTED_LIMIT: ${{ inputs.limit || '0' }}
+          REQUESTED_DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          args=(--limit "${REQUESTED_LIMIT}")
+          if [[ "${REQUESTED_DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python -m tactical.market_structure_snapshot_runner "${args[@]}"
+
+      - name: Upload market-structure snapshot artefact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-market-structure-snapshot
+          path: funnel_output/market_structure_snapshot
+          if-no-files-found: warn
