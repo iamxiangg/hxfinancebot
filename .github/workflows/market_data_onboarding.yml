@@ -1,0 +1,56 @@
+name: HX Market Data Onboarding
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hx-market-data-onboarding
+  cancel-in-progress: false
+
+jobs:
+  capability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: Process queued market-data capability work
+        env:
+          HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
+          HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
+          PYTHONUNBUFFERED: "1"
+          YAHOO_MAX_CONCURRENT_REQUESTS: "1"
+          YAHOO_MIN_INTERVAL_SECONDS: "0.5"
+          YAHOO_RETRY_LIMIT: "3"
+        run: |
+          set -euo pipefail
+          python -m tactical.market_structure_capability_runner \
+            --claim-work \
+            --ingest \
+            --work-limit 25
+
+      - name: Upload onboarding audit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-data-onboarding
+          path: funnel_output/market_structure_capability
+          if-no-files-found: warn
