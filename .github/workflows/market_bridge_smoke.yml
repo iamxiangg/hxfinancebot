@@ -2,13 +2,6 @@ name: HX Market Bridge Smoke
 
 "on":
   workflow_dispatch:
-  push:
-    branches:
-      - "feature/hx-market-bridge-v1"
-    paths:
-      - "providers/hx_market_bridge.py"
-      - "tactical/market_bridge_smoke.py"
-      - ".github/workflows/market_bridge_smoke.yml"
 
 permissions:
   contents: read
