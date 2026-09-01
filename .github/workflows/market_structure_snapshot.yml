@@ -14,6 +14,14 @@ name: HX Fixed Market Structure Snapshot
         type: boolean
   schedule:
     - cron: "45 23 * * 1-5"
+  push:
+    branches:
+      - "feature/hx-market-bridge-v1"
+    paths:
+      - "providers/hx_market_bridge.py"
+      - "tactical/market_structure_capability_runner.py"
+      - "tactical/market_structure_snapshot_runner.py"
+      - ".github/workflows/market_structure_snapshot.yml"
 
 permissions:
   contents: read
@@ -54,9 +62,13 @@ jobs:
           REQUESTED_DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
-          args=(--limit "${REQUESTED_LIMIT}")
-          if [[ "${REQUESTED_DRY_RUN}" == "true" ]]; then
-            args+=(--dry-run)
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            args=(--limit "3" --dry-run)
+          else
+            args=(--limit "${REQUESTED_LIMIT}")
+            if [[ "${REQUESTED_DRY_RUN}" == "true" ]]; then
+              args+=(--dry-run)
+            fi
           fi
           python -m tactical.market_structure_snapshot_runner "${args[@]}"
 
