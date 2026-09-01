@@ -93,6 +93,76 @@ def _finite_positive(value: float | None) -> bool:
     return value is not None and math.isfinite(float(value)) and float(value) > 0
 
 
+def _split_adjustment_audit(frame: pd.DataFrame) -> tuple[bool | None, list[dict[str, object]], bool]:
+    """Verify that split events inside the window are reflected in the price series.
+
+    Yahoo/yfinance history is normally split-adjusted even when auto_adjust=False. The
+    capability gate nevertheless fails closed when the event-date price gap is materially
+    closer to the raw, unadjusted split discontinuity than to ordinary price continuity,
+    or when adjacent sessions are unavailable for verification.
+    """
+    if "Stock Splits" not in frame.columns:
+        return None, [], False
+
+    split_values = pd.to_numeric(frame["Stock Splits"], errors="coerce").fillna(0.0)
+    event_rows = frame.loc[split_values != 0]
+    if event_rows.empty:
+        return False, [], True
+
+    session_dates = _session_dates(frame)
+    checks: list[dict[str, object]] = []
+    all_verified = True
+    separation_margin = math.log(1.35)
+
+    for event_index, event_row in event_rows.iterrows():
+        ratio = float(event_row["Stock Splits"])
+        event_date = pd.Timestamp(event_index).date()
+        prior_dates = [date for date in session_dates if date < event_date]
+        post_dates = [date for date in session_dates if date >= event_date]
+
+        state = "UNVERIFIED"
+        observed_gap_factor: float | None = None
+        expected_unadjusted_gap_factor: float | None = None
+
+        if ratio > 0 and prior_dates and post_dates:
+            previous_date = prior_dates[-1]
+            post_date = post_dates[0]
+            previous_session = frame[[pd.Timestamp(index).date() == previous_date for index in frame.index]]
+            post_session = frame[[pd.Timestamp(index).date() == post_date for index in frame.index]]
+            previous_closes = pd.to_numeric(previous_session["Close"], errors="coerce").dropna()
+            post_opens = pd.to_numeric(post_session["Open"], errors="coerce").dropna()
+
+            if not previous_closes.empty and not post_opens.empty:
+                previous_close = float(previous_closes.iloc[-1])
+                post_open = float(post_opens.iloc[0])
+                if _finite_positive(previous_close) and _finite_positive(post_open):
+                    observed_gap_factor = post_open / previous_close
+                    expected_unadjusted_gap_factor = 1.0 / ratio
+                    distance_to_adjusted = abs(math.log(observed_gap_factor))
+                    distance_to_unadjusted = abs(
+                        math.log(observed_gap_factor / expected_unadjusted_gap_factor)
+                    )
+                    if distance_to_adjusted + separation_margin < distance_to_unadjusted:
+                        state = "ADJUSTED"
+                    elif distance_to_unadjusted + separation_margin < distance_to_adjusted:
+                        state = "UNADJUSTED"
+
+        if state != "ADJUSTED":
+            all_verified = False
+
+        checks.append(
+            {
+                "event_at": _timestamp(event_index),
+                "split_ratio": ratio,
+                "observed_gap_factor": observed_gap_factor,
+                "expected_unadjusted_gap_factor": expected_unadjusted_gap_factor,
+                "state": state,
+            }
+        )
+
+    return True, checks, all_verified
+
+
 def _window_metrics(frame: pd.DataFrame, sessions: int) -> tuple[dict[str, float | int | str | None], list[str]]:
     warnings: list[str] = []
     window = _slice_last_sessions(frame, sessions)
@@ -193,14 +263,16 @@ def audit_symbol(symbol: str, *, checked_at: str) -> CapabilityResult:
         if tz is None:
             flags["timezone_missing"] = True
 
-        split_in_window: bool | None = None
-        if "Stock Splits" in working.columns:
-            split_values = pd.to_numeric(working["Stock Splits"], errors="coerce").fillna(0.0)
-            split_in_window = bool((split_values != 0).any())
-            if split_in_window:
-                flags["corporate_action_split_in_60d_window"] = True
-        else:
+        split_in_window, split_checks, split_adjustment_verified = _split_adjustment_audit(working)
+        if split_in_window is None:
             flags["corporate_actions_not_reported_in_download"] = True
+        elif split_in_window:
+            flags["corporate_action_split_in_60d_window"] = True
+            flags["split_adjustment_checks"] = split_checks
+            flags["split_adjustment_verified"] = split_adjustment_verified
+            flags["split_adjustment_basis"] = (
+                "YAHOO_PROVIDER_SPLIT_ADJUSTED_HISTORY_WITH_PRICE_CONTINUITY_CHECK"
+            )
 
         metrics_20d, warnings_20d = _window_metrics(working, 20)
         metrics_60d, warnings_60d = _window_metrics(working, 60)
@@ -209,7 +281,7 @@ def audit_symbol(symbol: str, *, checked_at: str) -> CapabilityResult:
             flags["warnings"] = warnings
 
         status = "ELIGIBLE"
-        if split_in_window:
+        if split_in_window and not split_adjustment_verified:
             status = "PARTIAL"
         if tz is None and status == "ELIGIBLE":
             status = "PARTIAL"
