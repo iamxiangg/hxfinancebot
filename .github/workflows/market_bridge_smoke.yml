@@ -1,0 +1,42 @@
+name: HX Market Bridge Smoke
+
+"on":
+  workflow_dispatch:
+  push:
+    branches:
+      - "feature/hx-market-bridge-v1"
+    paths:
+      - "providers/hx_market_bridge.py"
+      - "tactical/market_bridge_smoke.py"
+      - ".github/workflows/market_bridge_smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install minimal dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install requests>=2.31.0
+
+      - name: Verify signed Supabase bridge
+        env:
+          HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
+          HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
+        run: |
+          set -euo pipefail
+          python -m tactical.market_bridge_smoke
