@@ -17,6 +17,11 @@ name: HX Fixed Market Structure Snapshot
     # Australia/Asia regular sessions open, giving the global universe a
     # coherent completed-session window.
     - cron: "30 21 * * 1-5"
+  push:
+    branches:
+      - "main"
+    paths:
+      - ".github/workflows/market_structure_snapshot.yml"
 
 permissions:
   contents: read
