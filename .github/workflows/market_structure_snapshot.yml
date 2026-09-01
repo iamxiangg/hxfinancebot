@@ -13,7 +13,10 @@ name: HX Fixed Market Structure Snapshot
         default: false
         type: boolean
   schedule:
-    - cron: "45 23 * * 1-5"
+    # 21:30 UTC is after the US regular close even in winter and before
+    # Australia/Asia regular sessions open, giving the global universe a
+    # coherent completed-session window.
+    - cron: "30 21 * * 1-5"
 
 permissions:
   contents: read
