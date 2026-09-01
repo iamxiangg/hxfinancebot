@@ -24,6 +24,7 @@ REQUIRED_SESSIONS = 60
 WINDOWS = (20, 60)
 PROFILE_ROWS = 60
 VALUE_AREA_PCT = 70.0
+COMPLETED_SESSION_GUARD_VERSION = "PRIOR_SESSION_LAST_BAR_v1"
 
 
 @dataclass
@@ -91,6 +92,120 @@ def _slice_last_sessions(frame: pd.DataFrame, sessions: int) -> pd.DataFrame:
 
 def _finite_positive(value: float | None) -> bool:
     return value is not None and math.isfinite(float(value)) and float(value) > 0
+
+
+def _minutes_since_midnight(value: object) -> float:
+    timestamp = pd.Timestamp(value)
+    return (
+        float(timestamp.hour * 60 + timestamp.minute)
+        + float(timestamp.second) / 60.0
+        + float(timestamp.microsecond) / 60_000_000.0
+    )
+
+
+def _trim_to_completed_regular_sessions(
+    frame: pd.DataFrame,
+    *,
+    now_utc: datetime | pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, dict[str, object], bool]:
+    """Exclude the exchange's current incomplete regular session.
+
+    The 60-minute Yahoo download already excludes extended hours. To avoid another
+    provider request for every instrument, the normal regular-session end is inferred
+    from the median last-bar start across prior completed sessions. One full source
+    interval is added to that start time, intentionally making the guard conservative
+    for markets whose final bar is shorter than 60 minutes.
+    """
+    flags: dict[str, object] = {
+        "version": COMPLETED_SESSION_GUARD_VERSION,
+        "source_interval": INTERVAL,
+        "dropped_incomplete_session": False,
+    }
+    if frame.empty:
+        flags.update({"state": "UNVERIFIED", "reason": "EMPTY_HISTORY"})
+        return frame.copy(), flags, False
+
+    index = pd.DatetimeIndex(frame.index)
+    if index.tz is None:
+        flags.update({"state": "UNVERIFIED", "reason": "TIMEZONE_MISSING"})
+        return frame.copy(), flags, False
+
+    now = pd.Timestamp(now_utc if now_utc is not None else datetime.now(UTC))
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    else:
+        now = now.tz_convert("UTC")
+    now_local = now.tz_convert(index.tz)
+
+    dates = _session_dates(frame)
+    latest_date = dates[-1]
+    flags.update(
+        {
+            "exchange_timezone": str(index.tz),
+            "checked_at_local": now_local.isoformat(),
+            "latest_observed_session_date": latest_date.isoformat(),
+        }
+    )
+
+    if latest_date < now_local.date():
+        flags.update({"state": "VERIFIED_COMPLETED", "reason": "LATEST_SESSION_PRECEDES_LOCAL_TODAY"})
+        return frame.copy(), flags, True
+    if latest_date > now_local.date():
+        flags.update({"state": "UNVERIFIED", "reason": "LATEST_SESSION_IS_FUTURE_LOCAL_DATE"})
+        return frame.copy(), flags, False
+
+    prior_dates = dates[:-1][-10:]
+    if len(prior_dates) < 3:
+        flags.update({"state": "UNVERIFIED", "reason": "INSUFFICIENT_PRIOR_SESSIONS_FOR_CLOSE_INFERENCE"})
+        return frame.copy(), flags, False
+
+    prior_last_bar_minutes: list[float] = []
+    for session_date in prior_dates:
+        session = frame[[pd.Timestamp(idx).date() == session_date for idx in frame.index]]
+        if session.empty:
+            continue
+        prior_last_bar_minutes.append(_minutes_since_midnight(session.index[-1]))
+
+    if len(prior_last_bar_minutes) < 3:
+        flags.update({"state": "UNVERIFIED", "reason": "INSUFFICIENT_PRIOR_LAST_BARS"})
+        return frame.copy(), flags, False
+
+    expected_last_bar_start_minute = float(np.median(prior_last_bar_minutes))
+    expected_close_minute = expected_last_bar_start_minute + 60.0
+    local_midnight = pd.Timestamp(latest_date).tz_localize(index.tz)
+    expected_close = local_midnight + pd.Timedelta(minutes=expected_close_minute)
+
+    latest_session = frame[[pd.Timestamp(idx).date() == latest_date for idx in frame.index]]
+    latest_last_bar_start_minute = _minutes_since_midnight(latest_session.index[-1])
+    flags.update(
+        {
+            "inferred_last_bar_start_minute": expected_last_bar_start_minute,
+            "inferred_conservative_session_end": expected_close.isoformat(),
+            "latest_observed_bar_at": pd.Timestamp(latest_session.index[-1]).isoformat(),
+        }
+    )
+
+    current_session_still_open = now_local < expected_close
+    current_session_bar_set_incomplete = latest_last_bar_start_minute + 1.0 < expected_last_bar_start_minute
+    if current_session_still_open or current_session_bar_set_incomplete:
+        trimmed = frame[[pd.Timestamp(idx).date() < latest_date for idx in frame.index]].copy()
+        reason = (
+            "CURRENT_LOCAL_SESSION_BEFORE_INFERRED_END"
+            if current_session_still_open
+            else "CURRENT_LOCAL_SESSION_MISSING_EXPECTED_FINAL_BARS"
+        )
+        flags.update(
+            {
+                "state": "DROPPED_INCOMPLETE_CURRENT_SESSION",
+                "reason": reason,
+                "dropped_incomplete_session": True,
+                "dropped_session_date": latest_date.isoformat(),
+            }
+        )
+        return trimmed, flags, not trimmed.empty
+
+    flags.update({"state": "VERIFIED_COMPLETED", "reason": "CURRENT_LOCAL_SESSION_PAST_INFERRED_END"})
+    return frame.copy(), flags, True
 
 
 def _split_adjustment_audit(frame: pd.DataFrame) -> tuple[bool | None, list[dict[str, object]], bool]:
@@ -254,9 +369,17 @@ def audit_symbol(symbol: str, *, checked_at: str) -> CapabilityResult:
         if float(numeric["Volume"].sum()) <= 0:
             raise ValueError("No usable trading volume")
 
+        frame, session_guard, session_guard_verified = _trim_to_completed_regular_sessions(
+            frame,
+            now_utc=pd.Timestamp(checked_at),
+        )
+        flags["completed_session_guard"] = session_guard
+        if frame.empty:
+            raise ValueError("No completed regular-session history remains after session guard")
+
         sessions = _session_dates(frame)
         if len(sessions) < REQUIRED_SESSIONS:
-            raise ValueError(f"Only {len(sessions)} distinct 60m sessions returned; need {REQUIRED_SESSIONS}")
+            raise ValueError(f"Only {len(sessions)} completed sessions available; need {REQUIRED_SESSIONS}")
 
         working = _slice_last_sessions(frame, REQUIRED_SESSIONS)
         tz = str(pd.DatetimeIndex(working.index).tz) if pd.DatetimeIndex(working.index).tz is not None else None
@@ -281,6 +404,8 @@ def audit_symbol(symbol: str, *, checked_at: str) -> CapabilityResult:
             flags["warnings"] = warnings
 
         status = "ELIGIBLE"
+        if not session_guard_verified:
+            status = "PARTIAL"
         if split_in_window and not split_adjustment_verified:
             status = "PARTIAL"
         if tz is None and status == "ELIGIBLE":
