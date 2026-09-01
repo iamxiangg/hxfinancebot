@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from providers.hx_market_bridge import get_capability_work, ingest_capability_audit
 from providers.yahoo_throttle import yahoo_download
 from scanners.vp_avwap.avwap import compute_anchored_vwap
 from scanners.vp_avwap.profile import build_volume_profile
@@ -137,6 +139,8 @@ def _window_metrics(frame: pd.DataFrame, sessions: int) -> tuple[dict[str, float
     return {
         "sessions": actual_sessions,
         "bars": len(window),
+        "first_bar_at": _timestamp(window.index[0]),
+        "last_bar_at": _timestamp(window.index[-1]),
         "vwap": float(avwap.current_avwap),
         "poc": float(profile.poc),
         "vah": float(profile.vah),
@@ -205,10 +209,8 @@ def audit_symbol(symbol: str, *, checked_at: str) -> CapabilityResult:
             flags["warnings"] = warnings
 
         status = "ELIGIBLE"
-        # Splits require a separate price/volume normalization policy before production VP use.
         if split_in_window:
             status = "PARTIAL"
-        # Timezone is important for global completed-session handling, but absence does not invalidate raw calculations.
         if tz is None and status == "ELIGIBLE":
             status = "PARTIAL"
 
@@ -270,13 +272,29 @@ def audit_symbol(symbol: str, *, checked_at: str) -> CapabilityResult:
         )
 
 
+def _source_reference() -> str:
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+    sha = os.environ.get("GITHUB_SHA", "local")
+    return f"GitHub Actions run {run_id} attempt {attempt}; commit {sha}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit Yahoo 60m eligibility for HX 20D/60D fixed VP/VWAP.")
     parser.add_argument("--symbols", type=Path, default=Path("config/market_structure_validation_symbols.txt"))
     parser.add_argument("--output-dir", type=Path, default=Path("funnel_output/market_structure_capability"))
+    parser.add_argument("--claim-work", action="store_true", help="Read pending capability work from the signed HX market bridge.")
+    parser.add_argument("--work-limit", type=int, default=25)
+    parser.add_argument("--ingest", action="store_true", help="Persist audit results through the signed HX market bridge.")
     args = parser.parse_args()
 
-    symbols = _load_symbols(args.symbols)
+    work_items: list[dict[str, object]] = []
+    if args.claim_work:
+        work_items = get_capability_work(limit=args.work_limit)
+        symbols = list(dict.fromkeys(str(item["provider_symbol"]) for item in work_items if item.get("provider_symbol")))
+    else:
+        symbols = _load_symbols(args.symbols)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checked_at = datetime.now(UTC).isoformat()
 
@@ -288,8 +306,7 @@ def main() -> int:
         results.append(result)
 
     payload = [asdict(result) for result in results]
-    result_path = args.output_dir / "results.json"
-    result_path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+    (args.output_dir / "results.json").write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
 
     csv_path = args.output_dir / "results.csv"
     fields = [
@@ -307,16 +324,23 @@ def main() -> int:
     counts: dict[str, int] = {}
     for result in results:
         counts[result.status] = counts.get(result.status, 0) + 1
-    summary = {
+    summary: dict[str, object] = {
         "checked_at": checked_at,
         "capability": CAPABILITY,
         "required_interval": INTERVAL,
         "required_sessions": REQUIRED_SESSIONS,
         "symbols_requested": len(symbols),
+        "work_items_received": len(work_items),
         "counts": counts,
     }
-    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(json.dumps(summary, indent=2), flush=True)
+
+    if args.ingest and payload:
+        summary["ingest_result"] = ingest_capability_audit(payload, source_reference=_source_reference())
+    elif args.ingest:
+        summary["ingest_result"] = {"status": "NO_WORK"}
+
+    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
+    print(json.dumps(summary, indent=2, allow_nan=False), flush=True)
     return 0 if counts.get("ERROR", 0) == 0 else 2
 
 
