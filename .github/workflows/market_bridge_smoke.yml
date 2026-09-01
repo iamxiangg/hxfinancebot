@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install requests>=2.31.0
+          python -m pip install 'requests>=2.31.0'
 
       - name: Verify signed Supabase bridge
         env:
