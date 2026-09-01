@@ -1,0 +1,51 @@
+name: Market Structure Capability Audit
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - "tactical/market_structure_capability_runner.py"
+      - "config/market_structure_validation_symbols.txt"
+      - ".github/workflows/market_structure_capability_audit.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Audit 20D/60D fixed VP/VWAP capability
+        env:
+          PYTHONUNBUFFERED: "1"
+          YAHOO_MAX_CONCURRENT_REQUESTS: "1"
+          YAHOO_MIN_INTERVAL_SECONDS: "0.5"
+          YAHOO_RETRY_LIMIT: "3"
+        run: |
+          set -euo pipefail
+          python -m tactical.market_structure_capability_runner
+
+      - name: Upload capability audit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-structure-capability-audit
+          path: funnel_output/market_structure_capability
+          if-no-files-found: warn
