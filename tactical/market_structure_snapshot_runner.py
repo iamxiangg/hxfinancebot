@@ -13,10 +13,7 @@ from providers.hx_market_bridge import (
     ingest_capability_audit,
     ingest_market_structure_snapshot,
 )
-from tactical.market_structure_capability_runner import (
-    INTERVAL,
-    audit_symbol,
-)
+from tactical.market_structure_capability_runner import INTERVAL, audit_symbol
 
 
 CALCULATION_VERSION = "HX_MARKET_STRUCTURE_FIXED_v1"
@@ -66,8 +63,11 @@ def main() -> int:
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional deterministic symbol limit for testing; 0 means all eligible symbols.")
     parser.add_argument("--dry-run", action="store_true", help="Calculate and write local artefacts without ingesting results.")
+    parser.add_argument("--test-ingest", action="store_true", help="Ingest a test-tagged snapshot without refreshing canonical capability state.")
     parser.add_argument("--output-dir", type=Path, default=Path("funnel_output/market_structure_snapshot"))
     args = parser.parse_args()
+    if args.dry_run and args.test_ingest:
+        raise ValueError("--dry-run and --test-ingest are mutually exclusive")
 
     universe = get_eligible_universe()
     if args.limit > 0:
@@ -113,9 +113,10 @@ def main() -> int:
     persisted_instruments = len(snapshot_items) // 2
     status = "COMPLETED" if not exceptions else "COMPLETED_WITH_EXCEPTIONS"
     run_id, run_attempt, git_sha = _github_context()
-    ingest_key = f"FIXED_VP_VWAP_20D_60D:{run_id}:{run_attempt}"
+    prefix = "FIXED_VP_VWAP_20D_60D:TEST" if args.test_ingest else "FIXED_VP_VWAP_20D_60D"
+    ingest_key = f"{prefix}:{run_id}:{run_attempt}"
     if run_id == "local":
-        ingest_key = f"FIXED_VP_VWAP_20D_60D:local:{git_sha}:{checked_at}"
+        ingest_key = f"{prefix}:local:{git_sha}:{checked_at}"
 
     run_payload: dict[str, Any] = {
         "snapshot_at": checked_at,
@@ -127,27 +128,34 @@ def main() -> int:
         "ingest_key": ingest_key,
         "status": status,
         "requested_instruments": len(universe),
+        "is_test": args.test_ingest,
         "summary": {
             "eligible_at_start": len(universe),
             "persisted_instruments": persisted_instruments,
             "exceptions": exceptions,
             "source_interval": INTERVAL,
             "windows": list(WINDOWS),
+            "is_test": args.test_ingest,
         },
     }
 
     ingest_summary: dict[str, Any] = {"status": "DRY_RUN"}
-    if not args.dry_run:
+    if args.test_ingest:
+        if not snapshot_items:
+            raise RuntimeError("No instruments remained eligible for test snapshot ingestion")
+        snapshot_ingest = ingest_market_structure_snapshot(run=run_payload, items=snapshot_items)
+        ingest_summary = {
+            "capability_ingest": {"status": "SKIPPED_TEST_INGEST"},
+            "snapshot_ingest": snapshot_ingest,
+        }
+    elif not args.dry_run:
         capability_ingest = ingest_capability_audit(
             capability_payload,
             source_reference=_source_reference(),
         )
         if not snapshot_items:
             raise RuntimeError("No instruments remained eligible after live validation")
-        snapshot_ingest = ingest_market_structure_snapshot(
-            run=run_payload,
-            items=snapshot_items,
-        )
+        snapshot_ingest = ingest_market_structure_snapshot(run=run_payload, items=snapshot_items)
         ingest_summary = {
             "capability_ingest": capability_ingest,
             "snapshot_ingest": snapshot_ingest,
@@ -161,6 +169,7 @@ def main() -> int:
         "detail_rows": len(snapshot_items),
         "status": status,
         "exception_count": len(exceptions),
+        "is_test": args.test_ingest,
         "ingest": ingest_summary,
     }
     (args.output_dir / "summary.json").write_text(
