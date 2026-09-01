@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-ci.txt
 
       - name: Audit 20D/60D fixed VP/VWAP capability
         env:
