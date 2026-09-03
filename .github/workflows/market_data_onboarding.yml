@@ -8,6 +8,7 @@ name: HX Market Data Onboarding
   push:
     paths:
       - ".github/workflows/market_data_onboarding.yml"
+      - "tactical/l5_market_structure_refresh_runner.py"
 
 permissions:
   contents: read
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   capability:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -36,8 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
 
-      - name: Process queued market-data capability work
-        id: capability
+      - name: Process and persist queued L5 market structure work
         env:
           HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
           HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
@@ -47,39 +47,12 @@ jobs:
           YAHOO_RETRY_LIMIT: "3"
         run: |
           set -euo pipefail
-          python -m tactical.market_structure_capability_runner \
-            --claim-work \
-            --ingest \
-            --work-limit 50
-          work_count="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          p = Path('funnel_output/market_structure_capability/summary.json')
-          data = json.loads(p.read_text()) if p.exists() else {}
-          print(int(data.get('work_items_received', 0)))
-          PY
-          )"
-          echo "work_count=${work_count}" >> "$GITHUB_OUTPUT"
+          python -m tactical.l5_market_structure_refresh_runner --work-limit 50
 
-      - name: Persist fresh fixed 20D/60D market structure after queued work
-        if: ${{ steps.capability.outputs.work_count != '0' }}
-        env:
-          HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
-          HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
-          PYTHONUNBUFFERED: "1"
-          YAHOO_MAX_CONCURRENT_REQUESTS: "1"
-          YAHOO_MIN_INTERVAL_SECONDS: "0.5"
-          YAHOO_RETRY_LIMIT: "3"
-        run: |
-          set -euo pipefail
-          python -m tactical.market_structure_snapshot_runner --limit 0
-
-      - name: Upload onboarding audit
+      - name: Upload L5 market-structure refresh artefact
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: market-data-onboarding
-          path: |
-            funnel_output/market_structure_capability
-            funnel_output/market_structure_snapshot
+          name: l5-market-structure-refresh
+          path: funnel_output/l5_market_structure_refresh
           if-no-files-found: warn
