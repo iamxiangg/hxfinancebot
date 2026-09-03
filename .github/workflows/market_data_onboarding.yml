@@ -3,7 +3,11 @@ name: HX Market Data Onboarding
 "on":
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    # Pull urgent L5 market-structure work twice per hour. P0 requests are served first.
+    - cron: "17,47 * * * *"
+  push:
+    paths:
+      - ".github/workflows/market_data_onboarding.yml"
 
 permissions:
   contents: read
@@ -15,7 +19,7 @@ concurrency:
 jobs:
   capability:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -33,6 +37,7 @@ jobs:
           python -m pip install -r requirements-ci.txt
 
       - name: Process queued market-data capability work
+        id: capability
         env:
           HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
           HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
@@ -45,12 +50,36 @@ jobs:
           python -m tactical.market_structure_capability_runner \
             --claim-work \
             --ingest \
-            --work-limit 25
+            --work-limit 50
+          work_count="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('funnel_output/market_structure_capability/summary.json')
+          data = json.loads(p.read_text()) if p.exists() else {}
+          print(int(data.get('work_items_received', 0)))
+          PY
+          )"
+          echo "work_count=${work_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Persist fresh fixed 20D/60D market structure after queued work
+        if: ${{ steps.capability.outputs.work_count != '0' }}
+        env:
+          HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
+          HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
+          PYTHONUNBUFFERED: "1"
+          YAHOO_MAX_CONCURRENT_REQUESTS: "1"
+          YAHOO_MIN_INTERVAL_SECONDS: "0.5"
+          YAHOO_RETRY_LIMIT: "3"
+        run: |
+          set -euo pipefail
+          python -m tactical.market_structure_snapshot_runner --limit 0
 
       - name: Upload onboarding audit
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: market-data-onboarding
-          path: funnel_output/market_structure_capability
+          path: |
+            funnel_output/market_structure_capability
+            funnel_output/market_structure_snapshot
           if-no-files-found: warn
