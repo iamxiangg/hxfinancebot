@@ -21,7 +21,6 @@ from tactical.market_structure_reaction import (
     backfill_reaction_states,
 )
 
-
 CALCULATION_VERSION = "HX_MARKET_STRUCTURE_FIXED_v1"
 WINDOWS = (20, 60)
 
@@ -98,23 +97,18 @@ def main() -> int:
         results.append(result)
 
     capability_payload = [asdict(result) for result in results]
-    capability_ingest = ingest_capability_audit(
-        capability_payload,
-        source_reference=_source_reference(),
-    )
+    capability_ingest = ingest_capability_audit(capability_payload, source_reference=_source_reference())
 
     snapshot_items: list[dict[str, Any]] = []
     exceptions: list[dict[str, str]] = []
     eligible_symbols: list[str] = []
     for result in results:
         if result.status != "ELIGIBLE":
-            exceptions.append(
-                {
-                    "provider_symbol": result.provider_symbol,
-                    "status": result.status,
-                    "reason": result.last_error or json.dumps(result.quality_flags, sort_keys=True),
-                }
-            )
+            exceptions.append({
+                "provider_symbol": result.provider_symbol,
+                "status": result.status,
+                "reason": result.last_error or json.dumps(result.quality_flags, sort_keys=True),
+            })
             continue
         eligible_symbols.append(result.provider_symbol)
         for sessions in WINDOWS:
@@ -123,6 +117,7 @@ def main() -> int:
     snapshot_ingest: dict[str, Any] = {"status": "NO_ELIGIBLE_SNAPSHOT_ITEMS"}
     reaction_ingest: dict[str, Any] = {"status": "SKIPPED_NO_SNAPSHOT"}
     reaction_items: list[dict[str, Any]] = []
+    reaction_ingest_results: list[dict[str, Any]] = []
     reaction_exceptions: list[dict[str, str]] = []
 
     if snapshot_items:
@@ -165,27 +160,30 @@ def main() -> int:
                         checked_at=checked_at,
                         backfill_sessions=args.reaction_backfill_sessions,
                     )
+                    # Ingest per symbol so evidence-rich backfills cannot exceed the bridge payload ceiling.
+                    result = ingest_market_reaction_states(
+                        market_snapshot_id=market_snapshot_id,
+                        items=symbol_items,
+                    )
+                    reaction_ingest_results.append({"provider_symbol": symbol, "result": result})
                     reaction_items.extend(symbol_items)
-                    print(f"  -> {len(symbol_items)} reaction rows", flush=True)
+                    print(f"  -> {len(symbol_items)} reaction rows ingested", flush=True)
                 except Exception as exc:
                     reaction_exceptions.append({"provider_symbol": symbol, "error": f"{exc.__class__.__name__}: {exc}"})
                     print(f"  -> reaction backfill failed: {exc}", flush=True)
-            if reaction_items:
-                reaction_ingest = ingest_market_reaction_states(
-                    market_snapshot_id=market_snapshot_id,
-                    items=reaction_items,
-                )
-            else:
-                reaction_ingest = {"status": "NO_REACTION_ROWS", "exceptions": reaction_exceptions}
+            reaction_ingest = {
+                "status": "INGESTED_WITH_EXCEPTIONS" if reaction_exceptions else "INGESTED",
+                "symbols_ingested": len(reaction_ingest_results),
+                "rows": len(reaction_items),
+                "results": reaction_ingest_results,
+                "exceptions": reaction_exceptions,
+            }
 
     counts: dict[str, int] = {}
     for result in results:
         counts[result.status] = counts.get(result.status, 0) + 1
 
-    final_status = "COMPLETED"
-    if exceptions or reaction_exceptions:
-        final_status = "COMPLETED_WITH_EXCEPTIONS"
-
+    final_status = "COMPLETED_WITH_EXCEPTIONS" if exceptions or reaction_exceptions else "COMPLETED"
     summary = {
         "status": final_status,
         "checked_at": checked_at,
@@ -202,15 +200,9 @@ def main() -> int:
         "snapshot_ingest": snapshot_ingest,
         "reaction_ingest": reaction_ingest,
     }
-    (args.output_dir / "results.json").write_text(
-        json.dumps(capability_payload, indent=2, allow_nan=False), encoding="utf-8"
-    )
-    (args.output_dir / "reaction_states.json").write_text(
-        json.dumps(reaction_items, indent=2, allow_nan=False), encoding="utf-8"
-    )
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
-    )
+    (args.output_dir / "results.json").write_text(json.dumps(capability_payload, indent=2, allow_nan=False), encoding="utf-8")
+    (args.output_dir / "reaction_states.json").write_text(json.dumps(reaction_items, indent=2, allow_nan=False), encoding="utf-8")
+    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps(summary, indent=2, allow_nan=False), flush=True)
     return 0 if counts.get("ERROR", 0) == 0 and not reaction_exceptions else 2
 
