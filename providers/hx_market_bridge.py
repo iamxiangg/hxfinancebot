@@ -106,3 +106,18 @@ def ingest_market_structure_snapshot(
         },
         timeout=90,
     )
+
+
+def ingest_market_reaction_states(
+    *,
+    market_snapshot_id: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return post_bridge(
+        {
+            "action": "INGEST_MARKET_REACTION_STATES",
+            "market_snapshot_id": market_snapshot_id,
+            "items": items,
+        },
+        timeout=90,
+    )
