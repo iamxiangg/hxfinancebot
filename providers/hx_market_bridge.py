@@ -14,6 +14,17 @@ class HxMarketBridgeError(RuntimeError):
     pass
 
 
+_RETRYABLE_ACTIONS = {
+    "PING",
+    "GET_ELIGIBLE_UNIVERSE",
+    "GET_CAPABILITY_WORK",
+    "INGEST_CAPABILITY_AUDIT",
+    "INGEST_MARKET_STRUCTURE_SNAPSHOT",
+    "INGEST_MARKET_REACTION_STATES",
+}
+_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
 def _config() -> tuple[str, str]:
     url = os.environ.get("HX_MARKET_INGEST_URL", "").strip()
     secret = os.environ.get("HX_MARKET_INGEST_SECRET", "").strip()
@@ -24,38 +35,90 @@ def _config() -> tuple[str, str]:
     return url, secret
 
 
-def post_bridge(payload: dict[str, Any], *, timeout: int = 30) -> dict[str, Any]:
-    url, secret = _config()
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True, allow_nan=False)
+def _retry_config(action: str) -> tuple[int, float]:
+    if action not in _RETRYABLE_ACTIONS:
+        return 1, 0.0
+
+    try:
+        attempts = int(os.environ.get("HX_MARKET_BRIDGE_MAX_ATTEMPTS", "3"))
+    except ValueError:
+        attempts = 3
+    attempts = max(1, min(5, attempts))
+
+    try:
+        base_delay = float(os.environ.get("HX_MARKET_BRIDGE_BACKOFF_SECONDS", "1.0"))
+    except ValueError:
+        base_delay = 1.0
+    base_delay = max(0.0, min(10.0, base_delay))
+    return attempts, base_delay
+
+
+def _signed_headers(secret: str, body: str) -> dict[str, str]:
     timestamp = str(int(time.time()))
     signature = hmac.new(
         secret.encode("utf-8"),
         f"{timestamp}.{body}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    response = requests.post(
-        url,
-        data=body.encode("utf-8"),
-        headers={
-            "content-type": "application/json",
-            "x-hx-timestamp": timestamp,
-            "x-hx-signature": f"sha256={signature}",
-        },
-        timeout=timeout,
-    )
-    try:
-        data = response.json()
-    except ValueError as exc:
+    return {
+        "content-type": "application/json",
+        "x-hx-timestamp": timestamp,
+        "x-hx-signature": f"sha256={signature}",
+    }
+
+
+def post_bridge(payload: dict[str, Any], *, timeout: int = 30) -> dict[str, Any]:
+    url, secret = _config()
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    action = str(payload.get("action") or "").upper()
+    max_attempts, base_delay = _retry_config(action)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                data=body.encode("utf-8"),
+                headers=_signed_headers(secret, body),
+                timeout=timeout,
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt >= max_attempts:
+                raise HxMarketBridgeError(
+                    f"HX market bridge transport failure action={action or '<unknown>'} "
+                    f"after {attempt} attempt(s): {exc.__class__.__name__}: {exc}"
+                ) from exc
+            time.sleep(base_delay * (2 ** (attempt - 1)))
+            continue
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_attempts:
+                time.sleep(base_delay * (2 ** (attempt - 1)))
+                continue
+            raise HxMarketBridgeError(
+                f"HX market bridge returned HTTP {response.status_code} "
+                f"action={action or '<unknown>'} attempt={attempt}/{max_attempts} "
+                "with non-JSON body"
+            ) from exc
+
+        if response.ok:
+            if not isinstance(data, dict):
+                raise HxMarketBridgeError("HX market bridge response must be a JSON object")
+            return data
+
+        if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_attempts:
+            time.sleep(base_delay * (2 ** (attempt - 1)))
+            continue
+
         raise HxMarketBridgeError(
-            f"HX market bridge returned HTTP {response.status_code} with non-JSON body"
-        ) from exc
-    if not response.ok:
-        raise HxMarketBridgeError(
-            f"HX market bridge returned HTTP {response.status_code}: {data}"
+            f"HX market bridge returned HTTP {response.status_code} "
+            f"action={action or '<unknown>'} attempt={attempt}/{max_attempts}: {data}"
         )
-    if not isinstance(data, dict):
-        raise HxMarketBridgeError("HX market bridge response must be a JSON object")
-    return data
+
+    raise HxMarketBridgeError(
+        f"HX market bridge exhausted retries for action={action or '<unknown>'}"
+    )
 
 
 def ping() -> dict[str, Any]:
