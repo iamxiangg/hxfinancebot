@@ -39,6 +39,7 @@ jobs:
           python -m pip install -r requirements-ci.txt
 
       - name: Process and persist queued L5 market structure work
+        # Every explicit open onboarding row is work, even if an older capability result exists.
         env:
           HX_MARKET_INGEST_URL: ${{ vars.HX_MARKET_INGEST_URL }}
           HX_MARKET_INGEST_SECRET: ${{ secrets.HX_MARKET_INGEST_SECRET }}
