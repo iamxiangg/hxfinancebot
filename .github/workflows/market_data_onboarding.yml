@@ -9,6 +9,7 @@ name: HX Market Data Onboarding
     paths:
       - ".github/workflows/market_data_onboarding.yml"
       - "tactical/l5_market_structure_refresh_runner.py"
+      - "providers/hx_market_bridge.py"
 
 permissions:
   contents: read
@@ -45,6 +46,8 @@ jobs:
           YAHOO_MAX_CONCURRENT_REQUESTS: "1"
           YAHOO_MIN_INTERVAL_SECONDS: "0.5"
           YAHOO_RETRY_LIMIT: "3"
+          HX_MARKET_BRIDGE_MAX_ATTEMPTS: "3"
+          HX_MARKET_BRIDGE_BACKOFF_SECONDS: "1.0"
         run: |
           set -euo pipefail
           python -m tactical.l5_market_structure_refresh_runner --work-limit 50
