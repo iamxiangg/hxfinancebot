@@ -18,6 +18,7 @@ name: HX Fixed Market Structure Snapshot
     # coherent completed-session window.
     - cron: "30 21 * * 1-5"
   push:
+    # Relevant main-branch changes intentionally trigger an immediate production verification refresh.
     branches: [main]
     paths:
       - ".github/workflows/market_structure_snapshot.yml"
