@@ -17,6 +17,13 @@ name: HX Fixed Market Structure Snapshot
     # Australia/Asia regular sessions open, giving the global universe a
     # coherent completed-session window.
     - cron: "30 21 * * 1-5"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/market_structure_snapshot.yml"
+      - "tactical/market_structure_snapshot_runner.py"
+      - "tactical/market_structure_reaction.py"
+      - "providers/hx_market_bridge.py"
 
 permissions:
   contents: read
@@ -28,7 +35,7 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -53,6 +60,8 @@ jobs:
           YAHOO_MAX_CONCURRENT_REQUESTS: "1"
           YAHOO_MIN_INTERVAL_SECONDS: "0.5"
           YAHOO_RETRY_LIMIT: "3"
+          HX_MARKET_BRIDGE_MAX_ATTEMPTS: "3"
+          HX_MARKET_BRIDGE_BACKOFF_SECONDS: "1.0"
           REQUESTED_LIMIT: ${{ inputs.limit || '0' }}
           REQUESTED_DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
