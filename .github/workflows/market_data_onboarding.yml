@@ -4,6 +4,7 @@ name: HX Market Data Onboarding
   workflow_dispatch:
   schedule:
     # Pull urgent L5 market-structure work twice per hour. P0 requests are served first.
+    # Main-branch workflow changes also provide an immediate production verification trigger.
     - cron: "17,47 * * * *"
   push:
     paths:
