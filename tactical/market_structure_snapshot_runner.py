@@ -11,9 +11,15 @@ from typing import Any
 from providers.hx_market_bridge import (
     get_eligible_universe,
     ingest_capability_audit,
+    ingest_market_reaction_states,
     ingest_market_structure_snapshot,
 )
 from tactical.market_structure_capability_runner import INTERVAL, audit_symbol
+from tactical.market_structure_reaction import (
+    DEFAULT_BACKFILL_SESSIONS,
+    REACTION_METHODOLOGY_VERSION,
+    backfill_reaction_states,
+)
 
 
 CALCULATION_VERSION = "HX_MARKET_STRUCTURE_FIXED_v1"
@@ -64,6 +70,12 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="Optional deterministic symbol limit for testing; 0 means all eligible symbols.")
     parser.add_argument("--dry-run", action="store_true", help="Calculate and write local artefacts without ingesting results.")
     parser.add_argument("--test-ingest", action="store_true", help="Ingest a test-tagged snapshot without refreshing canonical capability state.")
+    parser.add_argument(
+        "--reaction-backfill-sessions",
+        type=int,
+        default=DEFAULT_BACKFILL_SESSIONS,
+        help="Completed sessions of VP/VWAP reaction history to persist after each snapshot.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("funnel_output/market_structure_snapshot"))
     args = parser.parse_args()
     if args.dry_run and args.test_ingest:
@@ -80,6 +92,7 @@ def main() -> int:
 
     capability_results = []
     snapshot_items: list[dict[str, Any]] = []
+    eligible_symbols: list[str] = []
     exceptions: list[dict[str, str]] = []
 
     for index, item in enumerate(universe, start=1):
@@ -98,6 +111,7 @@ def main() -> int:
             print(f"  -> excluded: {result.status}", flush=True)
             continue
 
+        eligible_symbols.append(symbol)
         for sessions in WINDOWS:
             snapshot_items.append(_snapshot_item(result, sessions=sessions))
         print("  -> 20D + 60D validated", flush=True)
@@ -135,11 +149,17 @@ def main() -> int:
             "exceptions": exceptions,
             "source_interval": INTERVAL,
             "windows": list(WINDOWS),
+            "reaction_backfill_sessions": args.reaction_backfill_sessions,
+            "reaction_methodology": REACTION_METHODOLOGY_VERSION,
             "is_test": args.test_ingest,
         },
     }
 
     ingest_summary: dict[str, Any] = {"status": "DRY_RUN"}
+    reaction_items: list[dict[str, Any]] = []
+    reaction_ingest_results: list[dict[str, Any]] = []
+    reaction_exceptions: list[dict[str, str]] = []
+
     if args.test_ingest:
         if not snapshot_items:
             raise RuntimeError("No instruments remained eligible for test snapshot ingestion")
@@ -161,6 +181,52 @@ def main() -> int:
             "snapshot_ingest": snapshot_ingest,
         }
 
+    if not args.dry_run:
+        market_snapshot_id = str(ingest_summary.get("snapshot_ingest", {}).get("market_snapshot_id") or "")
+        if not market_snapshot_id:
+            raise RuntimeError("Market-structure snapshot ingest did not return market_snapshot_id")
+
+        for index, symbol in enumerate(eligible_symbols, start=1):
+            print(f"[{index}/{len(eligible_symbols)}] reaction backfill {symbol}", flush=True)
+            try:
+                symbol_items = backfill_reaction_states(
+                    symbol,
+                    checked_at=checked_at,
+                    backfill_sessions=args.reaction_backfill_sessions,
+                )
+                reaction_result = ingest_market_reaction_states(
+                    market_snapshot_id=market_snapshot_id,
+                    items=symbol_items,
+                )
+                reaction_ingest_results.append(
+                    {"provider_symbol": symbol, "result": reaction_result}
+                )
+                reaction_items.extend(symbol_items)
+                print(f"  -> {len(symbol_items)} reaction rows ingested", flush=True)
+            except Exception as exc:
+                reaction_exceptions.append(
+                    {
+                        "provider_symbol": symbol,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    }
+                )
+                print(f"  -> reaction backfill failed: {exc}", flush=True)
+
+        ingest_summary["reaction_ingest"] = {
+            "status": "INGESTED_WITH_EXCEPTIONS" if reaction_exceptions else "INGESTED",
+            "symbols_requested": len(eligible_symbols),
+            "symbols_ingested": len(reaction_ingest_results),
+            "rows": len(reaction_items),
+            "results": reaction_ingest_results,
+            "exceptions": reaction_exceptions,
+            "backfill_sessions": args.reaction_backfill_sessions,
+            "methodology_version": REACTION_METHODOLOGY_VERSION,
+        }
+
+    (args.output_dir / "reaction_states.json").write_text(
+        json.dumps(reaction_items, indent=2, allow_nan=False), encoding="utf-8"
+    )
+
     summary = {
         "checked_at": checked_at,
         "calculation_version": CALCULATION_VERSION,
@@ -169,6 +235,10 @@ def main() -> int:
         "detail_rows": len(snapshot_items),
         "status": status,
         "exception_count": len(exceptions),
+        "reaction_exception_count": len(reaction_exceptions),
+        "reaction_rows": len(reaction_items),
+        "reaction_backfill_sessions": args.reaction_backfill_sessions,
+        "reaction_methodology": REACTION_METHODOLOGY_VERSION,
         "is_test": args.test_ingest,
         "ingest": ingest_summary,
     }
@@ -176,7 +246,7 @@ def main() -> int:
         json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, allow_nan=False), flush=True)
-    return 0
+    return 0 if not reaction_exceptions else 2
 
 
 if __name__ == "__main__":
